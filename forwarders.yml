@@ -1,0 +1,24 @@
+# ============================================================
+# rfw — Forwarder configuration file
+#
+# Usage:  rfw -f forwarders.yml
+# ============================================================
+
+forwarders:
+  # Forward local port 8080 to a web server
+  - local_host: "127.0.0.1"
+    local_port: 8080
+    remote_host: "192.168.1.100"
+    remote_port: 80
+
+  # Forward local port 3306 to a remote database
+  - local_host: "0.0.0.0"
+    local_port: 3306
+    remote_host: "db-prod.example.com"
+    remote_port: 3306
+
+  # Forward local port 443 to a cloud service
+  - local_host: "0.0.0.0"
+    local_port: 443
+    remote_host: "app.azure.com"
+    remote_port: 443

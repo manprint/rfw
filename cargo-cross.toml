@@ -1,0 +1,22 @@
+# ============================================================
+# cargo-cross.toml — Cargo linker configuration per target
+#
+# Each target needs the correct cross-linker.
+# Linux aarch64 must override -fuse-ld=lld to use system ld.
+# ============================================================
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
+
+[target.x86_64-apple-darwin]
+linker = "x86_64-apple-darwin14-clang"
+
+[target.aarch64-apple-darwin]
+linker = "aarch64-apple-darwin14-clang"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+[target.aarch64-pc-windows-msvc]
+linker = "aarch64-w64-mingw32-clang"

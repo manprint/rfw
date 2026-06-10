@@ -1,0 +1,54 @@
+# ============================================================
+# docker-compose.yml — rfw example deployment
+#
+# Start:   docker compose up -d
+# Config via env vars: edit the RFW_FORWARDER_N vars below
+# Config via YAML:     uncomment volumes section and create
+#                      ./forwarders.yml
+# ============================================================
+
+services:
+  rfw:
+    image: rfw:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rfw
+    restart: unless-stopped
+
+    # Expose local forwarder ports to the host
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "8082:8082"
+      # Add more ports as needed for your forwarders
+
+    environment:
+      # ── Forwarder configuration via env vars ──
+      # Format: local_host:local_port:remote_host:remote_port
+      # Env vars override CLI args and config file.
+      - RFW_FORWARDER_1=0.0.0.0:8080:example.com:80
+      - RFW_FORWARDER_2=0.0.0.0:8081:api.example.com:443
+      # - RFW_FORWARDER_3=0.0.0.0:3306:prod-db.example.com:3306
+
+      # ── Runtime settings ──
+      - RUST_LOG=info
+
+    # ── Optional: mount a YAML config file ──
+    # volumes:
+    #   - ./forwarders.yml:/etc/rfw/forwarders.yml:ro
+
+    # ── Resource limits ──
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 32M
+
+    # ── Health check ──
+    # healthcheck:
+    #   test: ["CMD", "pgrep", "-x", "rfw"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
