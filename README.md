@@ -38,19 +38,21 @@ cargo install --path .
 
 ### Pre-built binaries
 
-Download from the [releases page](https://github.com/fabiocorneti/rfw/releases).
+Download from the [releases page](https://github.com/manprint/rfw/releases).
 
 ### Docker
 
 ```bash
+docker pull ghcr.io/manprint/rfw:latest
 docker compose up -d
 ```
 
 Or run manually:
 
 ```bash
-docker run --rm -p 8080:8080 rfw \
-    -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80
+docker run --rm -p 8080:8080 \
+  -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
+  ghcr.io/manprint/rfw:latest
 ```
 
 ## Forwarder syntax
@@ -235,22 +237,24 @@ Requirements: Docker
 
 ## Docker
 
-### Build and run
+Every `v<major>.<minor>.<patch>` tag publishes `ghcr.io/manprint/rfw` with three tags: the Git tag itself, `latest`, and the full commit SHA.
+
+### Pull and run
 
 ```bash
-# Build the image
-docker build -t rfw .
+# Pull the latest published image
+docker pull ghcr.io/manprint/rfw:latest
 
 # Run with env vars
 docker run --rm -p 8080:8080 -p 8081:8081 \
     -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
     -e RFW_FORWARDER_2=0.0.0.0:8081:api.example.com:443 \
-    rfw
+  ghcr.io/manprint/rfw:latest
 
 # Or with a config file mounted
 docker run --rm -p 8080:8080 \
     -v ./forwarders.yml:/etc/rfw/forwarders.yml:ro \
-    rfw -f /etc/rfw/forwarders.yml
+  ghcr.io/manprint/rfw:latest -f /etc/rfw/forwarders.yml
 ```
 
 ### Docker Compose
@@ -258,6 +262,8 @@ docker run --rm -p 8080:8080 \
 ```bash
 docker compose up -d
 ```
+
+If you need to pin a specific image version, use `ghcr.io/manprint/rfw:v1.0.1` instead of `latest`.
 
 Edit `docker-compose.yml` to configure your forwarders via env vars.
 

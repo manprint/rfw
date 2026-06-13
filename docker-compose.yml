@@ -9,10 +9,7 @@
 
 services:
   rfw:
-    image: rfw:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/manprint/rfw:latest
     container_name: rfw
     restart: unless-stopped
 
