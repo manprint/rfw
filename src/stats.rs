@@ -1,6 +1,9 @@
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 
 /// Per-forwarder traffic counters.
@@ -91,9 +94,9 @@ impl Default for StatsRegistry {
     }
 }
 
-/// Human-readable byte formatting
+/// Human-readable byte formatting (1024-based, 3 decimal places).
 pub fn format_bytes(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = n as f64;
     let mut unit_idx = 0;
     while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
@@ -101,8 +104,76 @@ pub fn format_bytes(n: u64) -> String {
         unit_idx += 1;
     }
     if unit_idx == 0 {
-        format!("{} {}", n, UNITS[unit_idx])
+        format!("{} B", n)
     } else {
-        format!("{:.2} {}", size, UNITS[unit_idx])
+        format!("{:.3} {}", size, UNITS[unit_idx])
+    }
+}
+
+/// Wraps a stream and counts bytes read and written at the poll level.
+/// Byte counts accumulate regardless of whether I/O completes or errors.
+pub struct CountingStream<S> {
+    inner: S,
+    bytes_read: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
+}
+
+impl<S> CountingStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            bytes_read: Arc::new(AtomicU64::new(0)),
+            bytes_written: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written.load(Ordering::Relaxed)
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            let n = buf.filled().len().saturating_sub(before);
+            if n > 0 {
+                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                self.bytes_written.fetch_add(*n as u64, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

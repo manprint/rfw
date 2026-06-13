@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::ForwarderConfig;
-use crate::stats::{format_bytes, ForwarderStats, StatsRegistry};
+use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
 
 /// Run a single forwarder: listen on local_addr, proxy each connection to remote.
 ///
@@ -88,7 +88,7 @@ pub async fn run_forwarder(
 /// Proxy a single TCP connection to remote destination.
 /// Resolves hostname fresh each call for dynamic DNS support.
 async fn proxy_connection(
-    mut inbound: TcpStream,
+    inbound: TcpStream,
     peer_addr: std::net::SocketAddr,
     cfg: &ForwarderConfig,
     resolver: &TokioResolver,
@@ -124,20 +124,15 @@ async fn proxy_connection(
         "Connected"
     );
 
-    // Bidirectional copy — tracks total bytes each direction
-    let result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    // Wrap inbound to count bytes at poll level — accurate even when copy returns Err
+    // (broken pipe / connection reset would otherwise lose the byte counts).
+    // bytes_read  = client→server (sent to remote)
+    // bytes_written = server→client (received from remote)
+    let mut counting = CountingStream::new(inbound);
 
-    // Graceful shutdown: close both sides
-    let _ = inbound.shutdown().await;
-    let _ = outbound.shutdown().await;
-
-    match result {
-        Ok((to_remote, from_remote)) => {
-            stats.add_sent(to_remote);
-            stats.add_received(from_remote);
-        }
+    match tokio::io::copy_bidirectional(&mut counting, &mut outbound).await {
+        Ok(_) => {}
         Err(e) => {
-            // Broken pipe mid-connection is normal, not an error worth logging loudly
             warn!(
                 forwarder = %cfg.label(),
                 peer = %peer_addr,
@@ -146,6 +141,13 @@ async fn proxy_connection(
             );
         }
     }
+
+    // Graceful shutdown: close both sides
+    let _ = AsyncWriteExt::shutdown(&mut counting).await;
+    let _ = outbound.shutdown().await;
+
+    stats.add_sent(counting.bytes_read());
+    stats.add_received(counting.bytes_written());
 
     info!(
         forwarder = %cfg.label(),
