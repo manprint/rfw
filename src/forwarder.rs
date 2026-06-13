@@ -67,7 +67,7 @@ pub async fn run_forwarder(
                         let resolver = resolver.clone();
                         let s = stats.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy_connection(inbound, peer_addr, &fwd_cfg, &resolver, &s).await {
+                            if let Err(e) = proxy_connection(inbound, peer_addr, &fwd_cfg, &resolver, s.clone()).await {
                                 warn!(forwarder = %fwd_cfg.label(), peer = %peer_addr, error = %e, "Proxy error");
                             }
                             s.dec_connections();
@@ -92,7 +92,7 @@ async fn proxy_connection(
     peer_addr: std::net::SocketAddr,
     cfg: &ForwarderConfig,
     resolver: &TokioResolver,
-    stats: &ForwarderStats,
+    stats: Arc<ForwarderStats>,
 ) -> Result<(), anyhow::Error> {
     // Resolve remote hostname
     let lookup = tokio::time::timeout(
@@ -128,7 +128,7 @@ async fn proxy_connection(
     // (broken pipe / connection reset would otherwise lose the byte counts).
     // bytes_read  = client→server (sent to remote)
     // bytes_written = server→client (received from remote)
-    let mut counting = CountingStream::new(inbound);
+    let mut counting = CountingStream::new(inbound, stats);
 
     match tokio::io::copy_bidirectional(&mut counting, &mut outbound).await {
         Ok(_) => {}
@@ -145,9 +145,6 @@ async fn proxy_connection(
     // Graceful shutdown: close both sides
     let _ = AsyncWriteExt::shutdown(&mut counting).await;
     let _ = outbound.shutdown().await;
-
-    stats.add_sent(counting.bytes_read());
-    stats.add_received(counting.bytes_written());
 
     info!(
         forwarder = %cfg.label(),

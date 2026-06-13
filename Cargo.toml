@@ -1,6 +1,6 @@
 [package]
 name = "rfw"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 description = "Rust Forwarder — TCP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
 

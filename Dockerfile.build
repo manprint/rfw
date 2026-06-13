@@ -1,36 +1,63 @@
-# ============================================================
-# Dockerfile.build — Cross-compilation environment for rfw
-# All 6 targets: Linux, macOS, Windows (amd64 + arm64)
-# ============================================================
+ARG RUST_VERSION=latest
+FROM rust:${RUST_VERSION} AS builder
 
-FROM rust:latest AS builder
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG RUST_TARGETS="x86_64-unknown-linux-gnu"
+ARG INSTALL_LINUX_AARCH64=0
+ARG INSTALL_WINDOWS_GNU=0
+ARG INSTALL_ZIG=0
+ARG INSTALL_ANDROID=0
+ARG INSTALL_MACOS_SDK=0
+
+RUN cat <<'EOF' >/usr/local/bin/retry-command
+#!/usr/bin/env bash
+set -euo pipefail
+
+max_attempts="${1:?missing max attempts}"
+shift
+
+attempt=1
+while true; do
+    if "$@"; then
+        exit 0
+    else
+        exit_code=$?
+    fi
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+        exit "$exit_code"
+    fi
+
+    echo "retry-command: attempt ${attempt}/${max_attempts} failed with exit ${exit_code}; retrying..." >&2
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+done
+EOF
+
+RUN chmod +x /usr/local/bin/retry-command
 
 # ── Rust targets ──────────────────────────────────────────
-RUN rustup target add \
-    x86_64-unknown-linux-gnu \
-    aarch64-unknown-linux-gnu \
-    x86_64-apple-darwin \
-    aarch64-apple-darwin \
-    x86_64-pc-windows-gnu \
-    aarch64-pc-windows-gnullvm \
-    aarch64-linux-android
+RUN for target in ${RUST_TARGETS}; do \
+        retry-command 3 rustup target add "$target"; \
+    done
 
 # ── System packages for traditional cross-linkers ─────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Linux aarch64
-    gcc-aarch64-linux-gnu \
-    libc6-dev-arm64-cross \
-    binutils-aarch64-linux-gnu \
-    # Windows x86_64 (mingw)
-    gcc-mingw-w64-x86-64 \
-    # General
-    clang \
-    libssl-dev \
-    pkg-config \
-    curl \
-    unzip \
-    xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    packages=(); \
+    if [[ "${INSTALL_LINUX_AARCH64}" = "1" ]]; then \
+        packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu); \
+    fi; \
+    if [[ "${INSTALL_WINDOWS_GNU}" = "1" ]]; then \
+        packages+=(gcc-mingw-w64-x86-64); \
+    fi; \
+    if [[ "${INSTALL_ZIG}" = "1" || "${INSTALL_ANDROID}" = "1" ]]; then \
+        packages+=(curl unzip xz-utils); \
+    fi; \
+    if ((${#packages[@]})); then \
+        retry-command 3 apt-get update; \
+        DEBIAN_FRONTEND=noninteractive retry-command 3 apt-get install -y --no-install-recommends "${packages[@]}"; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # ── Cargo linker config ───────────────────────────────────
 # For targets that need traditional cross-linkers (Linux aarch64, Windows x86_64)
@@ -44,25 +71,28 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=bfd"
 # ── Zig + cargo-zigbuild (macOS + Windows arm64 linker) ───
 # Zig bundles cross-compiler + libc for all targets.
 # For macOS, needs SDK headers for framework dependencies (SystemConfiguration).
-RUN curl -sL "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" \
-    | tar -xJ -C /opt/ \
-    && ln -sf /opt/zig-linux-x86_64-*/zig /usr/local/bin/zig \
-    && cargo install cargo-zigbuild --locked
+RUN if [[ "${INSTALL_ZIG}" = "1" ]]; then \
+        retry-command 3 bash -lc 'curl -fsSL "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" | tar -xJ -C /opt/'; \
+        ln -sf /opt/zig-linux-x86_64-*/zig /usr/local/bin/zig; \
+        retry-command 3 cargo install cargo-zigbuild --locked; \
+    fi
 
 # ── Android NDK + cargo-ndk ───────────────────────────────
 # cargo-zigbuild does not resolve Android system libraries reliably here.
-RUN curl -sL "https://dl.google.com/android/repository/android-ndk-r29-linux.zip" \
-    -o /tmp/android-ndk-r29-linux.zip \
-    && unzip -q /tmp/android-ndk-r29-linux.zip -d /opt/ \
-    && rm -f /tmp/android-ndk-r29-linux.zip \
-    && cargo install cargo-ndk --locked
+RUN if [[ "${INSTALL_ANDROID}" = "1" ]]; then \
+        retry-command 3 curl -fsSL "https://dl.google.com/android/repository/android-ndk-r29-linux.zip" -o /tmp/android-ndk-r29-linux.zip; \
+        unzip -q /tmp/android-ndk-r29-linux.zip -d /opt/; \
+        rm -f /tmp/android-ndk-r29-linux.zip; \
+        retry-command 3 cargo install cargo-ndk --locked; \
+    fi
 
 ENV ANDROID_NDK_HOME=/opt/android-ndk-r29
 
 # macOS SDK headers (needed by hickory-resolver → resolv-conf → SystemConfiguration)
-RUN curl -sL "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz" \
-    | tar -xJ -C /opt/ \
-    && echo "macOS SDK installed at /opt/MacOSX11.3.sdk"
+RUN if [[ "${INSTALL_MACOS_SDK}" = "1" ]]; then \
+        retry-command 3 bash -lc 'curl -fsSL "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz" | tar -xJ -C /opt/'; \
+        echo "macOS SDK installed at /opt/MacOSX11.3.sdk"; \
+    fi
 
 ENV SDKROOT=/opt/MacOSX11.3.sdk
 

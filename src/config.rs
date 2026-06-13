@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Forwarder definition: local_host:local_port:remote_host:remote_port
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,22 +71,31 @@ pub fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
 
 /// Load forwarders from RFW_FORWARDER_N env vars
 fn load_env_forwarders() -> Vec<ForwarderConfig> {
-    let mut res = Vec::new();
-    for i in 1.. {
-        let key = format!("RFW_FORWARDER_{}", i);
-        match std::env::var(&key) {
-            Ok(val) => match parse_forwarder(&val) {
-                Ok(f) => res.push(f),
-                Err(e) => eprintln!("Warning: env {}: {}", key, e),
-            },
-            Err(_) => break,
+    let mut entries: Vec<_> = std::env::vars()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("RFW_FORWARDER_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .map(|index| (index, key, value))
+        })
+        .collect();
+
+    entries.sort_by_key(|(index, _, _)| *index);
+
+    let mut forwarders = Vec::with_capacity(entries.len());
+    for (_, key, value) in entries {
+        match parse_forwarder(&value) {
+            Ok(forwarder) => forwarders.push(forwarder),
+            Err(error) => {
+                warn!(env_var = %key, error = %error, "Ignoring invalid env forwarder");
+            }
         }
     }
-    res
+
+    forwarders
 }
 
 /// Load forwarders from a YAML config file
-pub(crate) fn load_yaml_forwarders(path: &PathBuf) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
+pub(crate) fn load_yaml_forwarders(path: &std::path::Path) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
     let content = std::fs::read_to_string(path)?;
     let cf: ConfigFile = serde_yaml::from_str(&content)?;
     Ok(cf.forwarders)
@@ -98,7 +108,7 @@ pub(crate) fn load_yaml_forwarders(path: &PathBuf) -> Result<Vec<ForwarderConfig
 /// - If CLI args are given, they replace the YAML config.
 /// - Otherwise the YAML file is used.
 pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
-    let forwarders = if !cli.forwarders.is_empty() {
+    let configured_forwarders = if !cli.forwarders.is_empty() {
         // CLI args: parse and use instead of YAML
         cli.forwarders
             .iter()
@@ -116,9 +126,11 @@ pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Er
 
     // Env vars override everything
     let env_forwarders = load_env_forwarders();
-    if !env_forwarders.is_empty() {
-        return Ok(env_forwarders);
-    }
+    let forwarders = if env_forwarders.is_empty() {
+        configured_forwarders
+    } else {
+        env_forwarders
+    };
 
     validate_no_duplicates(&forwarders)?;
     Ok(forwarders)
@@ -142,6 +154,53 @@ fn validate_no_duplicates(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ForwarderEnvGuard {
+        saved: Vec<(String, String)>,
+    }
+
+    impl ForwarderEnvGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let saved = std::env::vars()
+                .filter(|(key, _)| key.starts_with("RFW_FORWARDER_"))
+                .collect::<Vec<_>>();
+
+            clear_forwarder_env();
+            for (key, value) in vars {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+
+            Self { saved }
+        }
+    }
+
+    impl Drop for ForwarderEnvGuard {
+        fn drop(&mut self) {
+            clear_forwarder_env();
+            for (key, value) in self.saved.drain(..) {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+
+    fn clear_forwarder_env() {
+        let keys = std::env::vars()
+            .filter(|(key, _)| key.starts_with("RFW_FORWARDER_"))
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+
+        for key in keys {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
 
     #[test]
     fn test_parse_forwarder_ok() {
@@ -199,5 +258,44 @@ mod tests {
             remote_port: 443,
         };
         assert_eq!(f.label(), "127.0.0.1:9090->example.com:443");
+    }
+
+    #[test]
+    fn test_load_forwarders_env_overrides_cli_with_sparse_indices() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _env_guard = ForwarderEnvGuard::set(&[
+            ("RFW_FORWARDER_3", "127.0.0.1:9003:three.example:80"),
+            ("RFW_FORWARDER_1", "127.0.0.1:9001:one.example:80"),
+        ]);
+
+        let cli = CliArgs {
+            config_file: None,
+            forwarders: vec!["127.0.0.1:8000:cli.example:80".into()],
+        };
+
+        let forwarders = load_forwarders(&cli).expect("env forwarders should load");
+
+        assert_eq!(forwarders.len(), 2);
+        assert_eq!(forwarders[0].local_port, 9001);
+        assert_eq!(forwarders[1].local_port, 9003);
+    }
+
+    #[test]
+    fn test_load_forwarders_validates_duplicates_from_env() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _env_guard = ForwarderEnvGuard::set(&[
+            ("RFW_FORWARDER_1", "0.0.0.0:8080:first.example:80"),
+            ("RFW_FORWARDER_2", "0.0.0.0:8080:second.example:443"),
+        ]);
+
+        let cli = CliArgs {
+            config_file: None,
+            forwarders: Vec::new(),
+        };
+
+        let error = load_forwarders(&cli).expect_err("duplicate env forwarders must fail");
+        assert!(error
+            .to_string()
+            .contains("Duplicate local address '0.0.0.0:8080'"));
     }
 }

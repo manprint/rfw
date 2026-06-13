@@ -114,25 +114,19 @@ pub fn format_bytes(n: u64) -> String {
 /// Byte counts accumulate regardless of whether I/O completes or errors.
 pub struct CountingStream<S> {
     inner: S,
+    stats: Arc<ForwarderStats>,
     bytes_read: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
 }
 
 impl<S> CountingStream<S> {
-    pub fn new(inner: S) -> Self {
+    pub fn new(inner: S, stats: Arc<ForwarderStats>) -> Self {
         Self {
             inner,
+            stats,
             bytes_read: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read.load(Ordering::Relaxed)
-    }
-
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written.load(Ordering::Relaxed)
     }
 }
 
@@ -147,7 +141,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
         if matches!(poll, Poll::Ready(Ok(()))) {
             let n = buf.filled().len().saturating_sub(before);
             if n > 0 {
-                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                let n = n as u64;
+                self.bytes_read.fetch_add(n, Ordering::Relaxed);
+                self.stats.add_sent(n);
             }
         }
         poll
@@ -163,7 +159,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &poll {
             if *n > 0 {
-                self.bytes_written.fetch_add(*n as u64, Ordering::Relaxed);
+                let n = *n as u64;
+                self.bytes_written.fetch_add(n, Ordering::Relaxed);
+                self.stats.add_received(n);
             }
         }
         poll
@@ -175,5 +173,40 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn counting_stream_updates_stats_live_across_snapshots() {
+        let stats = Arc::new(ForwarderStats::new("test".to_string()));
+        stats.inc_connections();
+
+        let (mut peer, inner) = tokio::io::duplex(64);
+        let mut counting = CountingStream::new(inner, stats.clone());
+
+        peer.write_all(b"ping").await.unwrap();
+
+        let mut inbound = [0_u8; 4];
+        counting.read_exact(&mut inbound).await.unwrap();
+
+        let (_, sent, recv, active) = stats.snapshot_and_reset();
+        assert_eq!(sent, 4);
+        assert_eq!(recv, 0);
+        assert_eq!(active, 1);
+
+        counting.write_all(b"pong").await.unwrap();
+
+        let mut outbound = [0_u8; 4];
+        peer.read_exact(&mut outbound).await.unwrap();
+
+        let (_, sent, recv, active) = stats.snapshot_and_reset();
+        assert_eq!(sent, 0);
+        assert_eq!(recv, 4);
+        assert_eq!(active, 1);
     }
 }

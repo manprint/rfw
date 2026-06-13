@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::RwLock;
@@ -123,6 +123,26 @@ impl Default for ForwarderManager {
     }
 }
 
+fn is_relevant_config_event(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_))
+}
+
+fn watched_path_matches_event_path(watched_path: &Path, event_path: &Path) -> bool {
+    event_path == watched_path
+        || event_path
+            .canonicalize()
+            .map(|canonical_path| canonical_path == watched_path)
+            .unwrap_or(false)
+}
+
+fn should_debounce_reload(
+    last_reload: Option<Instant>,
+    now: Instant,
+    debounce_window: Duration,
+) -> bool {
+    last_reload.is_some_and(|previous| now.duration_since(previous) < debounce_window)
+}
+
 /// Watch a YAML config file for changes and hot-reload forwarders.
 pub async fn watch_config_file(
     config_path: PathBuf,
@@ -176,7 +196,10 @@ pub async fn watch_config_file(
     // Keep watcher alive by not dropping it
     let _watcher = watcher;
 
-    let mut last_reload = std::time::Instant::now();
+    const RELOAD_DEBOUNCE: Duration = Duration::from_secs(1);
+    const RELOAD_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+    let mut last_reload = None;
 
     loop {
         tokio::select! {
@@ -186,34 +209,32 @@ pub async fn watch_config_file(
                 return;
             }
             Some(event) = rx.recv() => {
+                let now = Instant::now();
+
                 // Debounce: ignore events within 1 second of last reload
-                if last_reload.elapsed() < Duration::from_secs(1) {
+                if should_debounce_reload(last_reload, now, RELOAD_DEBOUNCE) {
                     continue;
                 }
 
                 // Check if event is relevant to our file
-                let is_relevant = match &event.kind {
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => true,
-                    _ => false,
-                };
-
-                if !is_relevant {
+                if !is_relevant_config_event(&event.kind) {
                     continue;
                 }
 
                 // Check if path matches
-                let path_matches = event.paths.iter().any(|p| {
-                    p.canonicalize().map(|c| c == path).unwrap_or(false)
-                });
+                let path_matches = event
+                    .paths
+                    .iter()
+                    .any(|event_path| watched_path_matches_event_path(&path, event_path));
 
                 if !path_matches {
                     continue;
                 }
 
-                last_reload = std::time::Instant::now();
+                last_reload = Some(now);
 
                 // Short delay to let the file finish writing
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(RELOAD_SETTLE_DELAY).await;
 
                 info!("Config file changed, reloading...");
                 match load_yaml_forwarders(&config_path) {
@@ -238,4 +259,38 @@ pub fn start_stats_reporter(
     tokio::spawn(async move {
         stats_reporter(stats_registry, cancel).await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_debounce_reload_allows_first_event() {
+        let now = Instant::now();
+        assert!(!should_debounce_reload(None, now, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_should_debounce_reload_blocks_quick_repeat_events() {
+        let now = Instant::now();
+        assert!(should_debounce_reload(
+            Some(now - Duration::from_millis(500)),
+            now,
+            Duration::from_secs(1),
+        ));
+        assert!(!should_debounce_reload(
+            Some(now - Duration::from_secs(2)),
+            now,
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn test_watched_path_matches_deleted_target_path() {
+        let path = std::env::temp_dir().join("rfw-watch-config-does-not-exist.yml");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(watched_path_matches_event_path(&path, &path));
+    }
 }
