@@ -18,12 +18,16 @@ pub async fn run_forwarder(
     cfg: ForwarderConfig,
     cancel: CancellationToken,
     stats: Arc<ForwarderStats>,
+    buffer_bytes: usize,
 ) {
     let resolver = TokioResolver::builder_tokio()
         .expect("Failed to init DNS resolver builder")
         .build()
         .expect("Failed to build DNS resolver");
 
+    // Share config across connection tasks by refcount instead of deep-cloning
+    // its strings per accepted connection.
+    let cfg = Arc::new(cfg);
     let local_str = cfg.local_addr();
     let label = cfg.label();
 
@@ -62,15 +66,16 @@ pub async fn run_forwarder(
             accept = listener.accept() => {
                 match accept {
                     Ok((inbound, peer_addr)) => {
-                        stats.inc_connections();
                         let fwd_cfg = cfg.clone();
                         let resolver = resolver.clone();
                         let s = stats.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy_connection(inbound, peer_addr, &fwd_cfg, &resolver, s.clone()).await {
+                            // Guard ties inc/dec together: the count is restored on
+                            // every exit path, including a panic in proxy_connection.
+                            let _guard = ConnGuard::new(s.clone());
+                            if let Err(e) = proxy_connection(inbound, peer_addr, &fwd_cfg, &resolver, s, buffer_bytes).await {
                                 warn!(forwarder = %fwd_cfg.label(), peer = %peer_addr, error = %e, "Proxy error");
                             }
-                            s.dec_connections();
                         });
                     }
                     Err(e) => {
@@ -93,7 +98,14 @@ async fn proxy_connection(
     cfg: &ForwarderConfig,
     resolver: &TokioResolver,
     stats: Arc<ForwarderStats>,
+    buffer_bytes: usize,
 ) -> Result<(), anyhow::Error> {
+    // Disable Nagle on the client side: forwarded traffic is often interactive,
+    // and Nagle would add latency on small writes.
+    if let Err(e) = inbound.set_nodelay(true) {
+        warn!(forwarder = %cfg.label(), peer = %peer_addr, error = %e, "set_nodelay(inbound) failed");
+    }
+
     // Resolve remote hostname
     let lookup = tokio::time::timeout(
         Duration::from_secs(10),
@@ -103,19 +115,22 @@ async fn proxy_connection(
     .map_err(|_| anyhow::anyhow!("DNS lookup timeout for {}", cfg.remote_host))?;
 
     let remote_ips = lookup?;
-    let remote_ip = remote_ips.iter().next().ok_or_else(|| {
-        anyhow::anyhow!("No DNS records for {}", cfg.remote_host)
-    })?;
+    let remote_ip = remote_ips
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No DNS records for {}", cfg.remote_host))?;
 
     let remote_addr = format!("{}:{}", remote_ip, cfg.remote_port);
 
     // Connect to remote
-    let mut outbound = tokio::time::timeout(
-        Duration::from_secs(15),
-        TcpStream::connect(&remote_addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", remote_addr))??;
+    let mut outbound =
+        tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(&remote_addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("Connect timeout to {}", remote_addr))??;
+
+    if let Err(e) = outbound.set_nodelay(true) {
+        warn!(forwarder = %cfg.label(), peer = %peer_addr, error = %e, "set_nodelay(outbound) failed");
+    }
 
     info!(
         forwarder = %cfg.label(),
@@ -126,11 +141,18 @@ async fn proxy_connection(
 
     // Wrap inbound to count bytes at poll level — accurate even when copy returns Err
     // (broken pipe / connection reset would otherwise lose the byte counts).
-    // bytes_read  = client→server (sent to remote)
-    // bytes_written = server→client (received from remote)
+    // read side  = client→server (counted as bytes_sent)
+    // write side = server→client (counted as bytes_received)
     let mut counting = CountingStream::new(inbound, stats);
 
-    match tokio::io::copy_bidirectional(&mut counting, &mut outbound).await {
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut counting,
+        &mut outbound,
+        buffer_bytes,
+        buffer_bytes,
+    )
+    .await
+    {
         Ok(_) => {}
         Err(e) => {
             warn!(
@@ -163,9 +185,60 @@ async fn cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
     }
 }
 
-/// Stats reporter: logs traffic report every 60 seconds.
-pub async fn stats_reporter(stats_registry: Arc<StatsRegistry>, cancel: CancellationToken) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+/// RAII guard: increments the active-connection count on creation and
+/// decrements it on drop, guaranteeing the count is restored on every exit
+/// path of the connection task, including a panic.
+struct ConnGuard(Arc<ForwarderStats>);
+
+impl ConnGuard {
+    fn new(stats: Arc<ForwarderStats>) -> Self {
+        stats.inc_connections();
+        Self(stats)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.dec_connections();
+    }
+}
+
+/// Periodically re-derives the EWMA throughput rate for every forwarder.
+/// Single writer of the rate gauges; the hot path is untouched.
+pub async fn rate_sampler(
+    stats_registry: Arc<StatsRegistry>,
+    cancel: CancellationToken,
+    sample_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(sample_interval);
+    interval.tick().await; // skip immediate first tick
+    let mut last = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return;
+            }
+            _ = interval.tick() => {
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last).as_secs_f64();
+                last = now;
+                stats_registry.sample_rates(dt).await;
+            }
+        }
+    }
+}
+
+/// Stats reporter: logs a traffic report every `report_interval`.
+/// Shows **lifetime cumulative** totals and the **current throughput rate**
+/// (counters are never reset — that is now the sampler's derived gauge).
+pub async fn stats_reporter(
+    stats_registry: Arc<StatsRegistry>,
+    cancel: CancellationToken,
+    report_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(report_interval);
     interval.tick().await; // skip immediate first tick
 
     loop {
@@ -176,26 +249,28 @@ pub async fn stats_reporter(stats_registry: Arc<StatsRegistry>, cancel: Cancella
                 return;
             }
             _ = interval.tick() => {
-                let snapshots = stats_registry.collect_and_reset().await;
-                let total_sent: u64 = snapshots.iter().map(|(_, s, _, _)| s).sum();
-                let total_recv: u64 = snapshots.iter().map(|(_, _, r, _)| r).sum();
+                let snapshots = stats_registry.collect().await;
+                let total_sent: u64 = snapshots.iter().map(|s| s.bytes_sent).sum();
+                let total_recv: u64 = snapshots.iter().map(|s| s.bytes_received).sum();
 
                 info!("─── Traffic Report ──────────────────────────────────");
 
-                for (label, sent, recv, active) in &snapshots {
-                    if *sent > 0 || *recv > 0 || *active > 0 {
+                for s in &snapshots {
+                    if s.bytes_sent > 0 || s.bytes_received > 0 || s.active_connections > 0 {
                         info!(
-                            "  {:<45} send={:>10}  recv={:>10}  active={}",
-                            label,
-                            format_bytes(*sent),
-                            format_bytes(*recv),
-                            active
+                            "  {:<45} sent={:>10}  recv={:>10}  tx={:>10}/s  rx={:>10}/s  active={}",
+                            s.label,
+                            format_bytes(s.bytes_sent),
+                            format_bytes(s.bytes_received),
+                            format_bytes(s.rate_sent_bps),
+                            format_bytes(s.rate_recv_bps),
+                            s.active_connections
                         );
                     }
                 }
 
                 info!(
-                    "  TOTAL (all forwarders)              send={:>10}  recv={:>10}",
+                    "  TOTAL (all forwarders, lifetime)    sent={:>10}  recv={:>10}",
                     format_bytes(total_sent),
                     format_bytes(total_recv),
                 );
@@ -203,5 +278,33 @@ pub async fn stats_reporter(stats_registry: Arc<StatsRegistry>, cancel: Cancella
                 info!("──────────────────────────────────────────────────────");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn conn_guard_decrements_on_drop() {
+        let stats = Arc::new(ForwarderStats::new("t".to_string()));
+        {
+            let _g = ConnGuard::new(stats.clone());
+            assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn conn_guard_decrements_on_panic() {
+        let stats = Arc::new(ForwarderStats::new("t".to_string()));
+        let s2 = stats.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ConnGuard::new(s2);
+            panic!("boom");
+        }));
+        assert!(result.is_err());
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
     }
 }

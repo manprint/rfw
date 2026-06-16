@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::{load_yaml_forwarders, ForwarderConfig};
-use crate::forwarder::{run_forwarder, stats_reporter};
+use crate::forwarder::{rate_sampler, run_forwarder, stats_reporter};
 use crate::stats::StatsRegistry;
 
 /// Manages lifecycle of all forwarders: start, stop, hot-reload.
@@ -17,6 +17,8 @@ pub struct ForwarderManager {
     /// Map of label -> CancellationToken for running forwarders
     forwarders: RwLock<HashMap<String, ForwarderHandle>>,
     stats_registry: Arc<StatsRegistry>,
+    /// Per-direction copy buffer size handed to each forwarder.
+    buffer_bytes: usize,
 }
 
 struct ForwarderHandle {
@@ -24,10 +26,11 @@ struct ForwarderHandle {
 }
 
 impl ForwarderManager {
-    pub fn new() -> Self {
+    pub fn new(buffer_bytes: usize) -> Self {
         Self {
             forwarders: RwLock::new(HashMap::new()),
             stats_registry: Arc::new(StatsRegistry::new()),
+            buffer_bytes,
         }
     }
 
@@ -56,9 +59,10 @@ impl ForwarderManager {
         let stats = self.stats_registry.register(&label).await;
         let cfg_clone = cfg.clone();
         let token_clone = token.clone();
+        let buffer_bytes = self.buffer_bytes;
 
         tokio::spawn(async move {
-            run_forwarder(cfg_clone, token_clone, stats).await;
+            run_forwarder(cfg_clone, token_clone, stats, buffer_bytes).await;
         });
 
         fwds.insert(label.clone(), ForwarderHandle { token });
@@ -119,12 +123,15 @@ impl ForwarderManager {
 
 impl Default for ForwarderManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(65536)
     }
 }
 
 fn is_relevant_config_event(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_))
+    matches!(
+        kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    )
 }
 
 fn watched_path_matches_event_path(watched_path: &Path, event_path: &Path) -> bool {
@@ -255,9 +262,21 @@ pub async fn watch_config_file(
 pub fn start_stats_reporter(
     stats_registry: Arc<StatsRegistry>,
     cancel: CancellationToken,
+    report_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        stats_reporter(stats_registry, cancel).await;
+        stats_reporter(stats_registry, cancel, report_interval).await;
+    })
+}
+
+/// Start the periodic throughput-rate sampler task.
+pub fn start_rate_sampler(
+    stats_registry: Arc<StatsRegistry>,
+    cancel: CancellationToken,
+    sample_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        rate_sampler(stats_registry, cancel, sample_interval).await;
     })
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rfw"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Rust Forwarder — TCP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
 
@@ -18,3 +18,11 @@ hickory-resolver = "0.26.1"
 chrono = "0.4.45"
 anyhow = "1.0.102"
 thiserror = "2.0.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# NOTE: panic is intentionally left as "unwind" (default). A panic in one
+# connection task must stay isolated, not abort the whole multi-forwarder process.
