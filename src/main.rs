@@ -2,9 +2,11 @@ mod config;
 mod forwarder;
 mod logging;
 mod manager;
+mod metrics;
 mod stats;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::info;
 
@@ -23,6 +25,9 @@ async fn main() -> anyhow::Result<()> {
     // Load forwarder configurations (YAML + CLI + env, merged with precedence)
     let forwarders = config::load_forwarders(&cli)?;
 
+    // Load runtime settings (YAML settings: block + CLI overrides)
+    let settings = config::load_settings(&cli)?;
+
     if forwarders.is_empty() {
         anyhow::bail!(
             "No forwarders configured.\n\
@@ -36,16 +41,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    info!(
-        "Starting rfw with {} forwarder(s):",
-        forwarders.len()
-    );
+    info!("Starting rfw with {} forwarder(s):", forwarders.len());
     for fwd in &forwarders {
-        info!("  {} -> {}:{}", fwd.local_addr(), fwd.remote_host, fwd.remote_port);
+        info!(
+            "  {} -> {}:{}",
+            fwd.local_addr(),
+            fwd.remote_host,
+            fwd.remote_port
+        );
+    }
+
+    // splice is Linux-only; warn once at startup if requested elsewhere
+    #[cfg(not(target_os = "linux"))]
+    if settings.use_splice {
+        tracing::warn!("--splice / use_splice is Linux-only; using the portable copy path");
     }
 
     // Create manager and start all forwarders
-    let manager = Arc::new(manager::ForwarderManager::new());
+    let manager = Arc::new(manager::ForwarderManager::new(&settings)?);
     manager.start_all(&forwarders).await;
 
     // Start config file watcher (if config file provided)
@@ -59,12 +72,27 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Start stats reporter
+    // Start stats reporter + throughput-rate sampler
     let stats_cancel = CancellationToken::new();
     let _stats_handle = manager::start_stats_reporter(
         manager.stats_registry(),
         stats_cancel.clone(),
+        Duration::from_secs(settings.report_interval_secs),
     );
+    let _sampler_handle = manager::start_rate_sampler(
+        manager.stats_registry(),
+        stats_cancel.clone(),
+        Duration::from_secs(settings.sample_interval_secs),
+    );
+
+    // Start the HTTP stats endpoint if configured (opt-in)
+    if let Some(metrics_addr) = settings.metrics_addr.clone() {
+        let registry = manager.stats_registry();
+        let cancel = stats_cancel.clone();
+        tokio::spawn(async move {
+            metrics::serve(metrics_addr, registry, cancel).await;
+        });
+    }
 
     // Wait for shutdown signal
     info!("rfw is running. Press Ctrl+C to stop.");

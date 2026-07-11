@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,108 @@ impl ForwarderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfigFile {
     forwarders: Vec<ForwarderConfig>,
+    #[serde(default)]
+    settings: Settings,
+}
+
+fn default_report_interval() -> u64 {
+    60
+}
+fn default_sample_interval() -> u64 {
+    1
+}
+fn default_buffer_bytes() -> usize {
+    65536
+}
+fn default_use_splice() -> bool {
+    false
+}
+
+/// Process-global runtime settings (one HTTP endpoint, one sampler, one reporter).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// `host:port` for the HTTP stats endpoint. `None` disables it (default).
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
+    /// Periodic log report cadence, seconds.
+    #[serde(default = "default_report_interval")]
+    pub report_interval_secs: u64,
+    /// Throughput-rate sampling cadence, seconds.
+    #[serde(default = "default_sample_interval")]
+    pub sample_interval_secs: u64,
+    /// Per-direction copy buffer size, bytes.
+    #[serde(default = "default_buffer_bytes")]
+    pub buffer_bytes: usize,
+    /// Kernel socket buffer size (`SO_SNDBUF`/`SO_RCVBUF`) per socket, bytes.
+    /// `None` leaves the OS default. Raising it helps on high bandwidth-delay
+    /// (WAN / high-latency) links.
+    #[serde(default)]
+    pub socket_buffer_bytes: Option<usize>,
+    /// Use the Linux `splice(2)` zero-copy data path (opt-in, Linux only).
+    /// Ignored with a warning on non-Linux targets.
+    #[serde(default = "default_use_splice")]
+    pub use_splice: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            metrics_addr: None,
+            report_interval_secs: default_report_interval(),
+            sample_interval_secs: default_sample_interval(),
+            buffer_bytes: default_buffer_bytes(),
+            socket_buffer_bytes: None,
+            use_splice: default_use_splice(),
+        }
+    }
+}
+
+/// Live, lock-free copy of the data-plane knobs shared by every connection task.
+///
+/// Held behind an `Arc`; each new connection reads the current values with a
+/// `Relaxed` load. Hot-reload updates them via [`RuntimeKnobs::update`], so new
+/// connections pick up changes to `buffer_bytes` / `socket_buffer_bytes` /
+/// `use_splice` without a restart (in-flight connections keep their values).
+#[derive(Debug)]
+pub struct RuntimeKnobs {
+    buffer_bytes: AtomicUsize,
+    /// `0` means "leave the OS default".
+    socket_buffer_bytes: AtomicUsize,
+    use_splice: AtomicBool,
+}
+
+impl RuntimeKnobs {
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            buffer_bytes: AtomicUsize::new(s.buffer_bytes),
+            socket_buffer_bytes: AtomicUsize::new(s.socket_buffer_bytes.unwrap_or(0)),
+            use_splice: AtomicBool::new(s.use_splice),
+        }
+    }
+
+    /// Apply reloaded settings to the shared knobs (called on hot-reload).
+    pub fn update(&self, s: &Settings) {
+        self.buffer_bytes.store(s.buffer_bytes, Ordering::Relaxed);
+        self.socket_buffer_bytes
+            .store(s.socket_buffer_bytes.unwrap_or(0), Ordering::Relaxed);
+        self.use_splice.store(s.use_splice, Ordering::Relaxed);
+    }
+
+    pub fn buffer_bytes(&self) -> usize {
+        self.buffer_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns `None` when the OS default should be left in place.
+    pub fn socket_buffer_bytes(&self) -> Option<usize> {
+        match self.socket_buffer_bytes.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    pub fn use_splice(&self) -> bool {
+        self.use_splice.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -41,6 +144,31 @@ pub struct CliArgs {
     /// Path to YAML configuration file
     #[arg(short = 'f', long = "file")]
     pub config_file: Option<PathBuf>,
+
+    /// Bind address (host:port) for the HTTP stats endpoint (/metrics, /stats)
+    #[arg(long = "metrics-addr")]
+    pub metrics_addr: Option<String>,
+
+    /// Periodic traffic-report log cadence, seconds (default 60)
+    #[arg(long = "report-interval")]
+    pub report_interval_secs: Option<u64>,
+
+    /// Throughput-rate sampling cadence, seconds (default 1)
+    #[arg(long = "sample-interval")]
+    pub sample_interval_secs: Option<u64>,
+
+    /// Per-direction copy buffer size, bytes (default 65536)
+    #[arg(long = "buffer-bytes")]
+    pub buffer_bytes: Option<usize>,
+
+    /// Kernel socket buffer size (SO_SNDBUF/SO_RCVBUF) per socket, bytes
+    /// (default: OS default)
+    #[arg(long = "socket-buffer-bytes")]
+    pub socket_buffer_bytes: Option<usize>,
+
+    /// Use the Linux splice(2) zero-copy data path (Linux only)
+    #[arg(long = "splice")]
+    pub use_splice: bool,
 
     /// Forwarders in format local_host:local_port:remote_host:remote_port
     #[arg(trailing_var_arg = true)]
@@ -95,7 +223,9 @@ fn load_env_forwarders() -> Vec<ForwarderConfig> {
 }
 
 /// Load forwarders from a YAML config file
-pub(crate) fn load_yaml_forwarders(path: &std::path::Path) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
+pub(crate) fn load_yaml_forwarders(
+    path: &std::path::Path,
+) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
     let content = std::fs::read_to_string(path)?;
     let cf: ConfigFile = serde_yaml::from_str(&content)?;
     Ok(cf.forwarders)
@@ -112,10 +242,7 @@ pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Er
         // CLI args: parse and use instead of YAML
         cli.forwarders
             .iter()
-            .map(|s| {
-                parse_forwarder(s)
-                    .map_err(|e| anyhow::anyhow!("{}", e))
-            })
+            .map(|s| parse_forwarder(s).map_err(|e| anyhow::anyhow!("{}", e)))
             .collect::<Result<Vec<_>, _>>()?
     } else if let Some(path) = &cli.config_file {
         // YAML file
@@ -134,6 +261,51 @@ pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Er
 
     validate_no_duplicates(&forwarders)?;
     Ok(forwarders)
+}
+
+/// Load runtime settings: YAML `settings:` block (if a config file is given),
+/// with CLI flags overriding individual fields. Missing/unreadable file falls
+/// back to defaults (the forwarder load path already surfaces file errors).
+pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
+    let mut settings = match &cli.config_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(content) => serde_yaml::from_str::<ConfigFile>(&content)?.settings,
+            Err(_) => Settings::default(),
+        },
+        None => Settings::default(),
+    };
+
+    if let Some(addr) = &cli.metrics_addr {
+        settings.metrics_addr = Some(addr.clone());
+    }
+    if let Some(v) = cli.report_interval_secs {
+        settings.report_interval_secs = v;
+    }
+    if let Some(v) = cli.sample_interval_secs {
+        settings.sample_interval_secs = v;
+    }
+    if let Some(v) = cli.buffer_bytes {
+        settings.buffer_bytes = v;
+    }
+    if let Some(v) = cli.socket_buffer_bytes {
+        settings.socket_buffer_bytes = Some(v);
+    }
+    if cli.use_splice {
+        settings.use_splice = true;
+    }
+
+    Ok(settings)
+}
+
+/// Read only the `settings:` block from a YAML config file, returning defaults
+/// if it is unreadable or unparseable. Used by hot-reload (CLI overrides are not
+/// re-applied here — reloaded values come straight from the file).
+pub fn load_settings_from_file(path: &std::path::Path) -> Settings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<ConfigFile>(&content).ok())
+        .map(|cf| cf.settings)
+        .unwrap_or_default()
 }
 
 /// Check for duplicate local addresses among forwarders
@@ -200,6 +372,36 @@ mod tests {
                 std::env::remove_var(key);
             }
         }
+    }
+
+    #[test]
+    fn test_settings_defaults() {
+        let yaml =
+            "forwarders:\n  - {local_host: a, local_port: 1, remote_host: b, remote_port: 2}\n";
+        let cf: ConfigFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cf.settings.report_interval_secs, 60);
+        assert_eq!(cf.settings.sample_interval_secs, 1);
+        assert_eq!(cf.settings.buffer_bytes, 65536);
+        assert!(cf.settings.metrics_addr.is_none());
+    }
+
+    #[test]
+    fn test_cli_overrides_settings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs::parse_from([
+            "rfw",
+            "--report-interval",
+            "5",
+            "--buffer-bytes",
+            "1234",
+            "127.0.0.1:1:b:2",
+        ]);
+        let s = load_settings(&cli).unwrap();
+        assert_eq!(s.report_interval_secs, 5);
+        assert_eq!(s.buffer_bytes, 1234);
+        assert_eq!(s.sample_interval_secs, 1); // untouched -> default
+        assert!(s.metrics_addr.is_none());
     }
 
     #[test]
@@ -270,6 +472,12 @@ mod tests {
 
         let cli = CliArgs {
             config_file: None,
+            metrics_addr: None,
+            report_interval_secs: None,
+            sample_interval_secs: None,
+            buffer_bytes: None,
+            socket_buffer_bytes: None,
+            use_splice: false,
             forwarders: vec!["127.0.0.1:8000:cli.example:80".into()],
         };
 
@@ -290,6 +498,12 @@ mod tests {
 
         let cli = CliArgs {
             config_file: None,
+            metrics_addr: None,
+            report_interval_secs: None,
+            sample_interval_secs: None,
+            buffer_bytes: None,
+            socket_buffer_bytes: None,
+            use_splice: false,
             forwarders: Vec::new(),
         };
 

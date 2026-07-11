@@ -3,20 +3,34 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hickory_resolver::TokioResolver;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use crate::config::{load_yaml_forwarders, ForwarderConfig};
-use crate::forwarder::{run_forwarder, stats_reporter};
+use crate::config::{
+    load_settings_from_file, load_yaml_forwarders, ForwarderConfig, RuntimeKnobs, Settings,
+};
+use crate::forwarder::{rate_sampler, run_forwarder, stats_reporter};
 use crate::stats::StatsRegistry;
+
+/// How long to wait for in-flight connections to finish on shutdown before
+/// abandoning them (the runtime drops the rest at process exit).
+const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Manages lifecycle of all forwarders: start, stop, hot-reload.
 pub struct ForwarderManager {
     /// Map of label -> CancellationToken for running forwarders
     forwarders: RwLock<HashMap<String, ForwarderHandle>>,
     stats_registry: Arc<StatsRegistry>,
+    /// One DNS resolver shared by every forwarder (shared cache, no per-forwarder build).
+    resolver: Arc<TokioResolver>,
+    /// Live data-plane knobs (buffer size, socket buffers, splice), updatable on reload.
+    knobs: Arc<RuntimeKnobs>,
+    /// Tracks all in-flight connection tasks so shutdown can drain them.
+    conn_tracker: TaskTracker,
 }
 
 struct ForwarderHandle {
@@ -24,15 +38,30 @@ struct ForwarderHandle {
 }
 
 impl ForwarderManager {
-    pub fn new() -> Self {
-        Self {
+    /// Build the manager. Fails if the DNS resolver cannot be constructed
+    /// (surfaced once at startup instead of panicking per connection).
+    pub fn new(settings: &Settings) -> anyhow::Result<Self> {
+        let resolver = TokioResolver::builder_tokio()
+            .map_err(|e| anyhow::anyhow!("failed to init DNS resolver builder: {e}"))?
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {e}"))?;
+        Ok(Self {
             forwarders: RwLock::new(HashMap::new()),
             stats_registry: Arc::new(StatsRegistry::new()),
-        }
+            resolver: Arc::new(resolver),
+            knobs: Arc::new(RuntimeKnobs::from_settings(settings)),
+            conn_tracker: TaskTracker::new(),
+        })
     }
 
     pub fn stats_registry(&self) -> Arc<StatsRegistry> {
         self.stats_registry.clone()
+    }
+
+    /// Apply reloaded data-plane knobs (buffer/socket-buffer/splice) live.
+    /// New connections pick them up; interval/metrics settings still need a restart.
+    pub fn update_knobs(&self, settings: &Settings) {
+        self.knobs.update(settings);
     }
 
     /// Start all forwarders from the given configs.
@@ -56,9 +85,12 @@ impl ForwarderManager {
         let stats = self.stats_registry.register(&label).await;
         let cfg_clone = cfg.clone();
         let token_clone = token.clone();
+        let resolver = self.resolver.clone();
+        let knobs = self.knobs.clone();
+        let conn_tracker = self.conn_tracker.clone();
 
         tokio::spawn(async move {
-            run_forwarder(cfg_clone, token_clone, stats).await;
+            run_forwarder(cfg_clone, token_clone, stats, resolver, knobs, conn_tracker).await;
         });
 
         fwds.insert(label.clone(), ForwarderHandle { token });
@@ -107,6 +139,26 @@ impl ForwarderManager {
         for label in &labels {
             self.stop_one(label).await;
         }
+
+        // Drain in-flight connection tasks so short transfers can finish instead
+        // of being truncated at process exit. Bounded by a grace window.
+        self.conn_tracker.close();
+        if !self.conn_tracker.is_empty() {
+            info!(
+                "Draining {} in-flight connection(s) (up to {}s)...",
+                self.conn_tracker.len(),
+                SHUTDOWN_DRAIN_GRACE.as_secs()
+            );
+            if tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, self.conn_tracker.wait())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "Shutdown grace elapsed; {} connection(s) still active, abandoning them",
+                    self.conn_tracker.len()
+                );
+            }
+        }
     }
 
     /// Get current labels of running forwarders.
@@ -119,12 +171,15 @@ impl ForwarderManager {
 
 impl Default for ForwarderManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(&Settings::default()).expect("failed to build default ForwarderManager")
     }
 }
 
 fn is_relevant_config_event(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_))
+    matches!(
+        kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    )
 }
 
 fn watched_path_matches_event_path(watched_path: &Path, event_path: &Path) -> bool {
@@ -237,6 +292,9 @@ pub async fn watch_config_file(
                 tokio::time::sleep(RELOAD_SETTLE_DELAY).await;
 
                 info!("Config file changed, reloading...");
+                // Reload the data-plane knobs (buffer/socket-buffer/splice) live.
+                // Interval and metrics-addr changes still require a restart.
+                manager.update_knobs(&load_settings_from_file(&config_path));
                 match load_yaml_forwarders(&config_path) {
                     Ok(configs) => {
                         manager.sync(&configs).await;
@@ -255,9 +313,21 @@ pub async fn watch_config_file(
 pub fn start_stats_reporter(
     stats_registry: Arc<StatsRegistry>,
     cancel: CancellationToken,
+    report_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        stats_reporter(stats_registry, cancel).await;
+        stats_reporter(stats_registry, cancel, report_interval).await;
+    })
+}
+
+/// Start the periodic throughput-rate sampler task.
+pub fn start_rate_sampler(
+    stats_registry: Arc<StatsRegistry>,
+    cancel: CancellationToken,
+    sample_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        rate_sampler(stats_registry, cancel, sample_interval).await;
     })
 }
 

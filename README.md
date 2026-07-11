@@ -9,11 +9,12 @@
 - **Configuration sources** — CLI args, YAML file, or environment variables
 - **Hot-reload** — Watch YAML config file for changes, apply without restart
 - **Auto-reconnect** — Each forwarder retries independently on failure
-- **Dynamic DNS** — Resolves remote hostnames fresh per connection (picks up DNS changes)
+- **Dynamic DNS** — Resolves remote hostnames fresh per connection (picks up DNS changes), with failover across all resolved addresses
 - **Cross-platform** — Windows, macOS, Linux (amd64 + arm64), Android (arm64)
-- **Traffic stats** — Periodic reports (every 60s) with bytes sent/received per forwarder
+- **Traffic stats** — Lifetime cumulative bytes + live throughput rate per forwarder, in periodic logs and an optional HTTP endpoint (`/metrics`, `/stats`)
 - **Structured logging** — Console (human-friendly, color) + JSON file (machine-readable)
-- **Efficient** — Async I/O with `tokio`, handles thousands of concurrent connections
+- **High throughput** — Async I/O with `tokio`, tunable copy/socket buffers, optional Linux `splice(2)` zero-copy path; handles thousands of concurrent connections
+- **Graceful shutdown** — In-flight connections are drained (bounded grace) before exit
 
 ## Quick start
 
@@ -106,7 +107,7 @@ Usage:
 rfw -f forwarders.yml
 ```
 
-The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart.
+The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`) are hot-reloaded; interval and `metrics_addr` changes need a restart.
 
 ### 3. Environment variables
 
@@ -127,10 +128,19 @@ Arguments:
   [FORWARDERS]...  Forwarders in format local_host:local_port:remote_host:remote_port
 
 Options:
-  -f, --file <CONFIG_FILE>  Path to YAML configuration file
-  -h, --help                Print help
-  -V, --version             Print version
+  -f, --file <CONFIG_FILE>       Path to YAML configuration file
+      --metrics-addr <HOST:PORT>  Enable HTTP stats endpoint (/metrics, /stats)
+      --report-interval <SECS>    Traffic-report log cadence (default 60)
+      --sample-interval <SECS>    Throughput-rate sampling cadence (default 1)
+      --buffer-bytes <BYTES>      Per-direction copy buffer size (default 65536)
+      --socket-buffer-bytes <N>   Kernel socket buffer size per socket (default: OS default)
+      --splice                    Use the Linux splice(2) zero-copy path (Linux only)
+  -h, --help                      Print help
+  -V, --version                   Print version
 ```
+
+These runtime options can also be set in the YAML config under a `settings:`
+block (CLI flags take precedence). See `forwarders.yml`.
 
 ## Configuration override behavior
 
@@ -144,10 +154,16 @@ Options:
 When using `-f forwarders.yml`, rfw watches the YAML file for changes:
 
 - **New forwarders** added to the file are started automatically
-- **Removed forwarders** are stopped (existing connections drain naturally)
+- **Removed forwarders** stop accepting new connections (in-flight connections keep running until they close)
 - **Unchanged forwarders** are unaffected
 
 Changes are debounced (1s window) to avoid reload storms.
+
+> **Note:** Hot-reload applies the `forwarders:` list and the data-plane knobs
+> (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`) live — new connections
+> pick up the new values; in-flight connections keep theirs. Changes to
+> `report_interval_secs`, `sample_interval_secs`, and `metrics_addr` still
+> require a restart.
 
 ## How it works
 
@@ -180,10 +196,47 @@ Each forwarder runs as an independent async task:
 └─────────────────────────────────────────────────┘
 ```
 
-- **Connection handling:** Every incoming TCP connection is accepted and proxied to the remote destination using `tokio::io::copy_bidirectional`.
+- **Connection handling:** Every incoming TCP connection is accepted and proxied to the remote destination using `tokio::io::copy_bidirectional_with_sizes` (64 KiB buffers by default), with `TCP_NODELAY` set on both sides.
 - **DNS resolution:** Each connection resolves the remote hostname via the system DNS resolver (using hickory-resolver), so DNS changes are picked up immediately.
-- **Traffic stats:** Bytes sent/received are counted per forwarder and reported as a summary every 60 seconds.
+- **Traffic stats:** Bytes sent/received are counted per forwarder as **lifetime cumulative** counters (never reset). A sampler derives the current throughput rate (bytes/sec, EWMA-smoothed). Both are logged periodically and exposed live via the optional HTTP endpoint.
 - **Logging:** All connection/disconnection/error events are logged to stdout (color, human-friendly) and to `logs/rfw.log` (JSON, daily rotation).
+
+## Performance & tuning
+
+rfw is built for throughput: the release profile uses fat LTO,
+`codegen-units = 1`, and `opt-level = 3`; the data plane copies with
+`copy_bidirectional_with_sizes` over per-connection buffers, sets `TCP_NODELAY`
+on both sockets, shares each forwarder's config by `Arc` (no per-connection
+allocation), and counts bytes with a single lock-free atomic per poll.
+
+For maximum bandwidth:
+
+- **`--buffer-bytes <BYTES>`** — Per-direction copy buffer (default 65536). On
+  fast LAN / 10 GbE links, larger buffers (e.g. `262144` or `1048576`) cut
+  syscall count and raise throughput. Cost is memory: two buffers per direction
+  per active connection, so scale it against your expected connection count.
+
+- **`--socket-buffer-bytes <N>`** — Sets the kernel send/receive buffers
+  (`SO_SNDBUF`/`SO_RCVBUF`) on both sockets. The single biggest lever on
+  high bandwidth-delay (WAN / high-latency) links, where the default buffers
+  cap the in-flight window. Left at the OS default when unset.
+
+- **`--splice`** *(Linux only)* — Uses the `splice(2)` zero-copy data path:
+  bytes move directly between the two sockets through a kernel pipe, never
+  copied into user space. Lower CPU and higher throughput for pure forwarding;
+  ignored with a warning on non-Linux targets. Byte counting is preserved.
+
+  ```bash
+  rfw --splice --socket-buffer-bytes 1048576 --buffer-bytes 1048576 \
+      0.0.0.0:8080:fileserver.lan:80
+  ```
+
+- **Connection count** — Each connection is one async task on tokio's
+  multi-threaded runtime (one worker per CPU core); rfw handles thousands of
+  concurrent connections without extra tuning.
+
+All three knobs above are **hot-reloadable** via the YAML `settings:` block —
+new connections adopt the new values without a restart.
 
 ## Logging
 
@@ -196,15 +249,51 @@ Set `RUST_LOG=debug` or `RUST_LOG=trace` for more verbosity.
 
 ## Traffic report
 
-Every 60 seconds, rfw prints a traffic summary:
+Every `report_interval` seconds (default 60), rfw logs a traffic summary. Totals
+are **cumulative since process start** (not a per-window bucket); `tx`/`rx` are
+the current throughput rate:
 
 ```
 ─── Traffic Report ──────────────────────────────────
-  127.0.0.1:8080->172.16.0.5:80      send=   1.23 MiB  recv=   4.56 MiB  active=3
-  0.0.0.0:3306->db-prod:3306          send=   0.00 B    recv=   0.00 B    active=0
-  TOTAL (all forwarders)              send=   1.23 MiB  recv=   4.56 MiB
+  127.0.0.1:8080->172.16.0.5:80      sent=  1.230 GB  recv=  4.560 GB  tx=12.300 MB/s  rx=45.600 MB/s  active=3
+  TOTAL (all forwarders, lifetime)    sent=  1.230 GB  recv=  4.560 GB
 ──────────────────────────────────────────────────────
 ```
+
+## Bandwidth metrics endpoint
+
+Enable a read-only HTTP endpoint to read bandwidth **continuously**, at any
+moment, while rfw runs:
+
+```bash
+rfw --metrics-addr 127.0.0.1:9090 127.0.0.1:8080:172.16.0.5:80
+```
+
+- **`GET /metrics`** — Prometheus text format (scrape-friendly):
+
+  ```
+  # TYPE rfw_bytes_sent_total counter
+  rfw_bytes_sent_total{label="127.0.0.1:8080->172.16.0.5:80"} 1321205760
+  # TYPE rfw_bytes_received_total counter
+  rfw_bytes_received_total{label="127.0.0.1:8080->172.16.0.5:80"} 4896202752
+  # TYPE rfw_bytes_sent_rate_bps gauge
+  rfw_bytes_sent_rate_bps{label="127.0.0.1:8080->172.16.0.5:80"} 12897484
+  # TYPE rfw_active_connections gauge
+  rfw_active_connections{label="127.0.0.1:8080->172.16.0.5:80"} 3
+  ```
+
+- **`GET /stats`** — JSON array of per-forwarder snapshots:
+
+  ```json
+  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rate_sent_bps":12897484,"rate_recv_bps":48234234}]
+  ```
+
+`bytes_*_total` are lifetime cumulative counters; `*_rate_bps` are the current
+EWMA-smoothed throughput in bytes/sec. The endpoint is **disabled by default**
+(no `--metrics-addr` / `settings.metrics_addr` ⇒ no port opened).
+
+> **Security:** The endpoint is unauthenticated. Bind it to a loopback or
+> trusted interface (e.g. `127.0.0.1:9090`), not a public address.
 
 ## Cross-platform builds
 
@@ -305,10 +394,13 @@ cargo run -- localhost:8080:example.com:80
 ├── src/
 │   ├── main.rs         # Entry point, CLI parsing
 │   ├── config.rs       # Config loading (CLI, YAML, env)
-│   ├── forwarder.rs    # TCP forwarding logic
+│   ├── forwarder.rs    # TCP forwarding logic + reporter + rate sampler
 │   ├── manager.rs      # Forwarder lifecycle management
-│   ├── stats.rs        # Traffic statistics
+│   ├── stats.rs        # Traffic statistics (cumulative counters + rate)
+│   ├── metrics.rs      # HTTP /metrics + /stats endpoint
 │   └── logging.rs      # Tracing/logging setup
+├── tests/
+│   └── e2e_forward.rs  # End-to-end forwarding + metrics test
 └── README.md           # This file
 ```
 
