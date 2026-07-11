@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,9 @@ fn default_sample_interval() -> u64 {
 fn default_buffer_bytes() -> usize {
     65536
 }
+fn default_use_splice() -> bool {
+    false
+}
 
 /// Process-global runtime settings (one HTTP endpoint, one sampler, one reporter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +62,15 @@ pub struct Settings {
     /// Per-direction copy buffer size, bytes.
     #[serde(default = "default_buffer_bytes")]
     pub buffer_bytes: usize,
+    /// Kernel socket buffer size (`SO_SNDBUF`/`SO_RCVBUF`) per socket, bytes.
+    /// `None` leaves the OS default. Raising it helps on high bandwidth-delay
+    /// (WAN / high-latency) links.
+    #[serde(default)]
+    pub socket_buffer_bytes: Option<usize>,
+    /// Use the Linux `splice(2)` zero-copy data path (opt-in, Linux only).
+    /// Ignored with a warning on non-Linux targets.
+    #[serde(default = "default_use_splice")]
+    pub use_splice: bool,
 }
 
 impl Default for Settings {
@@ -67,7 +80,57 @@ impl Default for Settings {
             report_interval_secs: default_report_interval(),
             sample_interval_secs: default_sample_interval(),
             buffer_bytes: default_buffer_bytes(),
+            socket_buffer_bytes: None,
+            use_splice: default_use_splice(),
         }
+    }
+}
+
+/// Live, lock-free copy of the data-plane knobs shared by every connection task.
+///
+/// Held behind an `Arc`; each new connection reads the current values with a
+/// `Relaxed` load. Hot-reload updates them via [`RuntimeKnobs::update`], so new
+/// connections pick up changes to `buffer_bytes` / `socket_buffer_bytes` /
+/// `use_splice` without a restart (in-flight connections keep their values).
+#[derive(Debug)]
+pub struct RuntimeKnobs {
+    buffer_bytes: AtomicUsize,
+    /// `0` means "leave the OS default".
+    socket_buffer_bytes: AtomicUsize,
+    use_splice: AtomicBool,
+}
+
+impl RuntimeKnobs {
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            buffer_bytes: AtomicUsize::new(s.buffer_bytes),
+            socket_buffer_bytes: AtomicUsize::new(s.socket_buffer_bytes.unwrap_or(0)),
+            use_splice: AtomicBool::new(s.use_splice),
+        }
+    }
+
+    /// Apply reloaded settings to the shared knobs (called on hot-reload).
+    pub fn update(&self, s: &Settings) {
+        self.buffer_bytes.store(s.buffer_bytes, Ordering::Relaxed);
+        self.socket_buffer_bytes
+            .store(s.socket_buffer_bytes.unwrap_or(0), Ordering::Relaxed);
+        self.use_splice.store(s.use_splice, Ordering::Relaxed);
+    }
+
+    pub fn buffer_bytes(&self) -> usize {
+        self.buffer_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns `None` when the OS default should be left in place.
+    pub fn socket_buffer_bytes(&self) -> Option<usize> {
+        match self.socket_buffer_bytes.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    pub fn use_splice(&self) -> bool {
+        self.use_splice.load(Ordering::Relaxed)
     }
 }
 
@@ -97,6 +160,15 @@ pub struct CliArgs {
     /// Per-direction copy buffer size, bytes (default 65536)
     #[arg(long = "buffer-bytes")]
     pub buffer_bytes: Option<usize>,
+
+    /// Kernel socket buffer size (SO_SNDBUF/SO_RCVBUF) per socket, bytes
+    /// (default: OS default)
+    #[arg(long = "socket-buffer-bytes")]
+    pub socket_buffer_bytes: Option<usize>,
+
+    /// Use the Linux splice(2) zero-copy data path (Linux only)
+    #[arg(long = "splice")]
+    pub use_splice: bool,
 
     /// Forwarders in format local_host:local_port:remote_host:remote_port
     #[arg(trailing_var_arg = true)]
@@ -215,8 +287,25 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     if let Some(v) = cli.buffer_bytes {
         settings.buffer_bytes = v;
     }
+    if let Some(v) = cli.socket_buffer_bytes {
+        settings.socket_buffer_bytes = Some(v);
+    }
+    if cli.use_splice {
+        settings.use_splice = true;
+    }
 
     Ok(settings)
+}
+
+/// Read only the `settings:` block from a YAML config file, returning defaults
+/// if it is unreadable or unparseable. Used by hot-reload (CLI overrides are not
+/// re-applied here — reloaded values come straight from the file).
+pub fn load_settings_from_file(path: &std::path::Path) -> Settings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<ConfigFile>(&content).ok())
+        .map(|cf| cf.settings)
+        .unwrap_or_default()
 }
 
 /// Check for duplicate local addresses among forwarders
@@ -387,6 +476,8 @@ mod tests {
             report_interval_secs: None,
             sample_interval_secs: None,
             buffer_bytes: None,
+            socket_buffer_bytes: None,
+            use_splice: false,
             forwarders: vec!["127.0.0.1:8000:cli.example:80".into()],
         };
 
@@ -411,6 +502,8 @@ mod tests {
             report_interval_secs: None,
             sample_interval_secs: None,
             buffer_bytes: None,
+            socket_buffer_bytes: None,
+            use_splice: false,
             forwarders: Vec::new(),
         };
 

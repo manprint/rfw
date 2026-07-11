@@ -26,7 +26,7 @@ forwarders:
 # ------------------------------------------------------------
 # Optional runtime settings (all fields optional; defaults shown).
 # CLI flags (--metrics-addr, --report-interval, --sample-interval,
-# --buffer-bytes) override these.
+# --buffer-bytes, --socket-buffer-bytes, --splice) override these.
 # ------------------------------------------------------------
 settings:
   # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON).
@@ -36,5 +36,11 @@ settings:
   report_interval_secs: 60
   # Throughput-rate (bytes/sec) sampling cadence, seconds.
   sample_interval_secs: 1
-  # Per-direction copy buffer size, bytes.
+  # Per-direction copy buffer size, bytes (hot-reloadable).
   buffer_bytes: 65536
+  # Kernel socket buffer size (SO_SNDBUF/SO_RCVBUF) per socket, bytes.
+  # Omit / null leaves the OS default; raise it for high-latency (WAN) links.
+  # (hot-reloadable)
+  # socket_buffer_bytes: 1048576
+  # Use the Linux splice(2) zero-copy data path (Linux only, hot-reloadable).
+  use_splice: false

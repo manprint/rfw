@@ -78,6 +78,21 @@ async fn http_get(port: u16, path: &str) -> String {
 
 #[tokio::test]
 async fn bandwidth_lossless_and_metrics_live() {
+    run_lossless_scenario(&[]).await;
+}
+
+/// The Linux `splice(2)` zero-copy path must be just as lossless as the portable
+/// copy path — byte-exact end-to-end with correct cumulative counters.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bandwidth_lossless_via_splice() {
+    run_lossless_scenario(&["--splice"]).await;
+}
+
+/// Drive one full transfer through a freshly-spawned `rfw` and assert losslessness,
+/// live cumulative metrics, no reset, and no active-connection leak. `extra_args`
+/// are appended to the forwarder command (e.g. `--splice`).
+async fn run_lossless_scenario(extra_args: &[&str]) {
     let echo_port = free_port();
     let local_port = free_port();
     let metrics_port = free_port();
@@ -86,16 +101,18 @@ async fn bandwidth_lossless_and_metrics_live() {
 
     let fwd = format!("127.0.0.1:{local_port}:127.0.0.1:{echo_port}");
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    let mut args = vec![
+        "--metrics-addr",
+        &metrics_addr,
+        "--report-interval",
+        "1",
+        "--sample-interval",
+        "1",
+    ];
+    args.extend_from_slice(extra_args);
+    args.push(&fwd);
     let child = Command::new(env!("CARGO_BIN_EXE_rfw"))
-        .args([
-            "--metrics-addr",
-            &metrics_addr,
-            "--report-interval",
-            "1",
-            "--sample-interval",
-            "1",
-            &fwd,
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

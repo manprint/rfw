@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -9,6 +11,11 @@ use crate::stats::{StatsRegistry, StatsSnapshot};
 
 /// Cap on the request bytes we read before giving up (headers only; GET has no body).
 const MAX_REQUEST_BYTES: usize = 8192;
+
+/// Max time allowed to read the full request head. Bounds slowloris clients that
+/// open a connection and then trickle (or never send) bytes, which would
+/// otherwise leak one hung task per connection.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve a read-only HTTP endpoint exposing live traffic stats.
 ///
@@ -51,18 +58,26 @@ pub async fn serve(addr: String, registry: Arc<StatsRegistry>, cancel: Cancellat
 }
 
 async fn handle_conn(mut stream: TcpStream, registry: Arc<StatsRegistry>) -> std::io::Result<()> {
-    // Read request head until CRLFCRLF or the cap is hit.
+    // Read request head until CRLFCRLF or the cap is hit, under a hard deadline
+    // so a stalled client cannot pin the task open forever.
     let mut buf = Vec::with_capacity(512);
-    let mut chunk = [0_u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
+    let read_head = async {
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX_REQUEST_BYTES {
+                break;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= MAX_REQUEST_BYTES {
-            break;
-        }
+        Ok::<(), std::io::Error>(())
+    };
+    match timeout(REQUEST_READ_TIMEOUT, read_head).await {
+        Ok(r) => r?,
+        Err(_) => return Ok(()), // deadline hit: drop the connection
     }
 
     let head = String::from_utf8_lossy(&buf);

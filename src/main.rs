@@ -51,8 +51,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // splice is Linux-only; warn once at startup if requested elsewhere
+    #[cfg(not(target_os = "linux"))]
+    if settings.use_splice {
+        tracing::warn!("--splice / use_splice is Linux-only; using the portable copy path");
+    }
+
     // Create manager and start all forwarders
-    let manager = Arc::new(manager::ForwarderManager::new(settings.buffer_bytes));
+    let manager = Arc::new(manager::ForwarderManager::new(&settings)?);
     manager.start_all(&forwarders).await;
 
     // Start config file watcher (if config file provided)
