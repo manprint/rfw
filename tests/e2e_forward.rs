@@ -1,80 +1,13 @@
 //! End-to-end tests: spawn the real `rfw` binary, forward TCP through it to an
 //! in-process echo server, and assert byte-exact forwarding + live stats.
-//!
-//! The forwarder binary is located via `CARGO_BIN_EXE_rfw` (set by Cargo for
-//! integration tests), so no library target is required.
 
-use std::net::TcpListener as StdListener;
-use std::process::{Child, Command, Stdio};
+mod common;
+
 use std::time::Duration;
 
+use common::{free_port, http_get, spawn_echo, spawn_rfw, wait_port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-/// Grab a currently-free localhost port (small race window before rebind).
-fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// Kills the child rfw process when the guard drops (test end / panic).
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// In-process echo server: every connection echoes bytes back until EOF.
-async fn spawn_echo(port: u16) {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(x) => x,
-                Err(_) => break,
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0_u8; 65536];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-}
-
-/// Poll until a TCP port accepts connections, or panic after ~5s.
-async fn wait_port(port: u16) {
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("port {port} never came up");
-}
-
-/// Minimal HTTP GET against the metrics endpoint; returns the full response.
-async fn http_get(port: u16, path: &str) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf).to_string()
-}
+use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn bandwidth_lossless_and_metrics_live() {
@@ -93,11 +26,9 @@ async fn bandwidth_lossless_via_splice() {
 /// live cumulative metrics, no reset, and no active-connection leak. `extra_args`
 /// are appended to the forwarder command (e.g. `--splice`).
 async fn run_lossless_scenario(extra_args: &[&str]) {
-    let echo_port = free_port();
     let local_port = free_port();
     let metrics_port = free_port();
-
-    spawn_echo(echo_port).await;
+    let echo_port = spawn_echo().await;
 
     let fwd = format!("127.0.0.1:{local_port}:127.0.0.1:{echo_port}");
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
@@ -111,13 +42,7 @@ async fn run_lossless_scenario(extra_args: &[&str]) {
     ];
     args.extend_from_slice(extra_args);
     args.push(&fwd);
-    let child = Command::new(env!("CARGO_BIN_EXE_rfw"))
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn rfw");
-    let _guard = ChildGuard(child);
+    let _guard = spawn_rfw(&args);
 
     wait_port(local_port).await;
     wait_port(metrics_port).await;

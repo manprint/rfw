@@ -14,18 +14,57 @@ use crate::config::CliArgs;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
+/// Wait for the first shutdown signal.
+///
+/// SIGTERM matters as much as Ctrl+C here: it is what Docker, Kubernetes, and
+/// systemd send first. Listening only for SIGINT meant every container stop
+/// killed in-flight transfers outright, and the documented graceful drain never
+/// ran outside an interactive terminal.
+async fn shutdown_signal() -> anyhow::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = sigterm.recv() => Ok("SIGTERM"),
+            _ = sigint.recv() => Ok("SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("Ctrl+C")
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Setup logging (keep guard alive for app lifetime)
-    let _guard = logging::setup()?;
-
-    // Parse CLI
+    // Parse CLI first: logging setup depends on --log-dir.
     let cli = CliArgs::parse();
+
+    // Healthcheck mode: probe a running instance and exit. Runs before logging
+    // setup so a probe never touches the log directory or competes for the log
+    // file with the instance it is checking.
+    if let Some(addr) = &cli.health_check {
+        return match metrics::health_check(addr).await {
+            Ok(()) => {
+                println!("ok");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+    }
+
+    // Setup logging (keep guard alive for app lifetime)
+    let _guard = logging::setup(&cli.log_dir)?;
 
     // Load forwarder configurations (YAML + CLI + env, merged with precedence)
     let forwarders = config::load_forwarders(&cli)?;
 
-    // Load runtime settings (YAML settings: block + CLI overrides)
+    // Load runtime settings (YAML settings: block + CLI overrides).
+    // Invalid values are rejected here rather than panicking a background task
+    // or wedging the copy loop later.
     let settings = config::load_settings(&cli)?;
 
     if forwarders.is_empty() {
@@ -95,9 +134,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Wait for shutdown signal
-    info!("rfw is running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received. Stopping all forwarders...");
+    info!("rfw is running. Press Ctrl+C (or send SIGTERM) to stop.");
+    let signal = shutdown_signal().await?;
+    info!("{signal} received. Stopping all forwarders...");
 
     // Graceful shutdown
     stats_cancel.cancel();

@@ -14,7 +14,8 @@
 - **Traffic stats** — Lifetime cumulative bytes + live throughput rate per forwarder, in periodic logs and an optional HTTP endpoint (`/metrics`, `/stats`)
 - **Structured logging** — Console (human-friendly, color) + JSON file (machine-readable)
 - **High throughput** — Async I/O with `tokio`, tunable copy/socket buffers, optional Linux `splice(2)` zero-copy path; handles thousands of concurrent connections
-- **Graceful shutdown** — In-flight connections are drained (bounded grace) before exit
+- **Graceful shutdown** — `SIGTERM` and `SIGINT` both drain in-flight connections (bounded grace) before exit
+- **Admission control** — Optional `max_connections` cap sheds excess at the edge instead of growing memory without bound
 
 ## Quick start
 
@@ -128,16 +129,39 @@ Arguments:
   [FORWARDERS]...  Forwarders in format local_host:local_port:remote_host:remote_port
 
 Options:
-  -f, --file <CONFIG_FILE>       Path to YAML configuration file
+  -f, --file <CONFIG_FILE>        Path to YAML configuration file
       --metrics-addr <HOST:PORT>  Enable HTTP stats endpoint (/metrics, /stats)
       --report-interval <SECS>    Traffic-report log cadence (default 60)
       --sample-interval <SECS>    Throughput-rate sampling cadence (default 1)
       --buffer-bytes <BYTES>      Per-direction copy buffer size (default 65536)
       --socket-buffer-bytes <N>   Kernel socket buffer size per socket (default: OS default)
       --splice                    Use the Linux splice(2) zero-copy path (Linux only)
+      --max-connections <N>       Cap concurrent connections (default: unbounded)
+      --connect-timeout <SECS>    Per-address TCP connect timeout (default 10)
+      --dns-timeout <SECS>        DNS resolution timeout (default 5)
+      --log-dir <DIR>             Rolling JSON log directory; "" disables file
+                                  logging (default "logs")
+      --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
+                                  exit 0 (healthy) or 1; starts no forwarders
   -h, --help                      Print help
   -V, --version                   Print version
 ```
+
+### Invalid settings are rejected at startup
+
+Values that would break the process are refused with a clear message rather
+than failing later in a background task:
+
+```bash
+$ rfw --sample-interval 0 127.0.0.1:8080:example.com:80
+Error: sample_interval_secs must be >= 1 (0 would panic the rate sampler)
+
+$ rfw --buffer-bytes 0 127.0.0.1:8080:example.com:80
+Error: buffer_bytes must be between 1024 and 16777216 (got 0)
+```
+
+On **hot-reload** the same values are *clamped* instead of rejected (a live
+process must not abort over an edit), and each correction is logged.
 
 These runtime options can also be set in the YAML config under a `settings:`
 block (CLI flags take precedence). See `forwarders.yml`.
@@ -160,10 +184,21 @@ When using `-f forwarders.yml`, rfw watches the YAML file for changes:
 Changes are debounced (1s window) to avoid reload storms.
 
 > **Note:** Hot-reload applies the `forwarders:` list and the data-plane knobs
-> (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`) live — new connections
-> pick up the new values; in-flight connections keep theirs. Changes to
-> `report_interval_secs`, `sample_interval_secs`, and `metrics_addr` still
-> require a restart.
+> (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, `connect_timeout_secs`,
+> `dns_timeout_secs`) live — new connections pick up the new values; in-flight
+> connections keep theirs. Changes to `report_interval_secs`,
+> `sample_interval_secs`, `max_connections`, and `metrics_addr` still require a
+> restart.
+
+**A reload is applied all-or-nothing.** The file is parsed once, and both the
+`forwarders:` list and the `settings:` block come from that single parse. If the
+file is unparseable (a typo, or a half-written save), the reload is refused and
+the running configuration — forwarders *and* knobs — is left untouched, with the
+reason logged. Duplicate local addresses are rejected the same way.
+
+Re-targeting a forwarder (same local port, different remote) tears down its
+listener and rebuilds it on the same port; the old socket is fully released
+before the rebind, so the port does not go dark in between.
 
 ## How it works
 
@@ -235,17 +270,64 @@ For maximum bandwidth:
   multi-threaded runtime (one worker per CPU core); rfw handles thousands of
   concurrent connections without extra tuning.
 
-All three knobs above are **hot-reloadable** via the YAML `settings:` block —
-new connections adopt the new values without a restart.
+- **`--max-connections <N>`** — Caps concurrently proxied connections across all
+  forwarders. Unbounded by default. Each in-flight connection costs roughly
+  `2 * buffer_bytes` of heap on the portable path, so under a container memory
+  limit this is what keeps a connection flood from becoming an OOM kill.
+  Connections beyond the cap are closed immediately at accept and counted in
+  `rfw_rejected_connections_total`. Size it as
+  `memory_budget / (2 * buffer_bytes)` with headroom.
+
+- **`--connect-timeout <SECS>`** — Per-address TCP connect timeout (default 10).
+  Connect attempts to a multi-address host are **staggered and raced**
+  (RFC 8305 "Happy Eyeballs", 250 ms apart), so a dead or black-holed first
+  DNS record costs a stagger rather than a full timeout.
+
+- **DNS** — A remote given as an IP literal skips the resolver entirely.
+  Hostnames are resolved per connection (hickory caches internally) under
+  `--dns-timeout` (default 5s).
+
+The buffer, socket-buffer and splice knobs above are **hot-reloadable** via the
+YAML `settings:` block — new connections adopt the new values without a restart.
+`max_connections` is fixed at startup.
 
 ## Logging
 
 Logs go to:
 
 - **Console** — Human-readable with colors and timestamps
-- **File** — `logs/rfw.log` (JSON, daily rotation)
+- **File** — `logs/rfw.log` (JSON, daily rotation), unless disabled
 
-Set `RUST_LOG=debug` or `RUST_LOG=trace` for more verbosity.
+Both sinks honour `RUST_LOG` (default `info`). Set `RUST_LOG=debug` for
+per-connection detail, or `RUST_LOG=warn` to quieten both.
+
+Per-connection lifecycle records ("Connected" / "Disconnected") are at **debug**
+level. At `info` a busy forwarder logs only startup, reloads, the periodic
+traffic report, and genuine problems.
+
+> **Operational note:** rotated log files are never deleted. For a long-lived
+> deployment either point `--log-dir` at a volume managed by logrotate, or run
+> with `--log-dir ""` and let the container runtime collect stdout:
+>
+> ```bash
+> rfw --log-dir "" 0.0.0.0:8080:example.com:80
+> ```
+
+## Signals & shutdown
+
+`SIGTERM` (what Docker, Kubernetes, and systemd send) and `SIGINT` (Ctrl+C) both
+trigger the same graceful shutdown:
+
+1. Stop accepting new connections on every forwarder.
+2. Drain in-flight connections, up to a 10-second grace window.
+3. Flush logs and exit.
+
+Give the container at least that long to stop:
+
+```yaml
+stop_grace_period: 15s     # docker compose
+terminationGracePeriodSeconds: 15   # kubernetes
+```
 
 ## Traffic report
 
@@ -280,13 +362,39 @@ rfw --metrics-addr 127.0.0.1:9090 127.0.0.1:8080:172.16.0.5:80
   rfw_bytes_sent_rate_bps{label="127.0.0.1:8080->172.16.0.5:80"} 12897484
   # TYPE rfw_active_connections gauge
   rfw_active_connections{label="127.0.0.1:8080->172.16.0.5:80"} 3
+  # TYPE rfw_rejected_connections_total counter
+  rfw_rejected_connections_total{label="127.0.0.1:8080->172.16.0.5:80"} 0
   ```
 
 - **`GET /stats`** — JSON array of per-forwarder snapshots:
 
   ```json
-  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rate_sent_bps":12897484,"rate_recv_bps":48234234}]
+  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234}]
   ```
+
+- **`GET /`** — Liveness probe (`200 OK`, body `rfw ok`).
+
+A non-zero `rfw_rejected_connections_total` means `max_connections` is the
+bottleneck, not the link — the first thing to check when throughput plateaus.
+
+### Container healthcheck
+
+`--health-check` makes the binary its own probe, which matters in the
+distroless runtime image (no shell, no `curl`). It reaches the endpoint rather
+than just checking that a process exists — a process whose forwarders all
+failed to bind is still running, but is not healthy:
+
+```bash
+rfw --health-check 127.0.0.1:9090 && echo healthy
+```
+
+```yaml
+healthcheck:
+  test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
 
 `bytes_*_total` are lifetime cumulative counters; `*_rate_bps` are the current
 EWMA-smoothed throughput in bytes/sec. The endpoint is **disabled by default**
@@ -375,6 +483,31 @@ cargo build --release
 cargo test
 ```
 
+The suite has four parts:
+
+| Target | What it covers |
+|---|---|
+| unit tests (`src/**`) | settings validation and clamping, runtime knobs, stats/EWMA, Prometheus + JSON rendering, the metrics endpoint's routing and timeouts, accept-error classification, admission control, DNS/IP-literal resolution, staggered connect racing, manager start/stop/sync |
+| `tests/e2e_forward.rs` | byte-exact forwarding and live cumulative metrics, on both the portable and `splice` paths |
+| `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe |
+| `tests/e2e_hot_reload.rs` | re-targeting a port without an outage, add/remove, malformed and duplicate configs, live knob reloads, counter continuity |
+
+The e2e suites spawn the real binary and drive it over real sockets, so they
+catch integration failures (signals, rebinds, shedding) that unit tests cannot.
+
+For a bigger end-to-end payload:
+
+```bash
+RFW_E2E_MB=256 cargo test --test e2e_forward
+```
+
+### Lint
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
 ### Run
 
 ```bash
@@ -400,7 +533,10 @@ cargo run -- localhost:8080:example.com:80
 │   ├── metrics.rs      # HTTP /metrics + /stats endpoint
 │   └── logging.rs      # Tracing/logging setup
 ├── tests/
-│   └── e2e_forward.rs  # End-to-end forwarding + metrics test
+│   ├── common/mod.rs     # Shared e2e harness (spawn rfw, backends, probes)
+│   ├── e2e_forward.rs    # Byte-exact forwarding + live metrics
+│   ├── e2e_lifecycle.rs  # Startup validation, SIGTERM, admission control
+│   └── e2e_hot_reload.rs # Config watcher, rebinds, malformed/duplicate configs
 └── README.md           # This file
 ```
 

@@ -44,3 +44,23 @@ settings:
   # socket_buffer_bytes: 1048576
   # Use the Linux splice(2) zero-copy data path (Linux only, hot-reloadable).
   use_splice: false
+  # Cap on concurrently proxied connections across all forwarders.
+  # Omit / null for unbounded. Each connection costs ~2 * buffer_bytes of heap,
+  # so under a container memory limit this is what prevents an OOM kill.
+  # Connections beyond the cap are closed at accept and counted in
+  # rfw_rejected_connections_total. (startup only — a change needs a restart)
+  # max_connections: 2000
+  # Per-address TCP connect timeout, seconds (hot-reloadable). Attempts to a
+  # multi-address host are staggered 250ms apart and raced, so a dead first
+  # DNS record does not cost a full timeout.
+  connect_timeout_secs: 10
+  # DNS resolution timeout, seconds (hot-reloadable). IP-literal remotes skip
+  # the resolver entirely.
+  dns_timeout_secs: 5
+
+# ------------------------------------------------------------
+# Notes
+#  * Invalid values are rejected at startup with a clear message; on
+#    hot-reload they are clamped to the nearest safe value and logged.
+#  * A file that fails to parse leaves the running configuration untouched.
+# ------------------------------------------------------------

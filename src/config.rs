@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,20 @@ fn default_buffer_bytes() -> usize {
 fn default_use_splice() -> bool {
     false
 }
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_dns_timeout() -> u64 {
+    5
+}
+
+/// Smallest accepted copy buffer. A zero-sized buffer makes
+/// `copy_bidirectional` spin at 100% CPU while moving no bytes, so it is
+/// rejected rather than clamped silently.
+pub const MIN_BUFFER_BYTES: usize = 1024;
+/// Largest accepted copy buffer. Each connection allocates two of these on the
+/// portable path, so an unbounded value is an easy way to OOM the process.
+pub const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 /// Process-global runtime settings (one HTTP endpoint, one sampler, one reporter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +85,19 @@ pub struct Settings {
     /// Ignored with a warning on non-Linux targets.
     #[serde(default = "default_use_splice")]
     pub use_splice: bool,
+    /// Upper bound on concurrently proxied connections across all forwarders.
+    /// `None` means unbounded. Each in-flight connection costs roughly
+    /// `2 * buffer_bytes` of heap on the portable path, so a bound keeps the
+    /// process inside a container memory limit instead of being OOM-killed.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Per-address TCP connect timeout, seconds. With several resolved
+    /// addresses this bounds how long a dead record can stall a connection.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// DNS resolution timeout, seconds.
+    #[serde(default = "default_dns_timeout")]
+    pub dns_timeout_secs: u64,
 }
 
 impl Default for Settings {
@@ -82,6 +109,104 @@ impl Default for Settings {
             buffer_bytes: default_buffer_bytes(),
             socket_buffer_bytes: None,
             use_splice: default_use_splice(),
+            max_connections: None,
+            connect_timeout_secs: default_connect_timeout(),
+            dns_timeout_secs: default_dns_timeout(),
+        }
+    }
+}
+
+impl Settings {
+    /// Reject values that would panic a task or wedge the data plane.
+    ///
+    /// Used at startup, where a bad value should stop the process with a clear
+    /// message instead of silently killing the stats tasks (a zero interval
+    /// panics `tokio::time::interval`) or spinning the CPU (a zero copy buffer
+    /// makes `copy_bidirectional` treat every read as EOF).
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.report_interval_secs == 0 {
+            anyhow::bail!("report_interval_secs must be >= 1 (0 would panic the stats reporter)");
+        }
+        if self.sample_interval_secs == 0 {
+            anyhow::bail!("sample_interval_secs must be >= 1 (0 would panic the rate sampler)");
+        }
+        if self.connect_timeout_secs == 0 {
+            anyhow::bail!("connect_timeout_secs must be >= 1");
+        }
+        if self.dns_timeout_secs == 0 {
+            anyhow::bail!("dns_timeout_secs must be >= 1");
+        }
+        if !(MIN_BUFFER_BYTES..=MAX_BUFFER_BYTES).contains(&self.buffer_bytes) {
+            anyhow::bail!(
+                "buffer_bytes must be between {MIN_BUFFER_BYTES} and {MAX_BUFFER_BYTES} (got {})",
+                self.buffer_bytes
+            );
+        }
+        if let Some(sz) = self.socket_buffer_bytes {
+            if sz == 0 {
+                anyhow::bail!("socket_buffer_bytes must be >= 1, or omitted for the OS default");
+            }
+        }
+        if let Some(max) = self.max_connections {
+            if max == 0 {
+                anyhow::bail!("max_connections must be >= 1, or omitted for unbounded");
+            }
+        }
+        if let Some(addr) = &self.metrics_addr {
+            if addr.parse::<std::net::SocketAddr>().is_err() {
+                anyhow::bail!("metrics_addr '{addr}' is not a valid host:port socket address");
+            }
+        }
+        Ok(())
+    }
+
+    /// Clamp out-of-range values in place, logging each correction.
+    ///
+    /// Used on hot-reload, where the process is already serving traffic and
+    /// aborting is not an option: a bad edit degrades to the nearest safe value
+    /// instead of panicking a task or wedging the copy loop.
+    pub fn clamp_in_place(&mut self) {
+        fn floor_u64(field: &str, value: &mut u64, min: u64) {
+            if *value < min {
+                warn!(
+                    field,
+                    got = *value,
+                    clamped_to = min,
+                    "Invalid setting clamped"
+                );
+                *value = min;
+            }
+        }
+
+        floor_u64("report_interval_secs", &mut self.report_interval_secs, 1);
+        floor_u64("sample_interval_secs", &mut self.sample_interval_secs, 1);
+        floor_u64("connect_timeout_secs", &mut self.connect_timeout_secs, 1);
+        floor_u64("dns_timeout_secs", &mut self.dns_timeout_secs, 1);
+
+        let clamped_buffer = self.buffer_bytes.clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES);
+        if clamped_buffer != self.buffer_bytes {
+            warn!(
+                field = "buffer_bytes",
+                got = self.buffer_bytes,
+                clamped_to = clamped_buffer,
+                "Invalid setting clamped"
+            );
+            self.buffer_bytes = clamped_buffer;
+        }
+
+        if self.socket_buffer_bytes == Some(0) {
+            warn!(
+                field = "socket_buffer_bytes",
+                "Invalid setting (0) ignored; using the OS default"
+            );
+            self.socket_buffer_bytes = None;
+        }
+        if self.max_connections == Some(0) {
+            warn!(
+                field = "max_connections",
+                "Invalid setting (0) ignored; treating as unbounded"
+            );
+            self.max_connections = None;
         }
     }
 }
@@ -98,23 +223,39 @@ pub struct RuntimeKnobs {
     /// `0` means "leave the OS default".
     socket_buffer_bytes: AtomicUsize,
     use_splice: AtomicBool,
+    connect_timeout_secs: AtomicU64,
+    dns_timeout_secs: AtomicU64,
 }
 
 impl RuntimeKnobs {
     pub fn from_settings(s: &Settings) -> Self {
-        Self {
-            buffer_bytes: AtomicUsize::new(s.buffer_bytes),
-            socket_buffer_bytes: AtomicUsize::new(s.socket_buffer_bytes.unwrap_or(0)),
-            use_splice: AtomicBool::new(s.use_splice),
-        }
+        let knobs = Self {
+            buffer_bytes: AtomicUsize::new(default_buffer_bytes()),
+            socket_buffer_bytes: AtomicUsize::new(0),
+            use_splice: AtomicBool::new(false),
+            connect_timeout_secs: AtomicU64::new(default_connect_timeout()),
+            dns_timeout_secs: AtomicU64::new(default_dns_timeout()),
+        };
+        knobs.update(s);
+        knobs
     }
 
     /// Apply reloaded settings to the shared knobs (called on hot-reload).
+    ///
+    /// Values are clamped first, so a bad hot-reload edit cannot install a
+    /// zero-sized copy buffer (which would spin the copy loop) into the live
+    /// data plane.
     pub fn update(&self, s: &Settings) {
+        let mut s = s.clone();
+        s.clamp_in_place();
         self.buffer_bytes.store(s.buffer_bytes, Ordering::Relaxed);
         self.socket_buffer_bytes
             .store(s.socket_buffer_bytes.unwrap_or(0), Ordering::Relaxed);
         self.use_splice.store(s.use_splice, Ordering::Relaxed);
+        self.connect_timeout_secs
+            .store(s.connect_timeout_secs, Ordering::Relaxed);
+        self.dns_timeout_secs
+            .store(s.dns_timeout_secs, Ordering::Relaxed);
     }
 
     pub fn buffer_bytes(&self) -> usize {
@@ -132,6 +273,37 @@ impl RuntimeKnobs {
     pub fn use_splice(&self) -> bool {
         self.use_splice.load(Ordering::Relaxed)
     }
+
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connect_timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    pub fn dns_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dns_timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// Snapshot every data-plane knob in one go, so a connection cannot be
+    /// built from a mix of pre- and post-reload values.
+    pub fn snapshot(&self) -> KnobSnapshot {
+        KnobSnapshot {
+            buffer_bytes: self.buffer_bytes(),
+            socket_buffer_bytes: self.socket_buffer_bytes(),
+            use_splice: self.use_splice(),
+            connect_timeout: self.connect_timeout(),
+            dns_timeout: self.dns_timeout(),
+        }
+    }
+}
+
+/// Immutable set of data-plane knobs captured at accept time. In-flight
+/// connections keep these values across a hot-reload.
+#[derive(Debug, Clone, Copy)]
+pub struct KnobSnapshot {
+    pub buffer_bytes: usize,
+    pub socket_buffer_bytes: Option<usize>,
+    pub use_splice: bool,
+    pub connect_timeout: std::time::Duration,
+    pub dns_timeout: std::time::Duration,
 }
 
 #[derive(Parser, Debug)]
@@ -170,9 +342,53 @@ pub struct CliArgs {
     #[arg(long = "splice")]
     pub use_splice: bool,
 
+    /// Max concurrently proxied connections across all forwarders
+    /// (default: unbounded)
+    #[arg(long = "max-connections")]
+    pub max_connections: Option<usize>,
+
+    /// Per-address TCP connect timeout, seconds (default 10)
+    #[arg(long = "connect-timeout")]
+    pub connect_timeout_secs: Option<u64>,
+
+    /// DNS resolution timeout, seconds (default 5)
+    #[arg(long = "dns-timeout")]
+    pub dns_timeout_secs: Option<u64>,
+
+    /// Directory for the rolling JSON log file. Use `--log-dir ""` to disable
+    /// file logging entirely and log to the console only.
+    #[arg(long = "log-dir", default_value = "logs")]
+    pub log_dir: String,
+
+    /// Probe a running rfw's stats endpoint at HOST:PORT and exit 0 if healthy,
+    /// 1 otherwise. Intended as a container healthcheck in images with no shell
+    /// (the binary is its own probe). Starts no forwarders.
+    #[arg(long = "health-check", value_name = "HOST:PORT")]
+    pub health_check: Option<String>,
+
     /// Forwarders in format local_host:local_port:remote_host:remote_port
     #[arg(trailing_var_arg = true)]
     pub forwarders: Vec<String>,
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        Self {
+            config_file: None,
+            metrics_addr: None,
+            report_interval_secs: None,
+            sample_interval_secs: None,
+            buffer_bytes: None,
+            socket_buffer_bytes: None,
+            use_splice: false,
+            max_connections: None,
+            connect_timeout_secs: None,
+            dns_timeout_secs: None,
+            log_dir: "logs".to_string(),
+            health_check: None,
+            forwarders: Vec::new(),
+        }
+    }
 }
 
 /// Parse a forwarder string "host:port:remote_host:remote_port"
@@ -222,13 +438,34 @@ fn load_env_forwarders() -> Vec<ForwarderConfig> {
     forwarders
 }
 
-/// Load forwarders from a YAML config file
+/// Parsed YAML config: the forwarder list plus the `settings:` block.
+#[derive(Debug)]
+pub(crate) struct LoadedConfig {
+    pub forwarders: Vec<ForwarderConfig>,
+    pub settings: Settings,
+}
+
+/// Read and parse a YAML config file once, returning both halves.
+///
+/// Hot-reload uses this so the `settings:` block and the `forwarders:` list are
+/// applied atomically: a file that fails to parse leaves *both* untouched,
+/// instead of resetting the data-plane knobs to their defaults while the
+/// forwarder list keeps running (which is what two separate loads did).
+pub(crate) fn load_yaml_config(path: &std::path::Path) -> Result<LoadedConfig, anyhow::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let cf: ConfigFile = serde_yaml::from_str(&content)?;
+    validate_no_duplicates(&cf.forwarders)?;
+    Ok(LoadedConfig {
+        forwarders: cf.forwarders,
+        settings: cf.settings,
+    })
+}
+
+/// Load forwarders from a YAML config file.
 pub(crate) fn load_yaml_forwarders(
     path: &std::path::Path,
 ) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
-    let content = std::fs::read_to_string(path)?;
-    let cf: ConfigFile = serde_yaml::from_str(&content)?;
-    Ok(cf.forwarders)
+    Ok(load_yaml_config(path)?.forwarders)
 }
 
 /// Load forwarders merging YAML file, CLI args, and env vars.
@@ -293,19 +530,18 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     if cli.use_splice {
         settings.use_splice = true;
     }
+    if let Some(v) = cli.max_connections {
+        settings.max_connections = Some(v);
+    }
+    if let Some(v) = cli.connect_timeout_secs {
+        settings.connect_timeout_secs = v;
+    }
+    if let Some(v) = cli.dns_timeout_secs {
+        settings.dns_timeout_secs = v;
+    }
 
+    settings.validate()?;
     Ok(settings)
-}
-
-/// Read only the `settings:` block from a YAML config file, returning defaults
-/// if it is unreadable or unparseable. Used by hot-reload (CLI overrides are not
-/// re-applied here — reloaded values come straight from the file).
-pub fn load_settings_from_file(path: &std::path::Path) -> Settings {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_yaml::from_str::<ConfigFile>(&content).ok())
-        .map(|cf| cf.settings)
-        .unwrap_or_default()
 }
 
 /// Check for duplicate local addresses among forwarders
@@ -471,14 +707,8 @@ mod tests {
         ]);
 
         let cli = CliArgs {
-            config_file: None,
-            metrics_addr: None,
-            report_interval_secs: None,
-            sample_interval_secs: None,
-            buffer_bytes: None,
-            socket_buffer_bytes: None,
-            use_splice: false,
             forwarders: vec!["127.0.0.1:8000:cli.example:80".into()],
+            ..CliArgs::default()
         };
 
         let forwarders = load_forwarders(&cli).expect("env forwarders should load");
@@ -496,20 +726,310 @@ mod tests {
             ("RFW_FORWARDER_2", "0.0.0.0:8080:second.example:443"),
         ]);
 
-        let cli = CliArgs {
-            config_file: None,
-            metrics_addr: None,
-            report_interval_secs: None,
-            sample_interval_secs: None,
-            buffer_bytes: None,
-            socket_buffer_bytes: None,
-            use_splice: false,
-            forwarders: Vec::new(),
-        };
+        let cli = CliArgs::default();
 
         let error = load_forwarders(&cli).expect_err("duplicate env forwarders must fail");
         assert!(error
             .to_string()
             .contains("Duplicate local address '0.0.0.0:8080'"));
+    }
+
+    // ---- Settings validation ------------------------------------------------
+    //
+    // These values reach `tokio::time::interval` and `copy_bidirectional`
+    // directly. Before validation existed, `--sample-interval 0` panicked the
+    // sampler task (silently killing every throughput gauge for the life of the
+    // process) and `--buffer-bytes 0` made the copy loop spin at ~67% CPU while
+    // forwarding nothing.
+
+    #[test]
+    fn defaults_are_valid() {
+        Settings::default()
+            .validate()
+            .expect("defaults must validate");
+    }
+
+    #[test]
+    fn validate_rejects_zero_report_interval() {
+        let s = Settings {
+            report_interval_secs: 0,
+            ..Settings::default()
+        };
+        let err = s
+            .validate()
+            .expect_err("zero report interval must be rejected");
+        assert!(err.to_string().contains("report_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_sample_interval() {
+        let s = Settings {
+            sample_interval_secs: 0,
+            ..Settings::default()
+        };
+        let err = s
+            .validate()
+            .expect_err("zero sample interval must be rejected");
+        assert!(err.to_string().contains("sample_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_buffer() {
+        for bad in [0, MIN_BUFFER_BYTES - 1, MAX_BUFFER_BYTES + 1] {
+            let s = Settings {
+                buffer_bytes: bad,
+                ..Settings::default()
+            };
+            let err = s
+                .validate()
+                .expect_err(&format!("buffer_bytes {bad} must be rejected"));
+            assert!(err.to_string().contains("buffer_bytes"), "{err}");
+        }
+        for good in [MIN_BUFFER_BYTES, 65536, MAX_BUFFER_BYTES] {
+            Settings {
+                buffer_bytes: good,
+                ..Settings::default()
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("buffer_bytes {good} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeouts_and_limits() {
+        let cases: Vec<(Settings, &str)> = vec![
+            (
+                Settings {
+                    connect_timeout_secs: 0,
+                    ..Settings::default()
+                },
+                "connect_timeout_secs",
+            ),
+            (
+                Settings {
+                    dns_timeout_secs: 0,
+                    ..Settings::default()
+                },
+                "dns_timeout_secs",
+            ),
+            (
+                Settings {
+                    max_connections: Some(0),
+                    ..Settings::default()
+                },
+                "max_connections",
+            ),
+            (
+                Settings {
+                    socket_buffer_bytes: Some(0),
+                    ..Settings::default()
+                },
+                "socket_buffer_bytes",
+            ),
+        ];
+        for (s, field) in cases {
+            let err = s.validate().expect_err("must be rejected");
+            assert!(err.to_string().contains(field), "expected {field}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_metrics_addr() {
+        let s = Settings {
+            metrics_addr: Some("nonsense".into()),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+
+        let ok = Settings {
+            metrics_addr: Some("127.0.0.1:9090".into()),
+            ..Settings::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn clamp_repairs_instead_of_failing() {
+        // Hot-reload path: a bad edit must degrade, not abort a live process.
+        let mut s = Settings {
+            report_interval_secs: 0,
+            sample_interval_secs: 0,
+            connect_timeout_secs: 0,
+            dns_timeout_secs: 0,
+            buffer_bytes: 0,
+            socket_buffer_bytes: Some(0),
+            max_connections: Some(0),
+            ..Settings::default()
+        };
+        s.clamp_in_place();
+        assert_eq!(s.report_interval_secs, 1);
+        assert_eq!(s.sample_interval_secs, 1);
+        assert_eq!(s.connect_timeout_secs, 1);
+        assert_eq!(s.dns_timeout_secs, 1);
+        assert_eq!(s.buffer_bytes, MIN_BUFFER_BYTES);
+        assert_eq!(s.socket_buffer_bytes, None);
+        assert_eq!(s.max_connections, None);
+        s.validate().expect("clamped settings must be valid");
+    }
+
+    #[test]
+    fn clamp_leaves_valid_settings_untouched() {
+        let original = Settings {
+            buffer_bytes: 131_072,
+            socket_buffer_bytes: Some(1 << 20),
+            max_connections: Some(1024),
+            report_interval_secs: 30,
+            ..Settings::default()
+        };
+        let mut s = original.clone();
+        s.clamp_in_place();
+        assert_eq!(s.buffer_bytes, original.buffer_bytes);
+        assert_eq!(s.socket_buffer_bytes, original.socket_buffer_bytes);
+        assert_eq!(s.max_connections, original.max_connections);
+        assert_eq!(s.report_interval_secs, original.report_interval_secs);
+    }
+
+    // ---- RuntimeKnobs -------------------------------------------------------
+
+    #[test]
+    fn knobs_never_install_a_zero_buffer() {
+        // A hot-reload must not be able to push a spinning buffer size into the
+        // live data plane, even though the file was accepted by serde.
+        let knobs = RuntimeKnobs::from_settings(&Settings {
+            buffer_bytes: 0,
+            ..Settings::default()
+        });
+        assert_eq!(knobs.buffer_bytes(), MIN_BUFFER_BYTES);
+
+        knobs.update(&Settings {
+            buffer_bytes: 0,
+            ..Settings::default()
+        });
+        assert_eq!(knobs.buffer_bytes(), MIN_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn knobs_round_trip_and_update() {
+        let knobs = RuntimeKnobs::from_settings(&Settings::default());
+        assert_eq!(knobs.buffer_bytes(), default_buffer_bytes());
+        assert_eq!(knobs.socket_buffer_bytes(), None);
+        assert!(!knobs.use_splice());
+
+        knobs.update(&Settings {
+            buffer_bytes: 4096,
+            socket_buffer_bytes: Some(8192),
+            use_splice: true,
+            connect_timeout_secs: 3,
+            dns_timeout_secs: 2,
+            ..Settings::default()
+        });
+
+        let snap = knobs.snapshot();
+        assert_eq!(snap.buffer_bytes, 4096);
+        assert_eq!(snap.socket_buffer_bytes, Some(8192));
+        assert!(snap.use_splice);
+        assert_eq!(snap.connect_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(snap.dns_timeout, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn knobs_zero_socket_buffer_means_os_default() {
+        let knobs = RuntimeKnobs::from_settings(&Settings {
+            socket_buffer_bytes: Some(0),
+            ..Settings::default()
+        });
+        assert_eq!(knobs.socket_buffer_bytes(), None);
+    }
+
+    // ---- YAML loading -------------------------------------------------------
+
+    fn write_temp(name: &str, body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("rfw-test-{name}-{}.yml", std::process::id()));
+        std::fs::write(&path, body).expect("write temp config");
+        path
+    }
+
+    #[test]
+    fn load_yaml_config_returns_both_halves() {
+        let path = write_temp(
+            "both",
+            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2}\nsettings:\n  buffer_bytes: 4096\n  use_splice: true\n",
+        );
+        let loaded = load_yaml_config(&path).expect("must parse");
+        assert_eq!(loaded.forwarders.len(), 1);
+        assert_eq!(loaded.settings.buffer_bytes, 4096);
+        assert!(loaded.settings.use_splice);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_yaml_config_rejects_duplicate_local_addresses() {
+        // The reload path used to skip this check, so a duplicate in an edited
+        // file started two forwarders on one port and left one retrying its
+        // bind every 5s forever.
+        let path = write_temp(
+            "dupes",
+            "forwarders:\n  - {local_host: 0.0.0.0, local_port: 8080, remote_host: a, remote_port: 80}\n  - {local_host: 0.0.0.0, local_port: 8080, remote_host: b, remote_port: 80}\n",
+        );
+        let err = load_yaml_config(&path).expect_err("duplicates must be rejected");
+        assert!(err.to_string().contains("Duplicate local address"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_yaml_config_reports_parse_errors() {
+        // A half-written file (editor mid-save) must surface as an error so the
+        // caller keeps the running configuration rather than applying defaults.
+        let path = write_temp(
+            "truncated",
+            "forwarders:\n  - local_host: \"127.0.0.1\"\n    local_p",
+        );
+        assert!(load_yaml_config(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_yaml_config_reports_missing_file() {
+        let missing = std::env::temp_dir().join("rfw-test-definitely-not-here.yml");
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_yaml_config(&missing).is_err());
+    }
+
+    // ---- CLI ----------------------------------------------------------------
+
+    #[test]
+    fn cli_overrides_new_settings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs::parse_from([
+            "rfw",
+            "--max-connections",
+            "512",
+            "--connect-timeout",
+            "3",
+            "--dns-timeout",
+            "2",
+            "127.0.0.1:1:b:2",
+        ]);
+        let s = load_settings(&cli).unwrap();
+        assert_eq!(s.max_connections, Some(512));
+        assert_eq!(s.connect_timeout_secs, 3);
+        assert_eq!(s.dns_timeout_secs, 2);
+    }
+
+    #[test]
+    fn load_settings_rejects_invalid_cli_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs::parse_from(["rfw", "--buffer-bytes", "0", "127.0.0.1:1:b:2"]);
+        assert!(load_settings(&cli).is_err());
+    }
+
+    #[test]
+    fn log_dir_defaults_to_logs_and_accepts_empty() {
+        let cli = CliArgs::parse_from(["rfw", "127.0.0.1:1:b:2"]);
+        assert_eq!(cli.log_dir, "logs");
+        let cli = CliArgs::parse_from(["rfw", "--log-dir", "", "127.0.0.1:1:b:2"]);
+        assert_eq!(cli.log_dir, "");
     }
 }

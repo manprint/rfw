@@ -19,6 +19,8 @@ services:
       - "8081:8081"
       - "8082:8082"
       # Add more ports as needed for your forwarders
+      # Stats endpoint (/metrics, /stats). Keep it off public networks.
+      # - "127.0.0.1:9090:9090"
 
     environment:
       # ── Forwarder configuration via env vars ──
@@ -29,13 +31,29 @@ services:
       # - RFW_FORWARDER_3=0.0.0.0:3306:prod-db.example.com:3306
 
       # ── Runtime settings ──
+      # Both the console and file log sinks honour this.
       - RUST_LOG=info
+
+    # ── Runtime flags ──
+    # --log-dir "" keeps logs on stdout so the Docker log driver (and its
+    #   rotation) owns them; rfw's own rotated files are never pruned.
+    # --max-connections bounds memory: each connection costs ~2 * buffer_bytes,
+    #   so 512 x 2 x 64 KiB = ~64 MiB of copy buffers, inside the 128M limit.
+    # --metrics-addr exposes /metrics, /stats and the / liveness route.
+    command:
+      - --log-dir
+      - ""
+      - --max-connections
+      - "512"
+      - --metrics-addr
+      - 0.0.0.0:9090
 
     # ── Optional: mount a YAML config file ──
     # volumes:
     #   - ./forwarders.yml:/etc/rfw/forwarders.yml:ro
 
     # ── Resource limits ──
+    # Keep --max-connections and --buffer-bytes consistent with this budget.
     deploy:
       resources:
         limits:
@@ -43,9 +61,18 @@ services:
         reservations:
           memory: 32M
 
+    # ── Graceful shutdown ──
+    # rfw handles SIGTERM and drains in-flight connections for up to 10s.
+    # A shorter grace period than that truncates transfers on every deploy.
+    stop_grace_period: 15s
+
     # ── Health check ──
-    # healthcheck:
-    #   test: ["CMD", "pgrep", "-x", "rfw"]
-    #   interval: 30s
-    #   timeout: 5s
-    #   retries: 3
+    # rfw probes its own stats endpoint: the distroless image has no shell or
+    # curl, and checking the process (pgrep / --version) would call a process
+    # whose forwarders all failed to bind "healthy".
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

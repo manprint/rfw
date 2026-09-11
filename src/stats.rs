@@ -25,6 +25,9 @@ pub struct ForwarderStats {
     /// Lifetime bytes remote -> client.
     pub bytes_received: AtomicU64,
     pub active_connections: AtomicU64,
+    /// Lifetime connections refused because `max_connections` was saturated.
+    /// A non-zero value in staging means the cap is the bottleneck, not the link.
+    pub rejected_connections: AtomicU64,
     /// Current send throughput (bytes/sec), EWMA-smoothed. Written only by the sampler.
     pub rate_sent_bps: AtomicU64,
     /// Current receive throughput (bytes/sec), EWMA-smoothed. Written only by the sampler.
@@ -42,6 +45,7 @@ impl ForwarderStats {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
+            rejected_connections: AtomicU64::new(0),
             rate_sent_bps: AtomicU64::new(0),
             rate_recv_bps: AtomicU64::new(0),
             last_sample_sent: AtomicU64::new(0),
@@ -69,6 +73,10 @@ impl ForwarderStats {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn inc_rejected(&self) {
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read a consistent-ish snapshot of all counters. Never resets anything.
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
@@ -76,6 +84,7 @@ impl ForwarderStats {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
+            rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
             rate_sent_bps: self.rate_sent_bps.load(Ordering::Relaxed),
             rate_recv_bps: self.rate_recv_bps.load(Ordering::Relaxed),
         }
@@ -124,6 +133,7 @@ pub struct StatsSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub active_connections: u64,
+    pub rejected_connections: u64,
     pub rate_sent_bps: u64,
     pub rate_recv_bps: u64,
 }
@@ -140,10 +150,18 @@ impl StatsRegistry {
         }
     }
 
-    /// Register a new forwarder and return its stats handle.
+    /// Register a forwarder and return its stats handle.
+    ///
+    /// Idempotent by label: re-registering an existing label hands back the same
+    /// counters instead of pushing a second entry. Two entries with one label
+    /// would emit a duplicate Prometheus series, which scrapers reject.
     pub async fn register(&self, label: &str) -> Arc<ForwarderStats> {
+        let mut stats = self.stats.write().await;
+        if let Some(existing) = stats.iter().find(|s| s.label() == label) {
+            return existing.clone();
+        }
         let s = Arc::new(ForwarderStats::new(label.to_string()));
-        self.stats.write().await.push(s.clone());
+        stats.push(s.clone());
         s
     }
 
@@ -319,5 +337,138 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.000 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.000 MB");
         assert_eq!(format_bytes(1024_u64.pow(4)), "1.000 TB");
+    }
+
+    #[tokio::test]
+    async fn register_is_idempotent_per_label() {
+        // Two entries under one label would emit a duplicate Prometheus series,
+        // which scrapers reject outright.
+        let reg = StatsRegistry::new();
+        let a = reg.register("x:1->y:2").await;
+        let b = reg.register("x:1->y:2").await;
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same label must reuse the same counters"
+        );
+        assert_eq!(reg.collect().await.len(), 1);
+
+        a.add_sent(10);
+        assert_eq!(b.snapshot().bytes_sent, 10, "handles must share state");
+    }
+
+    #[tokio::test]
+    async fn register_keeps_distinct_labels_separate() {
+        let reg = StatsRegistry::new();
+        let a = reg.register("a").await;
+        let b = reg.register("b").await;
+        a.add_sent(1);
+        b.add_received(2);
+        let snaps = reg.collect().await;
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps.iter().find(|s| s.label == "a").unwrap().bytes_sent, 1);
+        assert_eq!(
+            snaps
+                .iter()
+                .find(|s| s.label == "b")
+                .unwrap()
+                .bytes_received,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_drops_only_the_named_forwarder() {
+        let reg = StatsRegistry::new();
+        reg.register("keep").await;
+        reg.register("drop").await;
+        reg.remove("drop").await;
+        let labels: Vec<_> = reg.collect().await.into_iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["keep".to_string()]);
+
+        // Removing something absent is a no-op, not a panic.
+        reg.remove("never-existed").await;
+        assert_eq!(reg.collect().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sample_rates_updates_every_registered_forwarder() {
+        let reg = StatsRegistry::new();
+        let a = reg.register("a").await;
+        let b = reg.register("b").await;
+        a.add_sent(1000);
+        b.add_received(2000);
+        reg.sample_rates(1.0).await;
+        assert_eq!(a.snapshot().rate_sent_bps, 300); // 0.3 * 1000
+        assert_eq!(b.snapshot().rate_recv_bps, 600); // 0.3 * 2000
+    }
+
+    #[test]
+    fn rejected_connections_accumulate() {
+        let stats = ForwarderStats::new("t".to_string());
+        assert_eq!(stats.snapshot().rejected_connections, 0);
+        stats.inc_rejected();
+        stats.inc_rejected();
+        assert_eq!(stats.snapshot().rejected_connections, 2);
+        // Rejections must not touch the active gauge.
+        assert_eq!(stats.snapshot().active_connections, 0);
+    }
+
+    #[test]
+    fn compute_rate_saturates_on_counter_going_backwards() {
+        // Defensive: a decreasing cumulative sample must not underflow into a
+        // nonsense rate.
+        assert_eq!(compute_rate(1000, 500, 1.0, 0), 0);
+    }
+
+    #[test]
+    fn compute_rate_handles_fractional_and_large_dt() {
+        // 500 bytes in 0.5s = 1000 B/s instantaneous -> 0.3 * 1000.
+        assert_eq!(compute_rate(0, 500, 0.5, 0), 300);
+        // Negative dt is treated like zero: keep the previous value.
+        assert_eq!(compute_rate(0, 500, -1.0, 77), 77);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_counts_partial_reads_cumulatively() {
+        // The wrapper counts at poll level so bytes are credited even when the
+        // copy later fails; several small reads must sum exactly.
+        let stats = Arc::new(ForwarderStats::new("t".to_string()));
+        let (mut peer, inner) = tokio::io::duplex(8);
+        let mut counting = CountingStream::new(inner, stats.clone());
+
+        let writer = tokio::spawn(async move {
+            for _ in 0..10 {
+                peer.write_all(b"abcd").await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+        });
+
+        let mut sink = Vec::new();
+        counting.read_to_end(&mut sink).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(sink.len(), 40);
+        assert_eq!(stats.snapshot().bytes_sent, 40);
+        assert_eq!(stats.snapshot().bytes_received, 0);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_eof_does_not_count() {
+        let stats = Arc::new(ForwarderStats::new("t".to_string()));
+        let (peer, inner) = tokio::io::duplex(64);
+        drop(peer); // immediate EOF
+        let mut counting = CountingStream::new(inner, stats.clone());
+        let mut sink = Vec::new();
+        counting.read_to_end(&mut sink).await.unwrap();
+        assert!(sink.is_empty());
+        assert_eq!(stats.snapshot().bytes_sent, 0);
+    }
+
+    #[test]
+    fn format_bytes_rounds_within_a_unit() {
+        assert_eq!(format_bytes(1536), "1.500 KB");
+        assert_eq!(format_bytes(1024 * 1024 * 3 / 2), "1.500 MB");
+        // Beyond the largest unit it keeps scaling TB rather than overflowing.
+        assert!(format_bytes(u64::MAX).ends_with(" TB"));
     }
 }
