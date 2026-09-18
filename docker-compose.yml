@@ -5,11 +5,16 @@
 # Config via env vars: edit the RFW_FORWARDER_N vars below
 # Config via YAML:     uncomment volumes section and create
 #                      ./forwarders.yml
+#
+# For the "database behind a cloud DNS name on the host network" case
+# (e.g. an RDS endpoint whose IP changes on failover), see the
+# "Production recipe" section of the README.
 # ============================================================
 
 services:
   rfw:
-    image: ghcr.io/manprint/rfw:latest
+    # Pin a release tag in production; `latest` moves on every release.
+    image: ghcr.io/manprint/rfw:v1.0.5
     container_name: rfw
     restart: unless-stopped
 
@@ -39,7 +44,11 @@ services:
     #   rotation) owns them; rfw's own rotated files are never pruned.
     # --max-connections bounds memory: each connection costs ~2 * buffer_bytes,
     #   so 512 x 2 x 64 KiB = ~64 MiB of copy buffers, inside the 128M limit.
-    # --metrics-addr exposes /metrics, /stats and the / liveness route.
+    # --metrics-addr exposes /metrics, /stats and the / health route. On the
+    #   default bridge network 0.0.0.0 is only reachable from other containers
+    #   unless published above; with network_mode: host bind 127.0.0.1 instead.
+    # TCP keepalive is on by default (60s idle, 10s interval, 3 probes) so a
+    #   peer that vanishes without closing is reaped in ~90s instead of never.
     command:
       - --log-dir
       - ""
@@ -49,8 +58,20 @@ services:
       - 0.0.0.0:9090
 
     # ── Optional: mount a YAML config file ──
+    # Mount the *directory*, not the single file: editors save by replacing
+    # the inode, and a single-file bind mount keeps pointing at the old one, so
+    # the hot-reload watcher never sees the change.
     # volumes:
-    #   - ./forwarders.yml:/etc/rfw/forwarders.yml:ro
+    #   - ./config:/etc/rfw:ro
+    # command: ["-f", "/etc/rfw/forwarders.yml", "--log-dir", ""]
+
+    # ── File descriptors ──
+    # Each proxied connection holds two sockets. Docker's default soft limit is
+    # often 1024, i.e. ~500 connections before accept() fails with EMFILE.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
     # ── Resource limits ──
     # Keep --max-connections and --buffer-bytes consistent with this budget.
@@ -68,8 +89,8 @@ services:
 
     # ── Health check ──
     # rfw probes its own stats endpoint: the distroless image has no shell or
-    # curl, and checking the process (pgrep / --version) would call a process
-    # whose forwarders all failed to bind "healthy".
+    # curl. GET / answers 200 only while every configured forwarder is bound
+    # and accepting, so a forwarder stuck retrying a taken port is unhealthy.
     healthcheck:
       test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
       interval: 30s

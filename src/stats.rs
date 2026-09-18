@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -36,6 +36,12 @@ pub struct ForwarderStats {
     last_sample_sent: AtomicU64,
     /// Previous sampled value of `bytes_received` (sampler-private).
     last_sample_recv: AtomicU64,
+    /// `true` while the forwarder's listening socket is bound and accepting.
+    ///
+    /// Set by the accept loop, read by the health route: a forwarder stuck in
+    /// its bind-retry loop (port already taken, permission denied) is running
+    /// but not serving, and the healthcheck must say so.
+    listening: AtomicBool,
 }
 
 impl ForwarderStats {
@@ -50,11 +56,16 @@ impl ForwarderStats {
             rate_recv_bps: AtomicU64::new(0),
             last_sample_sent: AtomicU64::new(0),
             last_sample_recv: AtomicU64::new(0),
+            listening: AtomicBool::new(false),
         }
     }
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub fn set_listening(&self, listening: bool) {
+        self.listening.store(listening, Ordering::Relaxed);
     }
 
     pub fn add_sent(&self, n: u64) {
@@ -87,6 +98,7 @@ impl ForwarderStats {
             rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
             rate_sent_bps: self.rate_sent_bps.load(Ordering::Relaxed),
             rate_recv_bps: self.rate_recv_bps.load(Ordering::Relaxed),
+            listening: self.listening.load(Ordering::Relaxed),
         }
     }
 
@@ -136,6 +148,8 @@ pub struct StatsSnapshot {
     pub rejected_connections: u64,
     pub rate_sent_bps: u64,
     pub rate_recv_bps: u64,
+    /// Whether the forwarder's listener is currently bound.
+    pub listening: bool,
 }
 
 /// Global registry of all forwarder stats.
@@ -400,6 +414,18 @@ mod tests {
         reg.sample_rates(1.0).await;
         assert_eq!(a.snapshot().rate_sent_bps, 300); // 0.3 * 1000
         assert_eq!(b.snapshot().rate_recv_bps, 600); // 0.3 * 2000
+    }
+
+    #[test]
+    fn listening_flag_defaults_off_and_round_trips() {
+        // A freshly registered forwarder has not bound yet: the health route
+        // must not report it healthy until the accept loop says so.
+        let stats = ForwarderStats::new("t".to_string());
+        assert!(!stats.snapshot().listening);
+        stats.set_listening(true);
+        assert!(stats.snapshot().listening);
+        stats.set_listening(false);
+        assert!(!stats.snapshot().listening);
     }
 
     #[test]

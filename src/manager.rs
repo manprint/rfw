@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hickory_resolver::config::{LookupIpStrategy, ResolverOpts};
 use hickory_resolver::TokioResolver;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, Semaphore};
@@ -23,6 +24,22 @@ const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// the same local port races the old listener and hits `EADDRINUSE`, costing a
 /// multi-second outage on a port that never needed to go down.
 const STOP_LISTENER_GRACE: Duration = Duration::from_secs(5);
+
+/// Apply rfw's resolver policy on top of whatever the system config provides.
+///
+/// Shared with the DNS tests so they exercise the production strategy rather
+/// than hickory's default.
+///
+/// hickory's default `ip_strategy` is `Ipv6AndIpv4`: it issues the A and AAAA
+/// queries together and waits for *both* to finish. A resolver that drops or
+/// delays AAAA responses (some captive/legacy resolvers do) then stalls every
+/// lookup to `dns_timeout` and fails the connection even though the A answer
+/// arrived immediately. `Ipv4thenIpv6` returns as soon as A yields addresses
+/// and only asks for AAAA when it does not, which also halves query volume on
+/// the IPv4-only targets this forwarder is typically pointed at.
+pub(crate) fn apply_resolver_policy(opts: &mut ResolverOpts) {
+    opts.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+}
 
 /// Manages lifecycle of all forwarders: start, stop, hot-reload.
 pub struct ForwarderManager {
@@ -50,8 +67,10 @@ impl ForwarderManager {
     /// Build the manager. Fails if the DNS resolver cannot be constructed
     /// (surfaced once at startup instead of panicking per connection).
     pub fn new(settings: &Settings) -> anyhow::Result<Self> {
-        let resolver = TokioResolver::builder_tokio()
-            .map_err(|e| anyhow::anyhow!("failed to init DNS resolver builder: {e}"))?
+        let mut builder = TokioResolver::builder_tokio()
+            .map_err(|e| anyhow::anyhow!("failed to init DNS resolver builder: {e}"))?;
+        apply_resolver_policy(builder.options_mut());
+        let resolver = builder
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {e}"))?;
         Ok(Self {
@@ -676,6 +695,16 @@ mod tests {
             ..Settings::default()
         });
         assert!(m.knobs.snapshot().buffer_bytes >= crate::config::MIN_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn resolver_policy_prefers_ipv4_then_ipv6() {
+        // The default joins A and AAAA and waits for both; a dropped AAAA
+        // would stall every connection to the DNS timeout. See
+        // `apply_resolver_policy`.
+        let mut opts = ResolverOpts::default();
+        apply_resolver_policy(&mut opts);
+        assert_eq!(opts.ip_strategy, LookupIpStrategy::Ipv4thenIpv6);
     }
 
     #[test]

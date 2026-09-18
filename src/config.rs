@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,15 @@ fn default_connect_timeout() -> u64 {
 fn default_dns_timeout() -> u64 {
     5
 }
+fn default_keepalive_idle() -> u64 {
+    60
+}
+fn default_keepalive_interval() -> u64 {
+    10
+}
+fn default_keepalive_retries() -> u32 {
+    3
+}
 
 /// Smallest accepted copy buffer. A zero-sized buffer makes
 /// `copy_bidirectional` spin at 100% CPU while moving no bytes, so it is
@@ -98,6 +107,21 @@ pub struct Settings {
     /// DNS resolution timeout, seconds.
     #[serde(default = "default_dns_timeout")]
     pub dns_timeout_secs: u64,
+    /// TCP keepalive idle time before the first probe, seconds, applied to
+    /// both sockets of every proxied connection. `0` disables keepalive.
+    ///
+    /// Without keepalive a peer that vanishes without closing (client crash,
+    /// VPN/NAT drop, remote failover) leaves a half-open connection that
+    /// never ends: it holds a `max_connections` slot, a backend session and
+    /// two copy buffers until the other side happens to write.
+    #[serde(default = "default_keepalive_idle")]
+    pub keepalive_idle_secs: u64,
+    /// Seconds between keepalive probes once the idle time has elapsed.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_secs: u64,
+    /// Unanswered probes before the connection is declared dead.
+    #[serde(default = "default_keepalive_retries")]
+    pub keepalive_retries: u32,
 }
 
 impl Default for Settings {
@@ -112,6 +136,9 @@ impl Default for Settings {
             max_connections: None,
             connect_timeout_secs: default_connect_timeout(),
             dns_timeout_secs: default_dns_timeout(),
+            keepalive_idle_secs: default_keepalive_idle(),
+            keepalive_interval_secs: default_keepalive_interval(),
+            keepalive_retries: default_keepalive_retries(),
         }
     }
 }
@@ -155,6 +182,18 @@ impl Settings {
         if let Some(addr) = &self.metrics_addr {
             if addr.parse::<std::net::SocketAddr>().is_err() {
                 anyhow::bail!("metrics_addr '{addr}' is not a valid host:port socket address");
+            }
+        }
+        if self.keepalive_idle_secs > 0 {
+            if self.keepalive_interval_secs == 0 {
+                anyhow::bail!(
+                    "keepalive_interval_secs must be >= 1 when keepalive is enabled (keepalive_idle_secs > 0)"
+                );
+            }
+            if self.keepalive_retries == 0 {
+                anyhow::bail!(
+                    "keepalive_retries must be >= 1 when keepalive is enabled (keepalive_idle_secs > 0)"
+                );
             }
         }
         Ok(())
@@ -208,7 +247,34 @@ impl Settings {
             );
             self.max_connections = None;
         }
+        if self.keepalive_idle_secs > 0 {
+            floor_u64(
+                "keepalive_interval_secs",
+                &mut self.keepalive_interval_secs,
+                1,
+            );
+            if self.keepalive_retries == 0 {
+                warn!(
+                    field = "keepalive_retries",
+                    got = 0,
+                    clamped_to = 1,
+                    "Invalid setting clamped"
+                );
+                self.keepalive_retries = 1;
+            }
+        }
     }
+}
+
+/// TCP keepalive parameters applied to both sockets of a proxied connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveConfig {
+    /// Idle time before the first probe.
+    pub idle: std::time::Duration,
+    /// Interval between probes.
+    pub interval: std::time::Duration,
+    /// Unanswered probes before the connection is declared dead.
+    pub retries: u32,
 }
 
 /// Live, lock-free copy of the data-plane knobs shared by every connection task.
@@ -225,6 +291,10 @@ pub struct RuntimeKnobs {
     use_splice: AtomicBool,
     connect_timeout_secs: AtomicU64,
     dns_timeout_secs: AtomicU64,
+    /// `0` means keepalive disabled.
+    keepalive_idle_secs: AtomicU64,
+    keepalive_interval_secs: AtomicU64,
+    keepalive_retries: AtomicU32,
 }
 
 impl RuntimeKnobs {
@@ -235,6 +305,9 @@ impl RuntimeKnobs {
             use_splice: AtomicBool::new(false),
             connect_timeout_secs: AtomicU64::new(default_connect_timeout()),
             dns_timeout_secs: AtomicU64::new(default_dns_timeout()),
+            keepalive_idle_secs: AtomicU64::new(default_keepalive_idle()),
+            keepalive_interval_secs: AtomicU64::new(default_keepalive_interval()),
+            keepalive_retries: AtomicU32::new(default_keepalive_retries()),
         };
         knobs.update(s);
         knobs
@@ -256,6 +329,26 @@ impl RuntimeKnobs {
             .store(s.connect_timeout_secs, Ordering::Relaxed);
         self.dns_timeout_secs
             .store(s.dns_timeout_secs, Ordering::Relaxed);
+        self.keepalive_idle_secs
+            .store(s.keepalive_idle_secs, Ordering::Relaxed);
+        self.keepalive_interval_secs
+            .store(s.keepalive_interval_secs, Ordering::Relaxed);
+        self.keepalive_retries
+            .store(s.keepalive_retries, Ordering::Relaxed);
+    }
+
+    /// Returns `None` when keepalive is disabled (`keepalive_idle_secs == 0`).
+    pub fn keepalive(&self) -> Option<KeepaliveConfig> {
+        match self.keepalive_idle_secs.load(Ordering::Relaxed) {
+            0 => None,
+            idle => Some(KeepaliveConfig {
+                idle: std::time::Duration::from_secs(idle),
+                interval: std::time::Duration::from_secs(
+                    self.keepalive_interval_secs.load(Ordering::Relaxed).max(1),
+                ),
+                retries: self.keepalive_retries.load(Ordering::Relaxed).max(1),
+            }),
+        }
     }
 
     pub fn buffer_bytes(&self) -> usize {
@@ -291,6 +384,7 @@ impl RuntimeKnobs {
             use_splice: self.use_splice(),
             connect_timeout: self.connect_timeout(),
             dns_timeout: self.dns_timeout(),
+            keepalive: self.keepalive(),
         }
     }
 }
@@ -304,6 +398,8 @@ pub struct KnobSnapshot {
     pub use_splice: bool,
     pub connect_timeout: std::time::Duration,
     pub dns_timeout: std::time::Duration,
+    /// `None` = keepalive disabled.
+    pub keepalive: Option<KeepaliveConfig>,
 }
 
 #[derive(Parser, Debug)]
@@ -355,6 +451,20 @@ pub struct CliArgs {
     #[arg(long = "dns-timeout")]
     pub dns_timeout_secs: Option<u64>,
 
+    /// TCP keepalive idle time before the first probe, seconds, on both sides
+    /// of every proxied connection (default 60; 0 disables keepalive)
+    #[arg(long = "keepalive-idle", value_name = "SECS")]
+    pub keepalive_idle_secs: Option<u64>,
+
+    /// Seconds between TCP keepalive probes (default 10)
+    #[arg(long = "keepalive-interval", value_name = "SECS")]
+    pub keepalive_interval_secs: Option<u64>,
+
+    /// Unanswered keepalive probes before a connection is declared dead
+    /// (default 3)
+    #[arg(long = "keepalive-retries", value_name = "N")]
+    pub keepalive_retries: Option<u32>,
+
     /// Directory for the rolling JSON log file. Use `--log-dir ""` to disable
     /// file logging entirely and log to the console only.
     #[arg(long = "log-dir", default_value = "logs")]
@@ -384,6 +494,9 @@ impl Default for CliArgs {
             max_connections: None,
             connect_timeout_secs: None,
             dns_timeout_secs: None,
+            keepalive_idle_secs: None,
+            keepalive_interval_secs: None,
+            keepalive_retries: None,
             log_dir: "logs".to_string(),
             health_check: None,
             forwarders: Vec::new(),
@@ -453,7 +566,7 @@ pub(crate) struct LoadedConfig {
 /// forwarder list keeps running (which is what two separate loads did).
 pub(crate) fn load_yaml_config(path: &std::path::Path) -> Result<LoadedConfig, anyhow::Error> {
     let content = std::fs::read_to_string(path)?;
-    let cf: ConfigFile = serde_yaml::from_str(&content)?;
+    let cf: ConfigFile = serde_saphyr::from_str(&content)?;
     validate_no_duplicates(&cf.forwarders)?;
     Ok(LoadedConfig {
         forwarders: cf.forwarders,
@@ -506,7 +619,7 @@ pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Er
 pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     let mut settings = match &cli.config_file {
         Some(path) => match std::fs::read_to_string(path) {
-            Ok(content) => serde_yaml::from_str::<ConfigFile>(&content)?.settings,
+            Ok(content) => serde_saphyr::from_str::<ConfigFile>(&content)?.settings,
             Err(_) => Settings::default(),
         },
         None => Settings::default(),
@@ -538,6 +651,15 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     }
     if let Some(v) = cli.dns_timeout_secs {
         settings.dns_timeout_secs = v;
+    }
+    if let Some(v) = cli.keepalive_idle_secs {
+        settings.keepalive_idle_secs = v;
+    }
+    if let Some(v) = cli.keepalive_interval_secs {
+        settings.keepalive_interval_secs = v;
+    }
+    if let Some(v) = cli.keepalive_retries {
+        settings.keepalive_retries = v;
     }
 
     settings.validate()?;
@@ -614,11 +736,50 @@ mod tests {
     fn test_settings_defaults() {
         let yaml =
             "forwarders:\n  - {local_host: a, local_port: 1, remote_host: b, remote_port: 2}\n";
-        let cf: ConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let cf: ConfigFile = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(cf.settings.report_interval_secs, 60);
         assert_eq!(cf.settings.sample_interval_secs, 1);
         assert_eq!(cf.settings.buffer_bytes, 65536);
         assert!(cf.settings.metrics_addr.is_none());
+        // Keepalive is on by default: a DB forwarder must reap half-open peers.
+        assert_eq!(cf.settings.keepalive_idle_secs, 60);
+        assert_eq!(cf.settings.keepalive_interval_secs, 10);
+        assert_eq!(cf.settings.keepalive_retries, 3);
+    }
+
+    #[test]
+    fn yaml_null_and_missing_optionals_parse_as_none() {
+        // The example config documents `null` / omitted as "disabled". The
+        // parser swap (serde_yaml -> serde-saphyr) must keep that contract.
+        let yaml = "forwarders:\n  - {local_host: a, local_port: 1, remote_host: b, remote_port: 2}\nsettings:\n  metrics_addr: null\n  socket_buffer_bytes: ~\n";
+        let cf: ConfigFile = serde_saphyr::from_str(yaml).unwrap();
+        assert!(cf.settings.metrics_addr.is_none());
+        assert!(cf.settings.socket_buffer_bytes.is_none());
+        assert!(cf.settings.max_connections.is_none());
+    }
+
+    #[test]
+    fn yaml_comments_and_quoted_scalars_parse() {
+        // Shape of the shipped forwarders.yml: comments, quoted hosts, ints.
+        let yaml = "# header\nforwarders:\n  # a forwarder\n  - local_host: \"0.0.0.0\"\n    local_port: 5432\n    remote_host: \"db.example.com\"  # trailing\n    remote_port: 5432\nsettings:\n  metrics_addr: \"127.0.0.1:9090\"\n  use_splice: false\n  keepalive_idle_secs: 0\n";
+        let cf: ConfigFile = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(cf.forwarders.len(), 1);
+        assert_eq!(cf.forwarders[0].local_host, "0.0.0.0");
+        assert_eq!(cf.forwarders[0].remote_host, "db.example.com");
+        assert_eq!(cf.settings.metrics_addr.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(cf.settings.keepalive_idle_secs, 0);
+    }
+
+    #[test]
+    fn shipped_example_config_parses_and_validates() {
+        // The file in the repo root is what users copy; it must always load.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("forwarders.yml");
+        let loaded = load_yaml_config(&path).expect("forwarders.yml must parse");
+        assert_eq!(loaded.forwarders.len(), 3);
+        loaded
+            .settings
+            .validate()
+            .expect("forwarders.yml settings must validate");
     }
 
     #[test]
@@ -831,6 +992,121 @@ mod tests {
             let err = s.validate().expect_err("must be rejected");
             assert!(err.to_string().contains(field), "expected {field}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_keepalive_rules() {
+        // Disabled keepalive does not care about the other two fields.
+        Settings {
+            keepalive_idle_secs: 0,
+            keepalive_interval_secs: 0,
+            keepalive_retries: 0,
+            ..Settings::default()
+        }
+        .validate()
+        .expect("keepalive off must validate regardless of interval/retries");
+
+        // Enabled keepalive needs a usable cadence.
+        for (s, field) in [
+            (
+                Settings {
+                    keepalive_interval_secs: 0,
+                    ..Settings::default()
+                },
+                "keepalive_interval_secs",
+            ),
+            (
+                Settings {
+                    keepalive_retries: 0,
+                    ..Settings::default()
+                },
+                "keepalive_retries",
+            ),
+        ] {
+            let err = s.validate().expect_err("must be rejected");
+            assert!(err.to_string().contains(field), "expected {field}: {err}");
+        }
+    }
+
+    #[test]
+    fn clamp_repairs_keepalive_cadence_only_when_enabled() {
+        let mut on = Settings {
+            keepalive_interval_secs: 0,
+            keepalive_retries: 0,
+            ..Settings::default()
+        };
+        on.clamp_in_place();
+        assert_eq!(on.keepalive_interval_secs, 1);
+        assert_eq!(on.keepalive_retries, 1);
+        on.validate().expect("clamped keepalive must validate");
+
+        let mut off = Settings {
+            keepalive_idle_secs: 0,
+            keepalive_interval_secs: 0,
+            keepalive_retries: 0,
+            ..Settings::default()
+        };
+        off.clamp_in_place();
+        assert_eq!(
+            off.keepalive_idle_secs, 0,
+            "clamping must not turn keepalive on"
+        );
+        assert_eq!(off.keepalive_interval_secs, 0);
+    }
+
+    #[test]
+    fn knobs_expose_keepalive_and_zero_idle_disables_it() {
+        let knobs = RuntimeKnobs::from_settings(&Settings::default());
+        let ka = knobs.keepalive().expect("default keepalive is on");
+        assert_eq!(ka.idle, std::time::Duration::from_secs(60));
+        assert_eq!(ka.interval, std::time::Duration::from_secs(10));
+        assert_eq!(ka.retries, 3);
+        assert_eq!(knobs.snapshot().keepalive, Some(ka));
+
+        // Hot-reload can switch it off and on again.
+        knobs.update(&Settings {
+            keepalive_idle_secs: 0,
+            ..Settings::default()
+        });
+        assert!(knobs.keepalive().is_none());
+        assert!(knobs.snapshot().keepalive.is_none());
+
+        knobs.update(&Settings {
+            keepalive_idle_secs: 30,
+            keepalive_interval_secs: 5,
+            keepalive_retries: 2,
+            ..Settings::default()
+        });
+        let ka = knobs.keepalive().unwrap();
+        assert_eq!(ka.idle, std::time::Duration::from_secs(30));
+        assert_eq!(ka.interval, std::time::Duration::from_secs(5));
+        assert_eq!(ka.retries, 2);
+    }
+
+    #[test]
+    fn cli_keepalive_flags_override_settings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs::parse_from([
+            "rfw",
+            "--keepalive-idle",
+            "120",
+            "--keepalive-interval",
+            "15",
+            "--keepalive-retries",
+            "5",
+            "127.0.0.1:1:b:2",
+        ]);
+        let s = load_settings(&cli).unwrap();
+        assert_eq!(s.keepalive_idle_secs, 120);
+        assert_eq!(s.keepalive_interval_secs, 15);
+        assert_eq!(s.keepalive_retries, 5);
+
+        // `--keepalive-idle 0` is the documented off switch.
+        let cli = CliArgs::parse_from(["rfw", "--keepalive-idle", "0", "127.0.0.1:1:b:2"]);
+        let s = load_settings(&cli).unwrap();
+        assert_eq!(s.keepalive_idle_secs, 0);
+        assert!(RuntimeKnobs::from_settings(&s).keepalive().is_none());
     }
 
     #[test]

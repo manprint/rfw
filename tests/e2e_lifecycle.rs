@@ -432,6 +432,76 @@ async fn health_check_probe_reports_liveness() {
     );
 }
 
+/// The probe must fail while a forwarder cannot bind its port, and recover on
+/// its own once the port frees up. With `--net=host` this is the everyday
+/// failure: something else already listens on the port rfw was given, rfw
+/// retries the bind every 5s, and until this fix the process was "healthy".
+#[tokio::test]
+async fn health_check_fails_while_a_forwarder_cannot_bind_and_recovers() {
+    // Hold the port rfw is about to be told to listen on.
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken_port = blocker.local_addr().unwrap().port();
+    let metrics_port = free_port();
+    let echo_port = spawn_echo().await;
+
+    let fwd = format!("127.0.0.1:{taken_port}:127.0.0.1:{echo_port}");
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    let _guard = spawn_rfw(&["--metrics-addr", &metrics_addr, &fwd]);
+    wait_port(metrics_port).await;
+
+    let root = http_get(metrics_port, "/").await;
+    assert!(root.starts_with("HTTP/1.1 503"), "must be degraded: {root}");
+    assert!(
+        root.contains(&format!("127.0.0.1:{taken_port}->127.0.0.1:{echo_port}")),
+        "body must name the forwarder that cannot bind: {root}"
+    );
+    let stats = http_get(metrics_port, "/stats").await;
+    assert!(stats.contains("\"listening\":false"), "{stats}");
+
+    let probe = tokio::task::spawn_blocking({
+        let addr = metrics_addr.clone();
+        move || {
+            rfw_command(&["--health-check", &addr])
+                .output()
+                .expect("run probe")
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !probe.status.success(),
+        "probe must fail while a forwarder is not listening"
+    );
+
+    // Free the port: the bind-retry loop (5s cadence) claims it and the
+    // process turns healthy without a restart.
+    drop(blocker);
+    let mut healthy = false;
+    for _ in 0..160 {
+        if http_get(metrics_port, "/")
+            .await
+            .starts_with("HTTP/1.1 200 OK")
+        {
+            healthy = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(healthy, "must recover once the port is free");
+
+    let probe = tokio::task::spawn_blocking({
+        let addr = metrics_addr.clone();
+        move || {
+            rfw_command(&["--health-check", &addr])
+                .output()
+                .expect("run probe")
+        }
+    })
+    .await
+    .unwrap();
+    assert!(probe.status.success(), "probe must pass after recovery");
+}
+
 #[test]
 fn health_check_rejects_a_malformed_address() {
     let out = rfw_command(&["--health-check", "not-an-address"])

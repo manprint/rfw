@@ -3,7 +3,11 @@
 # ============================================================
 
 # ── Stage 1: Build ──────────────────────────────────────────
-FROM rust:latest AS builder
+# Pinned to the Debian 12 (bookworm) variant on purpose: the runtime stage is
+# distroless *cc-debian12*, so the builder's glibc must not be newer than the
+# runtime's. `rust:latest` moved to Debian 13 (glibc 2.41) and only kept
+# working because the binary happened not to pull in any post-2.36 symbols.
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

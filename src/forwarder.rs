@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ForwarderConfig, KnobSnapshot, RuntimeKnobs};
+use crate::config::{ForwarderConfig, KeepaliveConfig, KnobSnapshot, RuntimeKnobs};
 use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
 
 /// Stagger between parallel connect attempts to successive resolved addresses
@@ -19,11 +19,13 @@ use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
 /// enough that a healthy first record almost always wins on its own.
 const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
-/// Apply per-socket tuning: disable Nagle and (optionally) size the kernel
-/// send/receive buffers. Failures are logged but non-fatal.
+/// Apply per-socket tuning: disable Nagle, (optionally) size the kernel
+/// send/receive buffers, and (optionally) arm TCP keepalive. Failures are
+/// logged but non-fatal.
 fn tune_socket(
     stream: &TcpStream,
     socket_buffer_bytes: Option<usize>,
+    keepalive: Option<KeepaliveConfig>,
     label: &str,
     peer: std::net::SocketAddr,
     which: &str,
@@ -31,14 +33,73 @@ fn tune_socket(
     if let Err(e) = stream.set_nodelay(true) {
         warn!(forwarder = %label, peer = %peer, error = %e, "set_nodelay({which}) failed");
     }
+    let sock = socket2::SockRef::from(stream);
     if let Some(sz) = socket_buffer_bytes {
-        let sock = socket2::SockRef::from(stream);
         if let Err(e) = sock.set_recv_buffer_size(sz) {
             warn!(forwarder = %label, peer = %peer, error = %e, "set_recv_buffer_size({which}) failed");
         }
         if let Err(e) = sock.set_send_buffer_size(sz) {
             warn!(forwarder = %label, peer = %peer, error = %e, "set_send_buffer_size({which}) failed");
         }
+    }
+    // Keepalive is what turns a half-open connection (peer gone without a
+    // FIN/RST: crashed client, dropped VPN/NAT mapping, remote failover) into
+    // an error the copy loop can see. Without it the connection lives until
+    // the other side happens to write, which for an idle DB session can be
+    // never, and it keeps holding its max_connections permit, its backend
+    // session and its copy buffers the whole time.
+    if let Some(ka) = keepalive {
+        if let Err(e) = sock.set_tcp_keepalive(&keepalive_params(ka)) {
+            warn!(forwarder = %label, peer = %peer, error = %e, "set_tcp_keepalive({which}) failed");
+        }
+    }
+}
+
+/// Translate the configured keepalive into socket2 parameters.
+///
+/// `TCP_KEEPINTVL` / `TCP_KEEPCNT` are not settable on every platform socket2
+/// supports. Where they are not, only the idle time is applied and the OS
+/// defaults govern the probe cadence; a dead peer is still detected, just
+/// later.
+fn keepalive_params(ka: KeepaliveConfig) -> socket2::TcpKeepalive {
+    #[allow(unused_mut)]
+    let mut params = socket2::TcpKeepalive::new().with_time(ka.idle);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+    ))]
+    {
+        params = params.with_interval(ka.interval).with_retries(ka.retries);
+    }
+    params
+}
+
+/// RAII marker for "this forwarder's listener is bound and accepting".
+///
+/// Created right after a successful bind and dropped on every exit path of the
+/// accept loop (cancel, panic), so the health route can never keep reporting a
+/// listener that is gone.
+struct ListeningGuard(Arc<ForwarderStats>);
+
+impl ListeningGuard {
+    fn new(stats: Arc<ForwarderStats>) -> Self {
+        stats.set_listening(true);
+        Self(stats)
+    }
+}
+
+impl Drop for ListeningGuard {
+    fn drop(&mut self) {
+        self.0.set_listening(false);
     }
 }
 
@@ -90,6 +151,9 @@ pub async fn run_forwarder(
     };
 
     info!(forwarder = %label, "Listening on {} -> {}:{}", local_str, cfg.remote_host, cfg.remote_port);
+
+    // Flip the health flag for as long as the accept loop below is alive.
+    let _listening = ListeningGuard::new(stats.clone());
 
     // Accept loop
     loop {
@@ -293,6 +357,7 @@ async fn proxy_connection(
     tune_socket(
         &inbound,
         knobs.socket_buffer_bytes,
+        knobs.keepalive,
         label,
         peer_addr,
         "inbound",
@@ -312,6 +377,7 @@ async fn proxy_connection(
     tune_socket(
         &outbound,
         knobs.socket_buffer_bytes,
+        knobs.keepalive,
         label,
         peer_addr,
         "outbound",
@@ -653,7 +719,582 @@ mod splice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::config::Settings;
+
+    // ---- socket tuning ------------------------------------------------------
+
+    /// A connected loopback pair: (accepted server side, client side).
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn keepalive_is_armed_on_the_socket_when_configured() {
+        let (server, _client) = socket_pair().await;
+        let peer = server.peer_addr().unwrap();
+        let ka = KeepaliveConfig {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(7),
+            retries: 4,
+        };
+        tune_socket(&server, None, Some(ka), "t", peer, "inbound");
+
+        let sock = socket2::SockRef::from(&server);
+        assert!(
+            sock.keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled: this is what reaps half-open peers"
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(45));
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(7)
+            );
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), 4);
+        }
+        assert!(server.nodelay().unwrap(), "TCP_NODELAY must still be set");
+    }
+
+    #[tokio::test]
+    async fn keepalive_stays_off_when_disabled() {
+        // `keepalive_idle_secs: 0` is the documented off switch; the socket
+        // must then be left at the OS default (off).
+        let (server, _client) = socket_pair().await;
+        let peer = server.peer_addr().unwrap();
+        tune_socket(&server, None, None, "t", peer, "inbound");
+        assert!(!socket2::SockRef::from(&server).keepalive().unwrap());
+    }
+
+    #[test]
+    fn default_knobs_arm_keepalive() {
+        // Production default: on. A forwarder in front of a database with
+        // pooled, idle-for-hours clients cannot afford half-open leaks.
+        let snap = RuntimeKnobs::from_settings(&Settings::default()).snapshot();
+        assert!(snap.keepalive.is_some());
+    }
+
+    // ---- listening flag -----------------------------------------------------
+
+    /// Everything `run_forwarder` needs besides the config, with the resolver
+    /// left to the caller.
+    fn forwarder_deps(settings: &Settings) -> (Arc<RuntimeKnobs>, TaskTracker, CancellationToken) {
+        (
+            Arc::new(RuntimeKnobs::from_settings(settings)),
+            TaskTracker::new(),
+            CancellationToken::new(),
+        )
+    }
+
+    fn system_resolver() -> Arc<TokioResolver> {
+        Arc::new(test_resolver())
+    }
+
+    /// Poll until the listening flag equals `want`, or fail after ~3s.
+    async fn wait_listening(stats: &ForwarderStats, want: bool) {
+        for _ in 0..150 {
+            if stats.snapshot().listening == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("listening flag never became {want}");
+    }
+
+    #[tokio::test]
+    async fn listening_flag_tracks_the_accept_loop_lifetime() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let cfg = ForwarderConfig {
+            local_host: "127.0.0.1".into(),
+            local_port: port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 9,
+        };
+        let stats = Arc::new(ForwarderStats::new(cfg.label()));
+        assert!(!stats.snapshot().listening, "not bound yet");
+
+        let (knobs, tracker, cancel) = forwarder_deps(&Settings::default());
+        let task = tokio::spawn(run_forwarder(
+            cfg,
+            cancel.clone(),
+            stats.clone(),
+            system_resolver(),
+            knobs,
+            tracker,
+            None,
+        ));
+
+        wait_listening(&stats, true).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("accept loop must exit on cancel")
+            .unwrap();
+        assert!(
+            !stats.snapshot().listening,
+            "the guard must clear the flag once the accept loop is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn listening_flag_stays_off_while_the_port_is_taken() {
+        // The bind-retry loop is the "running but not serving" state the
+        // health route exists to expose.
+        let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let cfg = ForwarderConfig {
+            local_host: "127.0.0.1".into(),
+            local_port: port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 9,
+        };
+        let stats = Arc::new(ForwarderStats::new(cfg.label()));
+        let (knobs, tracker, cancel) = forwarder_deps(&Settings::default());
+        let task = tokio::spawn(run_forwarder(
+            cfg,
+            cancel.clone(),
+            stats.clone(),
+            system_resolver(),
+            knobs,
+            tracker,
+            None,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !stats.snapshot().listening,
+            "must not claim to listen on a taken port"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("bind-retry loop must exit on cancel")
+            .unwrap();
+        drop(blocker);
+    }
+
+    // ---- DNS change propagation --------------------------------------------
+    //
+    // The production use case is a database behind a cloud DNS name whose IP
+    // changes on failover (RDS-style, TTL of a few seconds). These tests stand
+    // up a fake authoritative resolver inside the test, point a real
+    // `TokioResolver` at it with the production `apply_resolver_policy`, and
+    // drive `run_forwarder` against a hostname whose answer is flipped
+    // underneath it.
+
+    /// Build a minimal DNS response for `query`: an A record with `ip`/`ttl`
+    /// for A questions, an empty NOERROR for anything else. Echoes the
+    /// question section verbatim.
+    fn fake_dns_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Option<Vec<u8>> {
+        if query.len() < 12 {
+            return None;
+        }
+        // Walk QNAME labels.
+        let mut off = 12;
+        loop {
+            let len = *query.get(off)? as usize;
+            off += 1;
+            if len == 0 {
+                break;
+            }
+            off += len;
+        }
+        let qtype = u16::from_be_bytes([*query.get(off)?, *query.get(off + 1)?]);
+        let q_end = off + 4;
+        query.get(..q_end)?;
+
+        let is_a = qtype == 1;
+        let mut resp = Vec::with_capacity(q_end + 16);
+        resp.extend_from_slice(&query[..2]); // ID
+        resp.extend_from_slice(&[0x81, 0x80]); // QR, RD, RA, NOERROR
+        resp.extend_from_slice(&[0, 1]); // QDCOUNT
+        resp.extend_from_slice(&[0, u8::from(is_a)]); // ANCOUNT
+        resp.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
+        resp.extend_from_slice(&query[12..q_end]); // question
+        if is_a {
+            resp.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to question
+            resp.extend_from_slice(&[0, 1, 0, 1]); // TYPE A, CLASS IN
+            resp.extend_from_slice(&ttl.to_be_bytes());
+            resp.extend_from_slice(&[0, 4]); // RDLENGTH
+            resp.extend_from_slice(&ip.octets());
+        }
+        Some(resp)
+    }
+
+    /// Fake resolver on an ephemeral UDP port. Answers every A question with
+    /// the IP currently stored in `answer` (as a `u32` from `Ipv4Addr`) and
+    /// counts A questions in `a_queries`.
+    async fn spawn_fake_dns(
+        answer: Arc<AtomicU32>,
+        a_queries: Arc<AtomicUsize>,
+        ttl: u32,
+    ) -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0_u8; 512];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let ip = Ipv4Addr::from(answer.load(Ordering::Relaxed));
+                if let Some(resp) = fake_dns_response(&buf[..n], ip, ttl) {
+                    // ANCOUNT == 1 means it was an A question.
+                    if resp[7] == 1 {
+                        a_queries.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = sock.send_to(&resp, peer).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A real hickory resolver pointed at the fake server, configured exactly
+    /// the way `ForwarderManager::new` configures the production one.
+    fn resolver_for(dns: SocketAddr) -> TokioResolver {
+        use hickory_resolver::config::{
+            ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig,
+        };
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+        let mut conn = ConnectionConfig::udp();
+        conn.port = dns.port();
+        let mut ns = NameServerConfig::udp(dns.ip());
+        ns.connections = vec![conn];
+        let mut config = ResolverConfig::default();
+        config.add_name_server(ns);
+
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        crate::manager::apply_resolver_policy(builder.options_mut());
+        // Keep the host's /etc/hosts out of the picture.
+        builder.options_mut().use_hosts_file = ResolveHosts::Never;
+        builder.build().unwrap()
+    }
+
+    /// Backend that answers the first bytes of every connection with `tag`
+    /// and then echoes each further chunk prefixed with `tag:`.
+    fn spawn_tagged_backend(listener: TcpListener, tag: &'static str) {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 256];
+                    if sock.read(&mut buf).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(format!("{tag}\n").as_bytes()).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                let mut out = format!("{tag}:").into_bytes();
+                                out.extend_from_slice(&buf[..n]);
+                                if sock.write_all(&out).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Two backends on *different loopback IPs* but the *same port*, because a
+    /// forwarder's remote port is fixed and only the DNS answer moves.
+    /// Linux routes the whole 127/8 to loopback, so 127.0.0.2 is bindable.
+    #[cfg(target_os = "linux")]
+    async fn two_backends_same_port() -> (Ipv4Addr, Ipv4Addr, u16) {
+        let a_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let b_ip = Ipv4Addr::new(127, 0, 0, 2);
+        for _ in 0..50 {
+            let b = TcpListener::bind((b_ip, 0)).await.unwrap();
+            let port = b.local_addr().unwrap().port();
+            if let Ok(a) = TcpListener::bind((a_ip, port)).await {
+                spawn_tagged_backend(a, "SRV-A");
+                spawn_tagged_backend(b, "SRV-B");
+                return (a_ip, b_ip, port);
+            }
+            // Port taken on 127.0.0.1: try another.
+        }
+        panic!("could not find one port free on both loopback addresses");
+    }
+
+    /// Connect through the forwarder, send a greeting, return the backend tag.
+    async fn probe_tag(port: u16) -> String {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0_u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf))
+            .await
+            .expect("backend must answer")
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn fake_dns_is_understood_by_the_real_resolver() {
+        // Sanity check for the harness itself: hickory must accept the hand
+        // rolled response and hand back the address it carries.
+        let answer = Arc::new(AtomicU32::new(u32::from(Ipv4Addr::new(10, 1, 2, 3))));
+        let count = Arc::new(AtomicUsize::new(0));
+        let dns = spawn_fake_dns(answer.clone(), count.clone(), 300).await;
+        let resolver = resolver_for(dns);
+
+        let out = resolve_targets("db.test", 5432, None, &resolver, Duration::from_secs(3))
+            .await
+            .expect("fake DNS answer must resolve");
+        assert_eq!(out, vec!["10.1.2.3:5432".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        // Second lookup inside the TTL is served from hickory's cache: per
+        // connection resolution does not mean per connection network traffic.
+        let _ = resolve_targets("db.test", 5432, None, &resolver, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "must hit the cache within TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_dns_response_shape() {
+        // 12-byte header + "db.test" QNAME + QTYPE A + QCLASS IN.
+        let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(&[2, b'd', b'b', 4, b't', b'e', b's', b't', 0]);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        let r = fake_dns_response(&q, Ipv4Addr::new(1, 2, 3, 4), 7).unwrap();
+        assert_eq!(&r[..2], &[0xAB, 0xCD], "ID echoed");
+        assert_eq!(r[7], 1, "one answer for an A question");
+        assert_eq!(&r[r.len() - 4..], &[1, 2, 3, 4], "RDATA is the IP");
+        assert_eq!(&r[r.len() - 10..r.len() - 6], &7_u32.to_be_bytes(), "TTL");
+
+        // AAAA gets an empty NOERROR, never an A record.
+        let l = q.len();
+        q[l - 3] = 28;
+        let r = fake_dns_response(&q, Ipv4Addr::new(1, 2, 3, 4), 7).unwrap();
+        assert_eq!(r[7], 0);
+        assert!(fake_dns_response(&q[..5], Ipv4Addr::LOCALHOST, 1).is_none());
+    }
+
+    /// The headline guarantee for the database-behind-DNS use case: when the
+    /// record changes, the *next* connection goes to the new address without a
+    /// restart, while connections already open stay pinned to the old one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dns_change_is_followed_by_new_connections_without_restart() {
+        let (a_ip, b_ip, backend_port) = two_backends_same_port().await;
+        let answer = Arc::new(AtomicU32::new(u32::from(a_ip)));
+        let a_queries = Arc::new(AtomicUsize::new(0));
+        const TTL: u32 = 1;
+        let dns = spawn_fake_dns(answer.clone(), a_queries.clone(), TTL).await;
+
+        let local_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let cfg = ForwarderConfig {
+            local_host: "127.0.0.1".into(),
+            local_port,
+            remote_host: "db.test".into(),
+            remote_port: backend_port,
+        };
+        let stats = Arc::new(ForwarderStats::new(cfg.label()));
+        let (knobs, tracker, cancel) = forwarder_deps(&Settings {
+            dns_timeout_secs: 2,
+            connect_timeout_secs: 2,
+            ..Settings::default()
+        });
+        let task = tokio::spawn(run_forwarder(
+            cfg,
+            cancel.clone(),
+            stats.clone(),
+            Arc::new(resolver_for(dns)),
+            knobs,
+            tracker,
+            None,
+        ));
+        wait_listening(&stats, true).await;
+
+        // Phase 1: record -> A. Several connections in a burst share one
+        // lookup thanks to the TTL cache.
+        for _ in 0..3 {
+            assert_eq!(probe_tag(local_port).await, "SRV-A");
+        }
+        assert!(
+            a_queries.load(Ordering::Relaxed) <= 2,
+            "burst of 3 connections must not mean 3 DNS round trips (got {})",
+            a_queries.load(Ordering::Relaxed)
+        );
+
+        // Open a connection and keep it: it must stay on A after the flip.
+        let mut held = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
+        held.write_all(b"hold").await.unwrap();
+        let mut buf = [0_u8; 64];
+        let n = held.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]).trim(), "SRV-A");
+
+        // Flip the record -> B. No restart, no reload, no signal.
+        answer.store(u32::from(b_ip), Ordering::Relaxed);
+
+        // New connections must move over once the cached record expires.
+        let flipped_at = std::time::Instant::now();
+        let mut switched = false;
+        while flipped_at.elapsed() < Duration::from_secs(6) {
+            if probe_tag(local_port).await == "SRV-B" {
+                switched = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(switched, "new connections must follow the DNS change");
+        assert!(
+            flipped_at.elapsed() < Duration::from_secs(TTL as u64 + 3),
+            "switch took {:?}; should be bounded by the record TTL",
+            flipped_at.elapsed()
+        );
+
+        // The connection opened before the flip is still talking to A.
+        held.write_all(b"still").await.unwrap();
+        let n = held.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"SRV-A:still",
+            "in-flight connections stay pinned"
+        );
+        drop(held);
+
+        // And back again: the path is symmetric, not a one-shot.
+        answer.store(u32::from(a_ip), Ordering::Relaxed);
+        let mut back = false;
+        let t = std::time::Instant::now();
+        while t.elapsed() < Duration::from_secs(6) {
+            if probe_tag(local_port).await == "SRV-A" {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(back, "must follow the record back to A");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A record pointing at a dead address must fail the client within the
+    /// connect timeout and recover as soon as the record is fixed, with no
+    /// leftover active-connection count.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dns_pointing_at_a_dead_address_fails_fast_and_recovers() {
+        let (a_ip, _b_ip, backend_port) = two_backends_same_port().await;
+        // 127.0.0.3 has nothing listening on backend_port: connect is refused.
+        let dead_ip = Ipv4Addr::new(127, 0, 0, 3);
+        let answer = Arc::new(AtomicU32::new(u32::from(dead_ip)));
+        let dns = spawn_fake_dns(answer.clone(), Arc::new(AtomicUsize::new(0)), 1).await;
+
+        let local_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let cfg = ForwarderConfig {
+            local_host: "127.0.0.1".into(),
+            local_port,
+            remote_host: "db.test".into(),
+            remote_port: backend_port,
+        };
+        let stats = Arc::new(ForwarderStats::new(cfg.label()));
+        let (knobs, tracker, cancel) = forwarder_deps(&Settings {
+            dns_timeout_secs: 2,
+            connect_timeout_secs: 2,
+            ..Settings::default()
+        });
+        let task = tokio::spawn(run_forwarder(
+            cfg,
+            cancel.clone(),
+            stats.clone(),
+            Arc::new(resolver_for(dns)),
+            knobs,
+            tracker,
+            None,
+        ));
+        wait_listening(&stats, true).await;
+
+        // Dead record: the client sees EOF quickly, not a hang.
+        let started = std::time::Instant::now();
+        let mut c = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
+        let mut sink = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut sink))
+            .await
+            .expect("must not hang on a dead record")
+            .ok();
+        assert!(sink.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        // Record repaired: next connection works, nothing leaked.
+        answer.store(u32::from(a_ip), Ordering::Relaxed);
+        let mut ok = false;
+        let t = std::time::Instant::now();
+        while t.elapsed() < Duration::from_secs(6) {
+            let mut c = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
+            c.write_all(b"ping").await.unwrap();
+            let mut buf = [0_u8; 64];
+            if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf)).await
+            {
+                if String::from_utf8_lossy(&buf[..n]).trim() == "SRV-A" {
+                    ok = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(ok, "must recover once the record points somewhere alive");
+
+        for _ in 0..50 {
+            if stats.active_connections.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn conn_guard_decrements_on_drop() {

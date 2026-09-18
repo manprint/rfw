@@ -9,9 +9,11 @@
 - **Configuration sources** — CLI args, YAML file, or environment variables
 - **Hot-reload** — Watch YAML config file for changes, apply without restart
 - **Auto-reconnect** — Each forwarder retries independently on failure
-- **Dynamic DNS** — Resolves remote hostnames fresh per connection (picks up DNS changes), with failover across all resolved addresses
+- **Dynamic DNS** — Resolves remote hostnames per connection, honouring the record TTL, so a remote whose IP changes (cloud database failover) is followed by the next connection without a restart; fails over across all resolved addresses
+- **TCP keepalive** — On by default on both sides of every connection, so a peer that vanishes without closing is reaped in ~90s instead of holding a slot forever
 - **Cross-platform** — Windows, macOS, Linux (amd64 + arm64), Android (arm64)
 - **Traffic stats** — Lifetime cumulative bytes + live throughput rate per forwarder, in periodic logs and an optional HTTP endpoint (`/metrics`, `/stats`)
+- **Honest healthcheck** — `GET /` answers `200` only while every forwarder is actually bound and accepting; a forwarder stuck retrying a taken port turns it `503`
 - **Structured logging** — Console (human-friendly, color) + JSON file (machine-readable)
 - **High throughput** — Async I/O with `tokio`, tunable copy/socket buffers, optional Linux `splice(2)` zero-copy path; handles thousands of concurrent connections
 - **Graceful shutdown** — `SIGTERM` and `SIGINT` both drain in-flight connections (bounded grace) before exit
@@ -45,7 +47,7 @@ Download from the [releases page](https://github.com/manprint/rfw/releases).
 ### Docker
 
 ```bash
-docker pull ghcr.io/manprint/rfw:latest
+docker pull ghcr.io/manprint/rfw:v1.0.5
 docker compose up -d
 ```
 
@@ -54,8 +56,11 @@ Or run manually:
 ```bash
 docker run --rm -p 8080:8080 \
   -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
-  ghcr.io/manprint/rfw:latest
+  ghcr.io/manprint/rfw:v1.0.5 --log-dir ""
 ```
+
+For the "database behind a cloud DNS name on the host network" deployment, see
+[Production recipe](#production-recipe-database-behind-a-cloud-dns-name-socat-replacement).
 
 ## Forwarder syntax
 
@@ -108,7 +113,7 @@ Usage:
 rfw -f forwarders.yml
 ```
 
-The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`) are hot-reloaded; interval and `metrics_addr` changes need a restart.
+The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive) are hot-reloaded; interval, `max_connections` and `metrics_addr` changes need a restart.
 
 ### 3. Environment variables
 
@@ -139,6 +144,11 @@ Options:
       --max-connections <N>       Cap concurrent connections (default: unbounded)
       --connect-timeout <SECS>    Per-address TCP connect timeout (default 10)
       --dns-timeout <SECS>        DNS resolution timeout (default 5)
+      --keepalive-idle <SECS>     TCP keepalive idle time on both sockets of
+                                  every connection (default 60; 0 disables)
+      --keepalive-interval <SECS> Seconds between keepalive probes (default 10)
+      --keepalive-retries <N>     Unanswered probes before a connection is
+                                  declared dead (default 3)
       --log-dir <DIR>             Rolling JSON log directory; "" disables file
                                   logging (default "logs")
       --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
@@ -185,7 +195,8 @@ Changes are debounced (1s window) to avoid reload storms.
 
 > **Note:** Hot-reload applies the `forwarders:` list and the data-plane knobs
 > (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, `connect_timeout_secs`,
-> `dns_timeout_secs`) live — new connections pick up the new values; in-flight
+> `dns_timeout_secs`, `keepalive_idle_secs`, `keepalive_interval_secs`,
+> `keepalive_retries`) live — new connections pick up the new values; in-flight
 > connections keep theirs. Changes to `report_interval_secs`,
 > `sample_interval_secs`, `max_connections`, and `metrics_addr` still require a
 > restart.
@@ -231,8 +242,8 @@ Each forwarder runs as an independent async task:
 └─────────────────────────────────────────────────┘
 ```
 
-- **Connection handling:** Every incoming TCP connection is accepted and proxied to the remote destination using `tokio::io::copy_bidirectional_with_sizes` (64 KiB buffers by default), with `TCP_NODELAY` set on both sides.
-- **DNS resolution:** Each connection resolves the remote hostname via the system DNS resolver (using hickory-resolver), so DNS changes are picked up immediately.
+- **Connection handling:** Every incoming TCP connection is accepted and proxied to the remote destination using `tokio::io::copy_bidirectional_with_sizes` (64 KiB buffers by default), with `TCP_NODELAY` and TCP keepalive set on both sides.
+- **DNS resolution:** Each connection resolves the remote hostname through hickory-resolver, configured from the system `/etc/resolv.conf`. Answers are cached for their TTL, so a burst of connections costs one lookup, and a record that changes is followed by the first connection after the TTL expires. A queries are answered first and AAAA is only consulted when A yields nothing, so a resolver that is slow to answer AAAA cannot stall connections.
 - **Traffic stats:** Bytes sent/received are counted per forwarder as **lifetime cumulative** counters (never reset). A sampler derives the current throughput rate (bytes/sec, EWMA-smoothed). Both are logged periodically and exposed live via the optional HTTP endpoint.
 - **Logging:** All connection/disconnection/error events are logged to stdout (color, human-friendly) and to `logs/rfw.log` (JSON, daily rotation).
 
@@ -284,12 +295,24 @@ For maximum bandwidth:
   DNS record costs a stagger rather than a full timeout.
 
 - **DNS** — A remote given as an IP literal skips the resolver entirely.
-  Hostnames are resolved per connection (hickory caches internally) under
-  `--dns-timeout` (default 5s).
+  Hostnames are resolved per connection under `--dns-timeout` (default 5s);
+  hickory caches answers for their TTL, so a burst of connections costs one
+  lookup and an IP change is picked up by the first connection after the TTL.
 
-The buffer, socket-buffer and splice knobs above are **hot-reloadable** via the
-YAML `settings:` block — new connections adopt the new values without a restart.
-`max_connections` is fixed at startup.
+- **`--keepalive-idle / --keepalive-interval / --keepalive-retries`** — TCP
+  keepalive on **both** sockets of every proxied connection, on by default
+  (60s idle, 10s between probes, 3 probes ⇒ a dead peer is detected in ~90s).
+  This is what turns a half-open connection into an error the forwarder can
+  see. Without it, a client that crashed, lost its VPN, or had its NAT mapping
+  expire — or a remote that failed over without sending a reset — leaves a
+  connection that never ends and keeps holding its `max_connections` slot, its
+  backend session and its two copy buffers. Database clients with pooled,
+  idle-for-hours sessions are exactly the shape that leaks. Set
+  `--keepalive-idle 0` to disable.
+
+The buffer, socket-buffer, splice, timeout and keepalive knobs above are
+**hot-reloadable** via the YAML `settings:` block — new connections adopt the
+new values without a restart. `max_connections` is fixed at startup.
 
 ## Logging
 
@@ -364,15 +387,21 @@ rfw --metrics-addr 127.0.0.1:9090 127.0.0.1:8080:172.16.0.5:80
   rfw_active_connections{label="127.0.0.1:8080->172.16.0.5:80"} 3
   # TYPE rfw_rejected_connections_total counter
   rfw_rejected_connections_total{label="127.0.0.1:8080->172.16.0.5:80"} 0
+  # TYPE rfw_listening gauge
+  rfw_listening{label="127.0.0.1:8080->172.16.0.5:80"} 1
   ```
 
 - **`GET /stats`** — JSON array of per-forwarder snapshots:
 
   ```json
-  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234}]
+  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234,"listening":true}]
   ```
 
-- **`GET /`** — Liveness probe (`200 OK`, body `rfw ok`).
+- **`GET /`** — Health probe. `200 OK` (body `rfw ok`) while **every**
+  configured forwarder has its listener bound and accepting;
+  `503 Service Unavailable` otherwise, with a body naming the forwarders that
+  are not listening (e.g. stuck in the bind-retry loop because the port is
+  already taken).
 
 A non-zero `rfw_rejected_connections_total` means `max_connections` is the
 bottleneck, not the link — the first thing to check when throughput plateaus.
@@ -380,9 +409,11 @@ bottleneck, not the link — the first thing to check when throughput plateaus.
 ### Container healthcheck
 
 `--health-check` makes the binary its own probe, which matters in the
-distroless runtime image (no shell, no `curl`). It reaches the endpoint rather
-than just checking that a process exists — a process whose forwarders all
-failed to bind is still running, but is not healthy:
+distroless runtime image (no shell, no `curl`). It performs `GET /` and exits
+`0` only on `200`, so it inherits the rule above: a process whose forwarder
+cannot bind its port is running but **not** healthy, and the probe says so.
+Once the port frees up, the bind-retry loop claims it and the probe turns green
+without a restart.
 
 ```bash
 rfw --health-check 127.0.0.1:9090 && echo healthy
@@ -460,15 +491,129 @@ docker run --rm -p 8080:8080 \
 docker compose up -d
 ```
 
-If you need to pin a specific image version, use `ghcr.io/manprint/rfw:v1.0.1` instead of `latest`.
+In production pin a release tag (`ghcr.io/manprint/rfw:v1.0.5`) rather than
+`latest`, which moves on every release. Edit `docker-compose.yml` to configure
+your forwarders via env vars.
 
-Edit `docker-compose.yml` to configure your forwarders via env vars.
+### Production recipe: database behind a cloud DNS name (socat replacement)
+
+The canonical deployment: clients connect to port `5432` on a host, and rfw
+forwards to a managed database (Amazon RDS, Cloud SQL, Azure Database, …) that
+is reachable only through a **DNS name whose IP changes** on failover or
+maintenance. This replaces the classic
+
+```bash
+socat tcp-listen:5432,fork,reuseaddr tcp-connect:$(dig +short db.example.com | head -1):5432
+```
+
+which resolves the name **once at start** and pins the IP: after a failover it
+keeps forwarding to the old address until someone restarts the container.
+
+What rfw does differently, and what to expect:
+
+| Event | Behaviour |
+|---|---|
+| Normal operation | Every new connection resolves the name; hickory caches the answer for its TTL (RDS publishes 5s), so a burst of connections costs one lookup. |
+| DNS record changes (failover) | The first connection after the TTL expires goes to the new IP. No restart, no reload, no signal. Verified end-to-end in the test suite. |
+| Connections already open at failover | Stay on the old IP (this is L4 forwarding; the bytes are in flight). They end when the old instance resets them, or when keepalive declares them dead (~90s). Clients reconnect and land on the new IP. |
+| Record temporarily points at a dead IP | The client's connection fails after `--connect-timeout` (not a hang); recovery is automatic once the record is fixed. |
+| Client vanishes without closing (crash, VPN/NAT drop) | Keepalive reaps the half-open connection in ~90s, freeing its `max_connections` slot and the database session behind it. |
+| Port already taken on the host | The forwarder retries the bind every 5s and the healthcheck reports `503` until it succeeds. |
+
+**`docker run`** (host network, exactly like the socat container it replaces):
+
+```bash
+docker rm -f rfw-db 2>/dev/null
+
+docker run -d \
+  --name=rfw-db \
+  --net=host \
+  --restart=always \
+  --ulimit nofile=65536:65536 \
+  --stop-timeout 15 \
+  --health-cmd '/usr/local/bin/rfw --health-check 127.0.0.1:9090' \
+  --health-interval 30s --health-timeout 10s --health-retries 3 \
+  -e RFW_FORWARDER_1=0.0.0.0:5432:mydb.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com:5432 \
+  -e RUST_LOG=info \
+  ghcr.io/manprint/rfw:v1.0.5 \
+    --log-dir "" \
+    --max-connections 1000 \
+    --metrics-addr 127.0.0.1:9090 \
+    --connect-timeout 5 \
+    --dns-timeout 3
+```
+
+- `--net=host` binds `0.0.0.0:5432` directly on the host, like `socat` did, and
+  uses the host's `/etc/resolv.conf` for DNS.
+- `--ulimit nofile=65536:65536`: each proxied connection holds two sockets and
+  Docker's default soft limit is often 1024, i.e. ~500 connections before
+  `accept()` fails with `EMFILE`.
+- `--stop-timeout 15` covers the 10s in-flight drain on `docker stop`.
+- `--metrics-addr 127.0.0.1:9090`: on the host network `0.0.0.0` would expose
+  the unauthenticated stats endpoint on every interface. Loopback keeps it
+  local; the healthcheck reaches it from inside the same network namespace.
+- `--max-connections` should stay below the database's own connection limit;
+  with keepalive on, dead clients no longer eat into it.
+- `--log-dir ""` leaves logging to the Docker log driver (rfw never prunes its
+  own rotated files).
+
+**Docker Compose**, same deployment:
+
+```yaml
+services:
+  rfw-db:
+    image: ghcr.io/manprint/rfw:v1.0.5
+    container_name: rfw-db
+    restart: always
+    network_mode: host          # 0.0.0.0:5432 on the host, host DNS
+    environment:
+      - RFW_FORWARDER_1=0.0.0.0:5432:mydb.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com:5432
+      - RUST_LOG=info
+    command:
+      - --log-dir
+      - ""
+      - --max-connections
+      - "1000"
+      - --metrics-addr
+      - 127.0.0.1:9090
+      - --connect-timeout
+      - "5"
+      - --dns-timeout
+      - "3"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+```
+
+To manage the forwarder list from a file instead (hot-reload, several
+databases), mount the **directory** containing `forwarders.yml` rather than the
+single file — editors save by replacing the inode, and a single-file bind mount
+keeps pointing at the old one so the watcher never sees the change:
+
+```yaml
+    volumes:
+      - ./rfw:/etc/rfw:ro
+    command: ["-f", "/etc/rfw/forwarders.yml", "--log-dir", "", "--metrics-addr", "127.0.0.1:9090"]
+```
+
+Keepalive (`keepalive_idle_secs` 60 / `keepalive_interval_secs` 10 /
+`keepalive_retries` 3) is on by default and needs no flag; tune it in the
+`settings:` block or with `--keepalive-*` if your network drops idle flows
+faster than 60s.
 
 ## Development
 
 ### Prerequisites
 
-- Rust (latest stable)
+- Rust 1.89 or newer (stable)
 - Linux/macOS (for cross-compilation build script: Docker)
 
 ### Build
@@ -487,9 +632,9 @@ The suite has four parts:
 
 | Target | What it covers |
 |---|---|
-| unit tests (`src/**`) | settings validation and clamping, runtime knobs, stats/EWMA, Prometheus + JSON rendering, the metrics endpoint's routing and timeouts, accept-error classification, admission control, DNS/IP-literal resolution, staggered connect racing, manager start/stop/sync |
+| unit tests (`src/**`) | settings validation and clamping, runtime knobs, keepalive socket options, stats/EWMA, Prometheus + JSON rendering, the metrics endpoint's routing, health verdict and timeouts, accept-error classification, admission control, DNS/IP-literal resolution, **DNS change propagation against an in-test fake resolver** (new connections follow the record, held connections stay pinned, dead records fail fast and recover), staggered connect racing, manager start/stop/sync |
 | `tests/e2e_forward.rs` | byte-exact forwarding and live cumulative metrics, on both the portable and `splice` paths |
-| `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe |
+| `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe including `503` while a port cannot be bound and recovery once it frees |
 | `tests/e2e_hot_reload.rs` | re-targeting a port without an outage, add/remove, malformed and duplicate configs, live knob reloads, counter continuity |
 
 The e2e suites spawn the real binary and drive it over real sockets, so they

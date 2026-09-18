@@ -170,7 +170,7 @@ async fn handle_conn(mut stream: TcpStream, registry: Arc<StatsRegistry>) -> std
             let body = render_json(&registry.collect().await);
             http_response("200 OK", "application/json", &body)
         }
-        Some("/") => http_response("200 OK", "text/plain", "rfw ok\n"),
+        Some("/") => render_health(&registry.collect().await),
         _ => http_response("404 Not Found", "text/plain", "not found\n"),
     };
 
@@ -188,6 +188,32 @@ pub fn parse_request_target(head: &str) -> Option<String> {
         return None;
     }
     parts.next().map(|s| s.to_string())
+}
+
+/// Health verdict for `GET /`.
+///
+/// `200` only while every registered forwarder has its listener bound. A
+/// forwarder stuck in its bind-retry loop (port already taken, permission
+/// denied) is a running process that serves nothing on that port; reporting
+/// it healthy would let an orchestrator keep routing to a dark port forever.
+/// The body names the offenders so the failure is diagnosable from the probe
+/// alone.
+pub fn render_health(snaps: &[StatsSnapshot]) -> String {
+    let unbound: Vec<&str> = snaps
+        .iter()
+        .filter(|s| !s.listening)
+        .map(|s| s.label.as_str())
+        .collect();
+    if unbound.is_empty() {
+        http_response("200 OK", "text/plain", "rfw ok\n")
+    } else {
+        let body = format!(
+            "rfw degraded: {} forwarder(s) not listening: {}\n",
+            unbound.len(),
+            unbound.join(", ")
+        );
+        http_response("503 Service Unavailable", "text/plain", &body)
+    }
 }
 
 fn http_response(status: &str, content_type: &str, body: &str) -> String {
@@ -290,6 +316,14 @@ pub fn render_prometheus(snaps: &[StatsSnapshot]) -> String {
         snaps,
         |s| s.rejected_connections,
     );
+    push_metric(
+        &mut out,
+        "rfw_listening",
+        "1 while the forwarder's listener is bound and accepting, 0 otherwise.",
+        "gauge",
+        snaps,
+        |s| u64::from(s.listening),
+    );
     out
 }
 
@@ -301,14 +335,15 @@ pub fn render_json(snaps: &[StatsSnapshot]) -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"label\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{}}}",
+            "{{\"label\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{},\"listening\":{}}}",
             escape(&s.label),
             s.bytes_sent,
             s.bytes_received,
             s.active_connections,
             s.rejected_connections,
             s.rate_sent_bps,
-            s.rate_recv_bps
+            s.rate_recv_bps,
+            s.listening
         ));
     }
     out.push(']');
@@ -328,6 +363,7 @@ mod tests {
             rejected_connections: 3,
             rate_sent_bps: 10,
             rate_recv_bps: 20,
+            listening: true,
         }
     }
 
@@ -385,6 +421,47 @@ mod tests {
                 "stray line leaked into the exposition format: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn prometheus_and_json_expose_listening() {
+        let out = render_prometheus(&[snap()]);
+        assert!(out.contains("# TYPE rfw_listening gauge"));
+        assert!(out.contains("rfw_listening{label=\"a:1->b:2\"} 1"));
+        let dark = StatsSnapshot {
+            listening: false,
+            ..snap()
+        };
+        assert!(render_prometheus(std::slice::from_ref(&dark))
+            .contains("rfw_listening{label=\"a:1->b:2\"} 0"));
+        assert!(render_json(&[snap()]).contains("\"listening\":true"));
+        assert!(render_json(&[dark]).contains("\"listening\":false"));
+    }
+
+    #[test]
+    fn health_is_200_only_when_every_forwarder_listens() {
+        // Nothing registered: nothing can be broken.
+        assert!(render_health(&[]).starts_with("HTTP/1.1 200 OK"));
+        assert!(render_health(&[snap()]).starts_with("HTTP/1.1 200 OK"));
+
+        let dark = StatsSnapshot {
+            label: "0.0.0.0:5432->db:5432".into(),
+            listening: false,
+            ..snap()
+        };
+        let resp = render_health(&[snap(), dark]);
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("0.0.0.0:5432->db:5432"),
+            "the body must name the unbound forwarder: {resp}"
+        );
+        assert!(
+            !resp.contains("a:1->b:2"),
+            "healthy forwarders are not listed"
+        );
     }
 
     #[test]
@@ -477,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn endpoint_routes_and_404s() {
         let reg = Arc::new(StatsRegistry::new());
-        reg.register("a:1->b:2").await.add_sent(7);
+        let s = reg.register("a:1->b:2").await;
+        s.add_sent(7);
+        s.set_listening(true);
         let (port, cancel) = spawn_endpoint(reg).await;
 
         let root = get(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
@@ -499,6 +578,32 @@ mod tests {
         // A non-GET method falls through to 404 rather than being served.
         let post = get(port, "POST /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(post.starts_with("HTTP/1.1 404 Not Found"), "{post}");
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn health_route_and_probe_follow_the_listening_flag() {
+        // `--health-check` is what the container runtime calls; it must fail
+        // while a forwarder is unbound and pass once the listener is up.
+        let reg = Arc::new(StatsRegistry::new());
+        let s = reg.register("0.0.0.0:5432->db:5432").await;
+        let (port, cancel) = spawn_endpoint(reg).await;
+        let addr = format!("127.0.0.1:{port}");
+
+        let root = get(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(root.starts_with("HTTP/1.1 503"), "{root}");
+        let err = health_check(&addr)
+            .await
+            .expect_err("probe must fail while the forwarder is unbound");
+        assert!(err.to_string().contains("503"), "{err}");
+
+        s.set_listening(true);
+        let root = get(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(root.starts_with("HTTP/1.1 200 OK"), "{root}");
+        health_check(&addr)
+            .await
+            .expect("probe must pass once the listener is bound");
 
         cancel.cancel();
     }

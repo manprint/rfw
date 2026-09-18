@@ -26,10 +26,12 @@ forwarders:
 # ------------------------------------------------------------
 # Optional runtime settings (all fields optional; defaults shown).
 # CLI flags (--metrics-addr, --report-interval, --sample-interval,
-# --buffer-bytes, --socket-buffer-bytes, --splice) override these.
+# --buffer-bytes, --socket-buffer-bytes, --splice, --max-connections,
+# --connect-timeout, --dns-timeout, --keepalive-*) override these.
 # ------------------------------------------------------------
 settings:
-  # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON).
+  # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON,
+  # GET / health: 200 while every forwarder is bound, 503 otherwise).
   # Omit / null to disable (default: disabled).
   metrics_addr: "127.0.0.1:9090"
   # Periodic traffic-report log cadence, seconds.
@@ -55,8 +57,20 @@ settings:
   # DNS record does not cost a full timeout.
   connect_timeout_secs: 10
   # DNS resolution timeout, seconds (hot-reloadable). IP-literal remotes skip
-  # the resolver entirely.
+  # the resolver entirely. Hostnames are resolved per connection, honouring
+  # the record TTL, so a remote whose IP changes (cloud DB failover) is picked
+  # up by the next connection without a restart.
   dns_timeout_secs: 5
+  # TCP keepalive on both sides of every proxied connection (hot-reloadable).
+  # Without it a peer that vanishes without closing (client crash, VPN or NAT
+  # drop, remote failover) leaves a half-open connection that never ends,
+  # holding a max_connections slot, a backend session, and two copy buffers
+  # for hours. With these defaults a dead peer is detected in
+  # idle + interval * retries = 60 + 10 * 3 = 90s.
+  # keepalive_idle_secs: 0 disables keepalive entirely.
+  keepalive_idle_secs: 60
+  keepalive_interval_secs: 10
+  keepalive_retries: 3
 
 # ------------------------------------------------------------
 # Notes
