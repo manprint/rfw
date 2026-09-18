@@ -13,6 +13,8 @@ use tracing::{error, info, warn};
 
 use crate::config::{load_yaml_config, ForwarderConfig, RuntimeKnobs, Settings};
 use crate::forwarder::{rate_sampler, run_forwarder, stats_reporter};
+use crate::monitor::{probe_all, run_monitor};
+use crate::notify::{Event as Alert, Notifier, ProbeReport};
 use crate::stats::StatsRegistry;
 
 /// How long to wait for in-flight connections to finish on shutdown before
@@ -54,19 +56,23 @@ pub struct ForwarderManager {
     conn_tracker: TaskTracker,
     /// Global cap on concurrently proxied connections. `None` = unbounded.
     conn_limit: Option<Arc<Semaphore>>,
+    /// Alert sink shared by every forwarder, monitor and the reload path.
+    notifier: Notifier,
 }
 
 struct ForwarderHandle {
     token: CancellationToken,
-    /// Join handle of the accept-loop task. Awaited by `stop_one` so the
-    /// listening socket is closed before anything tries to rebind the port.
+    /// Join handle of the accept-loop supervisor. Awaited by `stop_one` so
+    /// the listening socket is closed before anything tries to rebind the port.
     task: tokio::task::JoinHandle<()>,
+    /// The target health monitor; shares `token`, so it exits on its own.
+    monitor: tokio::task::JoinHandle<()>,
 }
 
 impl ForwarderManager {
     /// Build the manager. Fails if the DNS resolver cannot be constructed
     /// (surfaced once at startup instead of panicking per connection).
-    pub fn new(settings: &Settings) -> anyhow::Result<Self> {
+    pub fn new(settings: &Settings, notifier: Notifier) -> anyhow::Result<Self> {
         let mut builder = TokioResolver::builder_tokio()
             .map_err(|e| anyhow::anyhow!("failed to init DNS resolver builder: {e}"))?;
         apply_resolver_policy(builder.options_mut());
@@ -83,11 +89,21 @@ impl ForwarderManager {
                 .max_connections
                 .filter(|n| *n > 0)
                 .map(|n| Arc::new(Semaphore::new(n))),
+            notifier,
         })
     }
 
     pub fn stats_registry(&self) -> Arc<StatsRegistry> {
         self.stats_registry.clone()
+    }
+
+    pub fn notifier(&self) -> Notifier {
+        self.notifier.clone()
+    }
+
+    /// Probe every configured target once, for the startup alert and log.
+    pub async fn startup_report(&self, configs: &[ForwarderConfig]) -> Vec<ProbeReport> {
+        probe_all(configs, self.resolver.clone(), &self.knobs).await
     }
 
     /// Apply reloaded data-plane knobs (buffer/socket-buffer/splice) live.
@@ -121,21 +137,56 @@ impl ForwarderManager {
         let knobs = self.knobs.clone();
         let conn_tracker = self.conn_tracker.clone();
         let conn_limit = self.conn_limit.clone();
+        let notifier = self.notifier.clone();
 
-        let task = tokio::spawn(async move {
-            run_forwarder(
-                cfg_clone,
-                token_clone,
-                stats,
-                resolver,
-                knobs,
-                conn_tracker,
-                conn_limit,
-            )
-            .await;
-        });
+        // Supervisor: the accept loop runs in its own task so a panic inside
+        // it is observed here (and alerted) the moment it happens, instead of
+        // surfacing only when the forwarder is eventually stopped.
+        let task = {
+            let label = label.clone();
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                let inner = tokio::spawn(run_forwarder(
+                    cfg_clone,
+                    token_clone,
+                    stats,
+                    resolver,
+                    knobs,
+                    conn_tracker,
+                    conn_limit,
+                    notifier.clone(),
+                ));
+                if let Err(e) = inner.await {
+                    if e.is_panic() {
+                        error!(forwarder = %label, error = %e, "Forwarder task panicked; its port is no longer served");
+                        notifier.notify(Alert::Internal {
+                            component: "forwarder",
+                            message: format!(
+                                "accept loop of {label} panicked: {e}. The port is no longer served until the process restarts"
+                            ),
+                        });
+                    }
+                }
+            })
+        };
 
-        fwds.insert(label.clone(), ForwarderHandle { token, task });
+        let monitor = tokio::spawn(run_monitor(
+            Arc::new(cfg.clone()),
+            token.clone(),
+            self.stats_registry.register(&label).await,
+            self.resolver.clone(),
+            self.knobs.clone(),
+            notifier,
+        ));
+
+        fwds.insert(
+            label.clone(),
+            ForwarderHandle {
+                token,
+                task,
+                monitor,
+            },
+        );
         info!(forwarder = %label, "Started");
     }
 
@@ -163,6 +214,9 @@ impl ForwarderManager {
                 STOP_LISTENER_GRACE.as_secs()
             ),
         }
+        // The monitor exits on the shared token; abort covers a probe still
+        // in flight so no stale verdict lands on a removed forwarder.
+        handle.monitor.abort();
         self.stats_registry.remove(label).await;
         info!(forwarder = %label, "Stopped");
     }
@@ -213,6 +267,7 @@ impl ForwarderManager {
             {
                 warn!(forwarder = %label, "Forwarder did not stop within the grace window");
             }
+            handle.monitor.abort();
             self.stats_registry.remove(&label).await;
             info!(forwarder = %label, "Stopped");
         }
@@ -239,7 +294,6 @@ impl ForwarderManager {
     }
 
     /// Get current labels of running forwarders.
-    #[allow(dead_code)]
     pub async fn running_labels(&self) -> Vec<String> {
         let fwds = self.forwarders.read().await;
         fwds.keys().cloned().collect()
@@ -248,7 +302,8 @@ impl ForwarderManager {
 
 impl Default for ForwarderManager {
     fn default() -> Self {
-        Self::new(&Settings::default()).expect("failed to build default ForwarderManager")
+        Self::new(&Settings::default(), Notifier::disabled())
+            .expect("failed to build default ForwarderManager")
     }
 }
 
@@ -289,10 +344,18 @@ pub async fn watch_config_file(
     manager: Arc<ForwarderManager>,
     cancel: CancellationToken,
 ) {
+    let notifier = manager.notifier();
     let path = match config_path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot resolve config path: {e}");
+            notifier.notify(Alert::Internal {
+                component: "config-watcher",
+                message: format!(
+                    "cannot resolve {}: {e}. Hot-reload is disabled",
+                    config_path.display()
+                ),
+            });
             return;
         }
     };
@@ -326,6 +389,10 @@ pub async fn watch_config_file(
         Ok(w) => w,
         Err(e) => {
             error!("Cannot create file watcher: {e}");
+            notifier.notify(Alert::Internal {
+                component: "config-watcher",
+                message: format!("cannot create the file watcher: {e}. Hot-reload is disabled"),
+            });
             return;
         }
     };
@@ -339,6 +406,13 @@ pub async fn watch_config_file(
 
     if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
         error!("Cannot watch directory {}: {e}", watch_dir.display());
+        notifier.notify(Alert::Internal {
+            component: "config-watcher",
+            message: format!(
+                "cannot watch {}: {e}. Hot-reload is disabled",
+                watch_dir.display()
+            ),
+        });
         return;
     }
 
@@ -368,6 +442,10 @@ pub async fn watch_config_file(
                 // rather than spinning on a closed channel.
                 if signal.is_none() {
                     error!("Config watcher channel closed; hot-reload is no longer active");
+                    notifier.notify(Alert::Internal {
+                        component: "config-watcher",
+                        message: "the file watcher stopped delivering events; hot-reload is no longer active (restart to re-arm)".to_string(),
+                    });
                     return;
                 }
 
@@ -410,15 +488,34 @@ pub async fn watch_config_file(
                 // their defaults while the forwarders keep the old list.
                 match load_yaml_config(&config_path) {
                     Ok(loaded) => {
+                        let before: std::collections::HashSet<String> =
+                            manager.running_labels().await.into_iter().collect();
                         manager.update_knobs(&loaded.settings);
                         manager.sync(&loaded.forwarders).await;
+                        let after: std::collections::HashSet<String> =
+                            manager.running_labels().await.into_iter().collect();
+                        let mut added: Vec<String> = after.difference(&before).cloned().collect();
+                        let mut removed: Vec<String> = before.difference(&after).cloned().collect();
+                        added.sort();
+                        removed.sort();
                         info!(
+                            added = ?added,
+                            removed = ?removed,
                             "Config reloaded: {} forwarders active",
                             loaded.forwarders.len()
                         );
+                        notifier.notify(Alert::ConfigReloaded {
+                            active: after.len(),
+                            added,
+                            removed,
+                        });
                     }
                     Err(e) => {
                         error!("Failed to reload config, keeping the running configuration: {e}");
+                        notifier.notify(Alert::ConfigReloadFailed {
+                            path: config_path.display().to_string(),
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
@@ -530,7 +627,55 @@ mod tests {
     }
 
     fn manager() -> Arc<ForwarderManager> {
-        Arc::new(ForwarderManager::new(&Settings::default()).expect("manager"))
+        Arc::new(
+            ForwarderManager::new(&Settings::default(), Notifier::disabled()).expect("manager"),
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_report_probes_every_configured_target_in_order() {
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = live.accept().await {
+                drop(s);
+            }
+        });
+        let dead_port = free_port().await;
+
+        let m = manager();
+        let configs = [
+            cfg(free_port().await, dead_port),
+            cfg(free_port().await, live_port),
+        ];
+        let report = m.startup_report(&configs).await;
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].label, configs[0].label());
+        assert!(report[0].outcome.is_err(), "{:?}", report[0]);
+        assert_eq!(report[1].label, configs[1].label());
+        assert!(report[1].outcome.is_ok(), "{:?}", report[1]);
+    }
+
+    #[tokio::test]
+    async fn every_started_forwarder_gets_a_monitor_that_reports_reachability() {
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = live.accept().await {
+                drop(s);
+            }
+        });
+        let m = manager();
+        m.start_all(&[cfg(free_port().await, live_port)]).await;
+        for _ in 0..200 {
+            let snaps = m.stats_registry().collect().await;
+            if snaps.iter().all(|s| s.target_reachable == Some(true)) {
+                m.shutdown_all().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("monitor never reported the target reachable");
     }
 
     #[tokio::test]

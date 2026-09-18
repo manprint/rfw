@@ -3,16 +3,24 @@ mod forwarder;
 mod logging;
 mod manager;
 mod metrics;
+mod monitor;
+mod notify;
 mod stats;
+mod testutil;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::CliArgs;
+use crate::notify::{Event, InstanceInfo, Notifier, WebhookConfig};
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
+
+/// How long shutdown waits for queued alerts (typically just "stopping") to
+/// reach the webhook before giving up on them.
+const WEBHOOK_FLUSH_GRACE: Duration = Duration::from_secs(3);
 
 /// Wait for the first shutdown signal.
 ///
@@ -96,8 +104,24 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("--splice / use_splice is Linux-only; using the portable copy path");
     }
 
+    // Webhook alerting (opt-in). Built before the manager so every forwarder,
+    // monitor and the reload path share one delivery queue.
+    let (notifier, notifier_handle) = match &settings.webhook_url {
+        Some(url) => {
+            // Validated already by `Settings::validate`; re-parse for the typed URL.
+            let url = notify::validate_webhook_url(url)
+                .map_err(|e| anyhow::anyhow!("webhook_url is invalid: {e}"))?;
+            let (n, h) = notify::start(WebhookConfig {
+                url,
+                instance: InstanceInfo::new(settings.instance_name.clone()),
+            })?;
+            (n, Some(h))
+        }
+        None => (Notifier::disabled(), None),
+    };
+
     // Create manager and start all forwarders
-    let manager = Arc::new(manager::ForwarderManager::new(&settings)?);
+    let manager = Arc::new(manager::ForwarderManager::new(&settings, notifier.clone())?);
     manager.start_all(&forwarders).await;
 
     // Start config file watcher (if config file provided)
@@ -128,8 +152,39 @@ async fn main() -> anyhow::Result<()> {
     if let Some(metrics_addr) = settings.metrics_addr.clone() {
         let registry = manager.stats_registry();
         let cancel = stats_cancel.clone();
+        let n = notifier.clone();
         tokio::spawn(async move {
-            metrics::serve(metrics_addr, registry, cancel).await;
+            metrics::serve(metrics_addr, registry, cancel, n).await;
+        });
+    }
+
+    // Startup report: probe every target once and tell the operator how the
+    // process came up. Runs in the background so a slow or dead target never
+    // delays serving traffic on the ports that are fine.
+    {
+        let mgr = manager.clone();
+        let n = notifier.clone();
+        let configs = forwarders.clone();
+        tokio::spawn(async move {
+            let report = mgr.startup_report(&configs).await;
+            for r in &report {
+                match &r.outcome {
+                    Ok((addr, latency)) => info!(
+                        forwarder = %r.label,
+                        target = %r.target,
+                        via = %addr,
+                        latency_ms = latency.as_millis(),
+                        "Startup probe: target reachable"
+                    ),
+                    Err(e) => warn!(
+                        forwarder = %r.label,
+                        target = %r.target,
+                        error = %e,
+                        "Startup probe: target unreachable"
+                    ),
+                }
+            }
+            n.notify(Event::Started { forwarders: report });
         });
     }
 
@@ -138,10 +193,27 @@ async fn main() -> anyhow::Result<()> {
     let signal = shutdown_signal().await?;
     info!("{signal} received. Stopping all forwarders...");
 
+    // Tell the operator first: the message goes out while connections drain.
+    let active: u64 = manager
+        .stats_registry()
+        .collect()
+        .await
+        .iter()
+        .map(|s| s.active_connections)
+        .sum();
+    notifier.notify(Event::Stopping {
+        signal: signal.to_string(),
+        active_connections: active,
+    });
+
     // Graceful shutdown
     stats_cancel.cancel();
     config_cancel.cancel();
     manager.shutdown_all().await;
+
+    if let Some(handle) = notifier_handle {
+        handle.shutdown(WEBHOOK_FLUSH_GRACE).await;
+    }
 
     info!("rfw stopped.");
     Ok(())

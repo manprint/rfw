@@ -1,10 +1,12 @@
+use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 /// EWMA smoothing factor for rate derivation (0..1). Higher = more reactive.
 const RATE_ALPHA: f64 = 0.3;
@@ -42,7 +44,28 @@ pub struct ForwarderStats {
     /// its bind-retry loop (port already taken, permission denied) is running
     /// but not serving, and the healthcheck must say so.
     listening: AtomicBool,
+    /// Last known reachability of the target as seen by the monitor:
+    /// `TARGET_UNKNOWN` until the first probe, then `TARGET_UP` / `TARGET_DOWN`.
+    target_state: AtomicU8,
+    /// Sorted, de-duplicated address set the remote hostname last resolved
+    /// to. Shared by the data path and the monitor so a DNS change is
+    /// reported exactly once whichever of them sees it first.
+    last_addrs: Mutex<Option<Vec<IpAddr>>>,
+    /// Monotonic base for the `last_connect_*` timestamps.
+    epoch: Instant,
+    /// Milliseconds since `epoch` of the last successful outbound connect
+    /// (`u64::MAX` = never). Lets the monitor skip probing a target that real
+    /// traffic just proved reachable.
+    last_connect_ok_ms: AtomicU64,
+    /// Wakes the monitor when a real connection fails, so the downtime clock
+    /// starts within a second of the first client-visible failure.
+    probe_kick: Notify,
 }
+
+const TARGET_UNKNOWN: u8 = 0;
+const TARGET_UP: u8 = 1;
+const TARGET_DOWN: u8 = 2;
+const NEVER_MS: u64 = u64::MAX;
 
 impl ForwarderStats {
     pub fn new(label: String) -> Self {
@@ -57,6 +80,11 @@ impl ForwarderStats {
             last_sample_sent: AtomicU64::new(0),
             last_sample_recv: AtomicU64::new(0),
             listening: AtomicBool::new(false),
+            target_state: AtomicU8::new(TARGET_UNKNOWN),
+            last_addrs: Mutex::new(None),
+            epoch: Instant::now(),
+            last_connect_ok_ms: AtomicU64::new(NEVER_MS),
+            probe_kick: Notify::new(),
         }
     }
 
@@ -88,6 +116,80 @@ impl ForwarderStats {
         self.rejected_connections.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the address set the remote hostname currently resolves to.
+    ///
+    /// Order-insensitive. Returns the *previous* set when one existed and it
+    /// differs from `addrs`; `None` on the first observation or when nothing
+    /// changed. Callers raise the DNS-change alert from the returned value.
+    pub fn observe_addrs(&self, addrs: &[IpAddr]) -> Option<Vec<IpAddr>> {
+        let mut sorted: Vec<IpAddr> = addrs.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut guard = self.last_addrs.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(prev) if *prev == sorted => None,
+            Some(_) => guard.replace(sorted),
+            None => {
+                *guard = Some(sorted);
+                None
+            }
+        }
+    }
+
+    /// The last observed address set, sorted.
+    #[cfg(test)]
+    pub fn last_addrs(&self) -> Option<Vec<IpAddr>> {
+        self.last_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX - 1)
+    }
+
+    /// A real outbound connection to the target just succeeded.
+    pub fn mark_connect_ok(&self) {
+        self.last_connect_ok_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    /// A real outbound connection to the target just failed (DNS or connect).
+    /// Wakes the monitor so it probes now rather than at the next tick.
+    pub fn mark_connect_failed(&self) {
+        self.probe_kick.notify_one();
+    }
+
+    /// Time since the last successful outbound connect, if any.
+    pub fn last_connect_ok_age(&self) -> Option<Duration> {
+        match self.last_connect_ok_ms.load(Ordering::Relaxed) {
+            NEVER_MS => None,
+            ms => Some(Duration::from_millis(self.elapsed_ms().saturating_sub(ms))),
+        }
+    }
+
+    /// Signalled by [`ForwarderStats::mark_connect_failed`].
+    pub fn probe_kick(&self) -> &Notify {
+        &self.probe_kick
+    }
+
+    pub fn set_target_reachable(&self, reachable: bool) {
+        self.target_state.store(
+            if reachable { TARGET_UP } else { TARGET_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `None` until the monitor has probed the target once.
+    pub fn target_reachable(&self) -> Option<bool> {
+        match self.target_state.load(Ordering::Relaxed) {
+            TARGET_UP => Some(true),
+            TARGET_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
     /// Read a consistent-ish snapshot of all counters. Never resets anything.
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
@@ -99,6 +201,7 @@ impl ForwarderStats {
             rate_sent_bps: self.rate_sent_bps.load(Ordering::Relaxed),
             rate_recv_bps: self.rate_recv_bps.load(Ordering::Relaxed),
             listening: self.listening.load(Ordering::Relaxed),
+            target_reachable: self.target_reachable(),
         }
     }
 
@@ -150,6 +253,8 @@ pub struct StatsSnapshot {
     pub rate_recv_bps: u64,
     /// Whether the forwarder's listener is currently bound.
     pub listening: bool,
+    /// Last probe verdict on the target: `None` before the first probe.
+    pub target_reachable: Option<bool>,
 }
 
 /// Global registry of all forwarder stats.
@@ -414,6 +519,57 @@ mod tests {
         reg.sample_rates(1.0).await;
         assert_eq!(a.snapshot().rate_sent_bps, 300); // 0.3 * 1000
         assert_eq!(b.snapshot().rate_recv_bps, 600); // 0.3 * 2000
+    }
+
+    #[test]
+    fn observe_addrs_reports_a_change_once_and_ignores_order() {
+        let s = ForwarderStats::new("t".into());
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert_eq!(
+            s.observe_addrs(&[a, b]),
+            None,
+            "first observation is not a change"
+        );
+        assert_eq!(s.observe_addrs(&[b, a]), None, "same set, different order");
+        assert_eq!(s.observe_addrs(&[b, a, b]), None, "duplicates collapse");
+        assert_eq!(
+            s.observe_addrs(&[b]),
+            Some(vec![a, b]),
+            "shrunk set: previous returned"
+        );
+        assert_eq!(s.observe_addrs(&[b]), None);
+        assert_eq!(s.last_addrs(), Some(vec![b]));
+    }
+
+    #[test]
+    fn target_reachability_starts_unknown() {
+        let s = ForwarderStats::new("t".into());
+        assert_eq!(s.target_reachable(), None);
+        assert_eq!(s.snapshot().target_reachable, None);
+        s.set_target_reachable(false);
+        assert_eq!(s.snapshot().target_reachable, Some(false));
+        s.set_target_reachable(true);
+        assert_eq!(s.target_reachable(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn connect_marks_track_age_and_kick_the_monitor() {
+        let s = Arc::new(ForwarderStats::new("t".into()));
+        assert_eq!(s.last_connect_ok_age(), None);
+        s.mark_connect_ok();
+        assert!(s.last_connect_ok_age().unwrap() < Duration::from_secs(1));
+
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move { s.probe_kick().notified().await })
+        };
+        tokio::task::yield_now().await;
+        s.mark_connect_failed();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a failed connect must wake the monitor")
+            .unwrap();
     }
 
     #[test]

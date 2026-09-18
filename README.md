@@ -14,6 +14,8 @@
 - **Cross-platform** — Windows, macOS, Linux (amd64 + arm64), Android (arm64)
 - **Traffic stats** — Lifetime cumulative bytes + live throughput rate per forwarder, in periodic logs and an optional HTTP endpoint (`/metrics`, `/stats`)
 - **Honest healthcheck** — `GET /` answers `200` only while every forwarder is actually bound and accepting; a forwarder stuck retrying a taken port turns it `503`
+- **Target monitoring** — Each target is probed (resolve + one TCP connect) on a cadence that backs off while real traffic proves it reachable; exposed as `rfw_target_reachable`
+- **Google Chat alerting** — Optional webhook (`--webhook-url` / `RFW_WEBHOOK_URL`) that reports startup with per-target reachability, DNS answer changes, a target unreachable for longer than a configurable threshold (default 5 minutes) and its recovery, ports that cannot be bound, reload errors, connection-limit saturation, internal faults and shutdown; throttled, retried, never on the data path
 - **Structured logging** — Console (human-friendly, color) + JSON file (machine-readable)
 - **High throughput** — Async I/O with `tokio`, tunable copy/socket buffers, optional Linux `splice(2)` zero-copy path; handles thousands of concurrent connections
 - **Graceful shutdown** — `SIGTERM` and `SIGINT` both drain in-flight connections (bounded grace) before exit
@@ -47,7 +49,7 @@ Download from the [releases page](https://github.com/manprint/rfw/releases).
 ### Docker
 
 ```bash
-docker pull ghcr.io/manprint/rfw:v1.0.5
+docker pull ghcr.io/manprint/rfw:v1.0.6
 docker compose up -d
 ```
 
@@ -56,7 +58,7 @@ Or run manually:
 ```bash
 docker run --rm -p 8080:8080 \
   -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
-  ghcr.io/manprint/rfw:v1.0.5 --log-dir ""
+  ghcr.io/manprint/rfw:v1.0.6 --log-dir ""
 ```
 
 For the "database behind a cloud DNS name on the host network" deployment, see
@@ -113,7 +115,7 @@ Usage:
 rfw -f forwarders.yml
 ```
 
-The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive) are hot-reloaded; interval, `max_connections` and `metrics_addr` changes need a restart.
+The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold) are hot-reloaded; interval, `max_connections`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
 
 ### 3. Environment variables
 
@@ -149,6 +151,14 @@ Options:
       --keepalive-interval <SECS> Seconds between keepalive probes (default 10)
       --keepalive-retries <N>     Unanswered probes before a connection is
                                   declared dead (default 3)
+      --webhook-url <URL>         Google Chat incoming-webhook URL for alerts
+                                  [env: RFW_WEBHOOK_URL] (default: off)
+      --instance-name <NAME>      Name shown in alerts [env: RFW_INSTANCE_NAME]
+                                  (default: hostname)
+      --probe-interval <SECS>     Seconds between active target probes
+                                  (default 30)
+      --unreachable-after <SECS>  Continuous failure before the "target
+                                  unreachable" alert (default 300 = 5 min)
       --log-dir <DIR>             Rolling JSON log directory; "" disables file
                                   logging (default "logs")
       --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
@@ -196,10 +206,14 @@ Changes are debounced (1s window) to avoid reload storms.
 > **Note:** Hot-reload applies the `forwarders:` list and the data-plane knobs
 > (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, `connect_timeout_secs`,
 > `dns_timeout_secs`, `keepalive_idle_secs`, `keepalive_interval_secs`,
-> `keepalive_retries`) live — new connections pick up the new values; in-flight
-> connections keep theirs. Changes to `report_interval_secs`,
-> `sample_interval_secs`, `max_connections`, and `metrics_addr` still require a
-> restart.
+> `keepalive_retries`, `probe_interval_secs`, `unreachable_after_secs`) live —
+> new connections pick up the new values; in-flight connections keep theirs.
+> Changes to `report_interval_secs`, `sample_interval_secs`, `max_connections`,
+> `metrics_addr`, `webhook_url` and `instance_name` still require a restart.
+>
+> Every reload outcome is alerted when a webhook is configured: a successful
+> one names the forwarders added and removed, a rejected one says the running
+> configuration was kept.
 
 **A reload is applied all-or-nothing.** The file is parsed once, and both the
 `forwarders:` list and the `settings:` block come from that single parse. If the
@@ -239,12 +253,18 @@ Each forwarder runs as an independent async task:
 │  │  Config    │  │  DNS        │  │  Stats    │ │
 │  │  Watcher   │  │  Resolver   │  │  Reporter │ │
 │  └────────────┘  └─────────────┘  └───────────┘ │
+│  ┌────────────────────┐  ┌──────────────────┐   │
+│  │  Target Monitor    │  │  Webhook Notifier│   │
+│  │  (one per fwd)     │  │  (Google Chat)   │   │
+│  └────────────────────┘  └──────────────────┘   │
 └─────────────────────────────────────────────────┘
 ```
 
 - **Connection handling:** Every incoming TCP connection is accepted and proxied to the remote destination using `tokio::io::copy_bidirectional_with_sizes` (64 KiB buffers by default), with `TCP_NODELAY` and TCP keepalive set on both sides.
 - **DNS resolution:** Each connection resolves the remote hostname through hickory-resolver, configured from the system `/etc/resolv.conf`. Answers are cached for their TTL, so a burst of connections costs one lookup, and a record that changes is followed by the first connection after the TTL expires. A queries are answered first and AAAA is only consulted when A yields nothing, so a resolver that is slow to answer AAAA cannot stall connections.
 - **Traffic stats:** Bytes sent/received are counted per forwarder as **lifetime cumulative** counters (never reset). A sampler derives the current throughput rate (bytes/sec, EWMA-smoothed). Both are logged periodically and exposed live via the optional HTTP endpoint.
+- **Target monitoring:** One monitor task per forwarder resolves the target and opens (then closes) a TCP connection every `probe_interval_secs`, feeding `rfw_target_reachable`. The probe is skipped while real connections keep succeeding, and pulled forward when a real connection fails, so the downtime clock starts within a second of the first client-visible failure. The resolved address set is shared with the data path, so a DNS change is reported exactly once, by whichever sees it first.
+- **Alerting:** Events go into a bounded queue drained by one delivery task (`POST {"text": …}` to the webhook, rustls + bundled roots, 3 attempts with backoff, per-kind throttling). Producers never wait on it: a slow or dead webhook costs a counter, not a connection. See [Alerting to Google Chat](#alerting-to-google-chat-webhook).
 - **Logging:** All connection/disconnection/error events are logged to stdout (color, human-friendly) and to `logs/rfw.log` (JSON, daily rotation).
 
 ## Performance & tuning
@@ -389,13 +409,33 @@ rfw --metrics-addr 127.0.0.1:9090 127.0.0.1:8080:172.16.0.5:80
   rfw_rejected_connections_total{label="127.0.0.1:8080->172.16.0.5:80"} 0
   # TYPE rfw_listening gauge
   rfw_listening{label="127.0.0.1:8080->172.16.0.5:80"} 1
+  # TYPE rfw_target_reachable gauge
+  rfw_target_reachable{label="127.0.0.1:8080->172.16.0.5:80"} 1
+  # TYPE rfw_webhook_enabled gauge
+  rfw_webhook_enabled 1
+  # TYPE rfw_webhook_sent_total counter
+  rfw_webhook_sent_total 4
+  # TYPE rfw_webhook_failed_total counter
+  rfw_webhook_failed_total 0
+  # TYPE rfw_webhook_dropped_total counter
+  rfw_webhook_dropped_total 0
+  # TYPE rfw_webhook_suppressed_total counter
+  rfw_webhook_suppressed_total 0
   ```
+
+  `rfw_target_reachable` is the last probe verdict per forwarder (absent until
+  the first probe, so an unknown target never looks like a down one). The
+  `rfw_webhook_*` family is process-level: how many alerts were accepted by
+  the webhook, given up on after retries, dropped because the queue was full,
+  or folded into a later message by the throttle.
 
 - **`GET /stats`** — JSON array of per-forwarder snapshots:
 
   ```json
-  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234,"listening":true}]
+  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234,"listening":true,"target_reachable":true}]
   ```
+
+  `target_reachable` is `true`/`false` after the first probe and `null` before.
 
 - **`GET /`** — Health probe. `200 OK` (body `rfw ok`) while **every**
   configured forwarder has its listener bound and accepting;
@@ -433,6 +473,100 @@ EWMA-smoothed throughput in bytes/sec. The endpoint is **disabled by default**
 
 > **Security:** The endpoint is unauthenticated. Bind it to a loopback or
 > trusted interface (e.g. `127.0.0.1:9090`), not a public address.
+
+## Alerting to Google Chat (webhook)
+
+rfw can push operational alerts to a Google Chat space through an
+[incoming webhook](https://developers.google.com/workspace/chat/quickstart/webhooks).
+In the space: *Apps & integrations → Webhooks → Add webhook*, copy the URL
+(`https://chat.googleapis.com/v1/spaces/<space>/messages?key=…&token=…`) and
+hand it to rfw:
+
+```bash
+# Preferred: the URL carries the space's credentials, keep it out of `ps` and shell history
+export RFW_WEBHOOK_URL='https://chat.googleapis.com/v1/spaces/AAAA/messages?key=…&token=…'
+rfw --instance-name db-proxy-prod 0.0.0.0:5432:mydb.example.com:5432
+
+# Equivalent flag / YAML key
+rfw --webhook-url "$RFW_WEBHOOK_URL" ...
+```
+
+```yaml
+settings:
+  webhook_url: "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=…&token=…"
+  instance_name: "db-proxy-prod"   # default: hostname
+  probe_interval_secs: 30          # active target probe cadence
+  unreachable_after_secs: 300      # 5 minutes of continuous failure before the alert
+```
+
+### What gets sent
+
+| Message | When | Level |
+|---|---|---|
+| **rfw started** | All forwarders spawned. Lists every forwarder with the result of one probe of its target: `✅ reachable at <ip:port> (<ms>)` or `❌ unreachable: <error>`. | info (warning if any target is unreachable) |
+| **DNS change** | The target hostname resolves to a different address set than before (seen by a probe or by a real connection, whichever first). Shows old → new. | info |
+| **Target unreachable** | Probes of a target have failed continuously for `unreachable_after_secs` (default 300 = 5 min). Sent **once** per outage, with the last error. Shorter blips are logged, not alerted. | critical |
+| **Target reachable again** | First successful probe after an alerted outage, with the outage length and the address that answered. | info |
+| **Cannot bind** | A forwarder's local port cannot be bound (taken, permission). Repeats of the 5 s bind retry are folded into one message per 5 min. | critical |
+| **Listening again** | The port bound after one or more failures. | info |
+| **Config reloaded** | Hot-reload applied; names forwarders added and removed. | info |
+| **Config reload failed** | The edited file did not parse or validate; running configuration kept. | warning |
+| **Connection limit reached** | `max_connections` is saturated and new connections are being refused (at most one message per 5 min per forwarder). | warning |
+| **Internal problem** | Anything else that breaks a component: the stats endpoint cannot bind, the config watcher dies, a forwarder task panics. | warning |
+| **rfw stopping** | `SIGTERM`/`SIGINT` received; says how many connections are being drained. Sent while the drain runs. | info |
+
+Every message ends with `<instance> · pid <pid> · rfw <version> · <UTC time>`,
+because several rfw instances usually post into one space.
+
+### How the target is probed
+
+Every `probe_interval_secs` the monitor resolves the target name and opens one
+TCP connection to it with the same DNS policy and Happy-Eyeballs racing as a
+real connection, then closes it. To keep this cheap and quiet:
+
+- the probe is **skipped** while a real connection to that target succeeded
+  within the last interval (a busy, healthy forwarder costs the backend no
+  extra connections);
+- a real connection that **fails** kicks a probe immediately (at most one per
+  second), so the downtime clock starts within a second of the first
+  client-visible failure rather than at the next tick;
+- while the target is down, probes run every 5 s so the alert lands close to
+  the threshold and recovery is noticed within seconds.
+
+For a database target each probe is an empty connection: PostgreSQL logs it as
+`incomplete startup packet` at `LOG` level. With the default 30 s cadence and a
+forwarder that carries steady traffic, most ticks are skipped; raise
+`probe_interval_secs` if the log line bothers you.
+
+### Delivery guarantees
+
+- **Never on the data path.** Events go into a bounded queue (256) with a
+  non-blocking send; a full queue drops the event and bumps
+  `rfw_webhook_dropped_total`. Accept loops and connections never wait on HTTP.
+- **Bounded retries.** `429`, `5xx` and transport errors are retried up to 3
+  times (1 s, 2 s backoff, `Retry-After` honoured up to 30 s); other `4xx` are
+  not. Failures are logged and counted in `rfw_webhook_failed_total`; they never
+  affect forwarding.
+- **Throttled.** Repetitive kinds (DNS change, bind failure, limit reached,
+  reload failure, internal) are limited to one message per window per
+  forwarder; suppressed repeats are reported as a count in the next message.
+  Deliveries are paced 1 s apart to stay inside Google Chat's per-space limit.
+- **Flushed on shutdown.** Queued alerts (typically "stopping") get up to 3 s to
+  go out after the connection drain.
+
+### Security notes
+
+- The webhook URL **is a credential**: whoever has it can post into the space.
+  Pass it through `RFW_WEBHOOK_URL` (or a secrets manager that sets it) rather
+  than a command-line flag, and keep it out of committed YAML. rfw redacts every
+  query value in its own logs (`…/messages?key=***&token=***`) and never echoes
+  the URL in an error.
+- TLS is rustls with the bundled Mozilla root store, so it works in the
+  distroless image without a system CA bundle. Redirects are refused: following
+  one would replay the credentials against another host. Plain `http://` is
+  accepted for local relays and tests, with a startup warning.
+- Messages contain forwarder labels, target hostnames and resolved IPs. Post
+  into a space whose members may see them.
 
 ## Cross-platform builds
 
@@ -491,7 +625,7 @@ docker run --rm -p 8080:8080 \
 docker compose up -d
 ```
 
-In production pin a release tag (`ghcr.io/manprint/rfw:v1.0.5`) rather than
+In production pin a release tag (`ghcr.io/manprint/rfw:v1.0.6`) rather than
 `latest`, which moves on every release. Edit `docker-compose.yml` to configure
 your forwarders via env vars.
 
@@ -519,6 +653,7 @@ What rfw does differently, and what to expect:
 | Record temporarily points at a dead IP | The client's connection fails after `--connect-timeout` (not a hang); recovery is automatic once the record is fixed. |
 | Client vanishes without closing (crash, VPN/NAT drop) | Keepalive reaps the half-open connection in ~90s, freeing its `max_connections` slot and the database session behind it. |
 | Port already taken on the host | The forwarder retries the bind every 5s and the healthcheck reports `503` until it succeeds. |
+| **Alerting** (with `RFW_WEBHOOK_URL` set) | Google Chat gets: a startup message confirming the database answered a TCP probe; a message on every DNS answer change (old → new IP); one message if the database stays unreachable for 5 minutes, and one when it answers again; a message if port 5432 cannot be bound; reload and shutdown notices. See [Alerting to Google Chat](#alerting-to-google-chat-webhook). |
 
 **`docker run`** (host network, exactly like the socat container it replaces):
 
@@ -534,13 +669,17 @@ docker run -d \
   --health-cmd '/usr/local/bin/rfw --health-check 127.0.0.1:9090' \
   --health-interval 30s --health-timeout 10s --health-retries 3 \
   -e RFW_FORWARDER_1=0.0.0.0:5432:mydb.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com:5432 \
+  -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
+  -e RFW_INSTANCE_NAME=db-proxy-prod \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.0.5 \
+  ghcr.io/manprint/rfw:v1.0.6 \
     --log-dir "" \
     --max-connections 1000 \
     --metrics-addr 127.0.0.1:9090 \
     --connect-timeout 5 \
-    --dns-timeout 3
+    --dns-timeout 3 \
+    --probe-interval 30 \
+    --unreachable-after 300
 ```
 
 - `--net=host` binds `0.0.0.0:5432` directly on the host, like `socat` did, and
@@ -556,18 +695,26 @@ docker run -d \
   with keepalive on, dead clients no longer eat into it.
 - `--log-dir ""` leaves logging to the Docker log driver (rfw never prunes its
   own rotated files).
+- `RFW_WEBHOOK_URL` (exported in the shell that runs the command, or injected by
+  your secrets manager) turns on the Google Chat alerts; leave it unset to run
+  silent. `RFW_INSTANCE_NAME` is what the messages call this host.
+- `--probe-interval 30 --unreachable-after 300` are the defaults, spelled out:
+  the database is probed every 30 s while idle, and an outage is alerted after
+  5 minutes of continuous failure.
 
 **Docker Compose**, same deployment:
 
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.0.5
+    image: ghcr.io/manprint/rfw:v1.0.6
     container_name: rfw-db
     restart: always
     network_mode: host          # 0.0.0.0:5432 on the host, host DNS
     environment:
       - RFW_FORWARDER_1=0.0.0.0:5432:mydb.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com:5432
+      - RFW_WEBHOOK_URL=${RFW_WEBHOOK_URL}   # from .env (not committed); unset = alerts off
+      - RFW_INSTANCE_NAME=db-proxy-prod
       - RUST_LOG=info
     command:
       - --log-dir
@@ -580,6 +727,10 @@ services:
       - "5"
       - --dns-timeout
       - "3"
+      - --probe-interval
+      - "30"
+      - --unreachable-after
+      - "300"
     ulimits:
       nofile:
         soft: 65536
@@ -593,16 +744,89 @@ services:
       start_period: 5s
 ```
 
-To manage the forwarder list from a file instead (hot-reload, several
-databases), mount the **directory** containing `forwarders.yml` rather than the
-single file — editors save by replacing the inode, and a single-file bind mount
-keeps pointing at the old one so the watcher never sees the change:
+**Same deployment, configured from a YAML file** (hot-reload, several
+databases, every knob in one place). Put this in `/opt/rfw/forwarders.yml` on
+the host:
 
 ```yaml
-    volumes:
-      - ./rfw:/etc/rfw:ro
-    command: ["-f", "/etc/rfw/forwarders.yml", "--log-dir", "", "--metrics-addr", "127.0.0.1:9090"]
+# /opt/rfw/forwarders.yml — rfw in front of a managed PostgreSQL
+forwarders:
+  - local_host: "0.0.0.0"           # host network: this is the host's port 5432
+    local_port: 5432
+    remote_host: "mydb.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com"
+    remote_port: 5432
+  # Add a second database and rfw picks it up on save, no restart:
+  # - local_host: "0.0.0.0"
+  #   local_port: 5433
+  #   remote_host: "replica.xxxxxxxxxxxx.eu-south-1.rds.amazonaws.com"
+  #   remote_port: 5432
+
+settings:
+  metrics_addr: "127.0.0.1:9090"    # /metrics, /stats, / health — loopback only on host net
+  max_connections: 1000             # keep below the database's own connection limit
+  connect_timeout_secs: 5
+  dns_timeout_secs: 3
+  keepalive_idle_secs: 60           # dead clients reaped in 60 + 10 * 3 = 90 s
+  keepalive_interval_secs: 10
+  keepalive_retries: 3
+  # Alerting: the URL is a credential, so it comes from RFW_WEBHOOK_URL in the
+  # environment (a CLI/env value overrides this key). Uncomment only for a
+  # file with restricted permissions.
+  # webhook_url: "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=…&token=…"
+  instance_name: "db-proxy-prod"
+  probe_interval_secs: 30           # probe the database every 30 s while idle
+  unreachable_after_secs: 300       # alert after 5 minutes of continuous failure
 ```
+
+Mount the **directory** containing the file rather than the single file —
+editors save by replacing the inode, and a single-file bind mount keeps
+pointing at the old one so the watcher never sees the change:
+
+```bash
+docker run -d \
+  --name=rfw-db \
+  --net=host \
+  --restart=always \
+  --ulimit nofile=65536:65536 \
+  --stop-timeout 15 \
+  --health-cmd '/usr/local/bin/rfw --health-check 127.0.0.1:9090' \
+  --health-interval 30s --health-timeout 10s --health-retries 3 \
+  -v /opt/rfw:/etc/rfw:ro \
+  -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
+  -e RUST_LOG=info \
+  ghcr.io/manprint/rfw:v1.0.6 \
+    -f /etc/rfw/forwarders.yml \
+    --log-dir ""
+```
+
+```yaml
+services:
+  rfw-db:
+    image: ghcr.io/manprint/rfw:v1.0.6
+    container_name: rfw-db
+    restart: always
+    network_mode: host
+    volumes:
+      - /opt/rfw:/etc/rfw:ro
+    environment:
+      - RFW_WEBHOOK_URL=${RFW_WEBHOOK_URL}
+      - RUST_LOG=info
+    command: ["-f", "/etc/rfw/forwarders.yml", "--log-dir", ""]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+```
+
+Do **not** set `RFW_FORWARDER_N` in this variant: environment forwarders
+replace the file's list entirely.
 
 Keepalive (`keepalive_idle_secs` 60 / `keepalive_interval_secs` 10 /
 `keepalive_retries` 3) is on by default and needs no flag; tune it in the
@@ -628,14 +852,15 @@ cargo build --release
 cargo test
 ```
 
-The suite has four parts:
+The suite has five parts:
 
 | Target | What it covers |
 |---|---|
-| unit tests (`src/**`) | settings validation and clamping, runtime knobs, keepalive socket options, stats/EWMA, Prometheus + JSON rendering, the metrics endpoint's routing, health verdict and timeouts, accept-error classification, admission control, DNS/IP-literal resolution, **DNS change propagation against an in-test fake resolver** (new connections follow the record, held connections stay pinned, dead records fail fast and recover), staggered connect racing, manager start/stop/sync |
+| unit tests (`src/**`) | settings validation and clamping, runtime knobs, keepalive socket options, stats/EWMA, Prometheus + JSON rendering, the metrics endpoint's routing, health verdict and timeouts, accept-error classification, admission control, DNS/IP-literal resolution, **DNS change propagation against an in-test fake resolver** (new connections follow the record, held connections stay pinned, dead records fail fast and recover), staggered connect racing, manager start/stop/sync, **target monitor** (outage alert once past the threshold, recovery, blips below the threshold stay silent, probes skipped under healthy traffic and kicked by failures, DNS change with old/new sets), **webhook notifier** (message rendering per event, URL validation and credential redaction, throttle windows, delivery against a local HTTP sink: 2xx, 5xx retry, 4xx no-retry, dead endpoint, shutdown flush, full-queue drop) |
 | `tests/e2e_forward.rs` | byte-exact forwarding and live cumulative metrics, on both the portable and `splice` paths |
 | `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe including `503` while a port cannot be bound and recovery once it frees |
 | `tests/e2e_hot_reload.rs` | re-targeting a port without an outage, add/remove, malformed and duplicate configs, live knob reloads, counter continuity |
+| `tests/e2e_webhook.rs` | the real binary against an in-process webhook sink: startup report with a reachable and an unreachable target, target outage → single alert → recovery, taken port → alert → recovery, reload success and failure, `SIGTERM` "stopping" message, invalid URL rejected without echoing it, `--help`, `rfw_target_reachable` and `rfw_webhook_*` on `/metrics` |
 
 The e2e suites spawn the real binary and drive it over real sockets, so they
 catch integration failures (signals, rebinds, shedding) that unit tests cannot.
@@ -673,15 +898,19 @@ cargo run -- localhost:8080:example.com:80
 │   ├── main.rs         # Entry point, CLI parsing
 │   ├── config.rs       # Config loading (CLI, YAML, env)
 │   ├── forwarder.rs    # TCP forwarding logic + reporter + rate sampler
-│   ├── manager.rs      # Forwarder lifecycle management
-│   ├── stats.rs        # Traffic statistics (cumulative counters + rate)
+│   ├── manager.rs      # Forwarder lifecycle management (+ per-forwarder monitor)
+│   ├── monitor.rs      # Target reachability probes, DNS-change detection, outage alerts
+│   ├── notify.rs       # Google Chat webhook: events, throttle, delivery worker
+│   ├── stats.rs        # Traffic statistics (cumulative counters + rate + target state)
 │   ├── metrics.rs      # HTTP /metrics + /stats endpoint
-│   └── logging.rs      # Tracing/logging setup
+│   ├── logging.rs      # Tracing/logging setup
+│   └── testutil.rs     # Test-only fake DNS server + resolver
 ├── tests/
 │   ├── common/mod.rs     # Shared e2e harness (spawn rfw, backends, probes)
 │   ├── e2e_forward.rs    # Byte-exact forwarding + live metrics
 │   ├── e2e_lifecycle.rs  # Startup validation, SIGTERM, admission control
-│   └── e2e_hot_reload.rs # Config watcher, rebinds, malformed/duplicate configs
+│   ├── e2e_hot_reload.rs # Config watcher, rebinds, malformed/duplicate configs
+│   └── e2e_webhook.rs    # Alerts against an in-process webhook sink
 └── README.md           # This file
 ```
 

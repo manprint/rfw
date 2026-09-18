@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::notify::{Event, Notifier, NotifierCounters, NotifierSnapshot};
 use crate::stats::{StatsRegistry, StatsSnapshot};
 
 /// Cap on the request bytes we read before giving up (headers only; GET has no body).
@@ -33,14 +34,26 @@ const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// `GET /` -> liveness, anything else -> 404. Connection-per-request (no
 /// keep-alive). This is a minimal, dependency-free responder; it only handles
 /// GET and ignores the request body.
-pub async fn serve(addr: String, registry: Arc<StatsRegistry>, cancel: CancellationToken) {
+pub async fn serve(
+    addr: String,
+    registry: Arc<StatsRegistry>,
+    cancel: CancellationToken,
+    notifier: Notifier,
+) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
             error!(error = %e, "Metrics server failed to bind {addr}");
+            notifier.notify(Event::Internal {
+                component: "metrics",
+                message: format!(
+                    "stats endpoint failed to bind {addr}: {e}. /metrics, /stats and the healthcheck are unavailable"
+                ),
+            });
             return;
         }
     };
+    let counters = notifier.counters();
     info!("Metrics endpoint listening on http://{addr}/metrics (and /stats)");
 
     let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
@@ -63,9 +76,10 @@ pub async fn serve(addr: String, registry: Arc<StatsRegistry>, cancel: Cancellat
                             continue;
                         };
                         let reg = registry.clone();
+                        let counters = counters.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = handle_conn(stream, reg).await {
+                            if let Err(e) = handle_conn(stream, reg, counters).await {
                                 warn!(error = %e, "Metrics request error");
                             }
                         });
@@ -131,7 +145,11 @@ pub async fn health_check(addr: &str) -> Result<(), anyhow::Error> {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, registry: Arc<StatsRegistry>) -> std::io::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    registry: Arc<StatsRegistry>,
+    counters: Arc<NotifierCounters>,
+) -> std::io::Result<()> {
     // Read request head until CRLFCRLF or the cap is hit, under a hard deadline
     // so a stalled client cannot pin the task open forever.
     let mut buf = Vec::with_capacity(512);
@@ -163,7 +181,8 @@ async fn handle_conn(mut stream: TcpStream, registry: Arc<StatsRegistry>) -> std
     let head = String::from_utf8_lossy(&buf);
     let response = match parse_request_target(&head).as_deref() {
         Some("/metrics") => {
-            let body = render_prometheus(&registry.collect().await);
+            let mut body = render_prometheus(&registry.collect().await);
+            body.push_str(&render_webhook_metrics(&counters.snapshot()));
             http_response("200 OK", "text/plain; version=0.0.4", &body)
         }
         Some("/stats") => {
@@ -324,6 +343,60 @@ pub fn render_prometheus(snaps: &[StatsSnapshot]) -> String {
         snaps,
         |s| u64::from(s.listening),
     );
+    // Absent (not 0) until the monitor has probed: an unknown target must not
+    // look like a down one on a dashboard.
+    out.push_str("# HELP rfw_target_reachable 1 if the last probe of the target succeeded, 0 if it failed; absent before the first probe.\n");
+    out.push_str("# TYPE rfw_target_reachable gauge\n");
+    for s in snaps {
+        if let Some(up) = s.target_reachable {
+            out.push_str(&format!(
+                "rfw_target_reachable{{label=\"{}\"}} {}\n",
+                escape(&s.label),
+                u64::from(up)
+            ));
+        }
+    }
+    out
+}
+
+/// Process-level webhook delivery counters (`rfw_webhook_*`).
+pub fn render_webhook_metrics(n: &NotifierSnapshot) -> String {
+    let mut out = String::new();
+    let mut single = |name: &str, help: &str, kind: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
+    single(
+        "rfw_webhook_enabled",
+        "1 if a webhook URL is configured, 0 otherwise.",
+        "gauge",
+        u64::from(n.enabled),
+    );
+    single(
+        "rfw_webhook_sent_total",
+        "Alert messages accepted by the webhook.",
+        "counter",
+        n.sent,
+    );
+    single(
+        "rfw_webhook_failed_total",
+        "Alert messages given up on after the retry budget.",
+        "counter",
+        n.failed,
+    );
+    single(
+        "rfw_webhook_dropped_total",
+        "Alert events dropped because the delivery queue was full.",
+        "counter",
+        n.dropped,
+    );
+    single(
+        "rfw_webhook_suppressed_total",
+        "Alert events folded into a later message by the per-kind throttle.",
+        "counter",
+        n.suppressed,
+    );
     out
 }
 
@@ -334,8 +407,13 @@ pub fn render_json(snaps: &[StatsSnapshot]) -> String {
         if i > 0 {
             out.push(',');
         }
+        let target = match s.target_reachable {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "null",
+        };
         out.push_str(&format!(
-            "{{\"label\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{},\"listening\":{}}}",
+            "{{\"label\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{},\"listening\":{},\"target_reachable\":{}}}",
             escape(&s.label),
             s.bytes_sent,
             s.bytes_received,
@@ -343,7 +421,8 @@ pub fn render_json(snaps: &[StatsSnapshot]) -> String {
             s.rejected_connections,
             s.rate_sent_bps,
             s.rate_recv_bps,
-            s.listening
+            s.listening,
+            target
         ));
     }
     out.push(']');
@@ -364,6 +443,57 @@ mod tests {
             rate_sent_bps: 10,
             rate_recv_bps: 20,
             listening: true,
+            target_reachable: Some(true),
+        }
+    }
+
+    #[test]
+    fn target_reachable_is_absent_until_probed_then_0_or_1() {
+        let unknown = StatsSnapshot {
+            target_reachable: None,
+            ..snap()
+        };
+        let out = render_prometheus(std::slice::from_ref(&unknown));
+        assert!(out.contains("# TYPE rfw_target_reachable gauge"));
+        assert!(
+            !out.contains("rfw_target_reachable{"),
+            "no sample before the first probe: {out}"
+        );
+        assert!(render_json(&[unknown]).contains("\"target_reachable\":null"));
+
+        let up = snap();
+        assert!(render_prometheus(std::slice::from_ref(&up))
+            .contains("rfw_target_reachable{label=\"a:1->b:2\"} 1"));
+        assert!(render_json(&[up]).contains("\"target_reachable\":true"));
+
+        let down = StatsSnapshot {
+            target_reachable: Some(false),
+            ..snap()
+        };
+        assert!(render_prometheus(std::slice::from_ref(&down))
+            .contains("rfw_target_reachable{label=\"a:1->b:2\"} 0"));
+        assert!(render_json(&[down]).contains("\"target_reachable\":false"));
+    }
+
+    #[test]
+    fn webhook_counters_render_as_process_level_metrics() {
+        let out = render_webhook_metrics(&NotifierSnapshot {
+            enabled: true,
+            sent: 5,
+            failed: 1,
+            dropped: 2,
+            suppressed: 9,
+        });
+        assert!(out.contains("# TYPE rfw_webhook_sent_total counter\nrfw_webhook_sent_total 5\n"));
+        assert!(out.contains("rfw_webhook_enabled 1\n"));
+        assert!(out.contains("rfw_webhook_failed_total 1\n"));
+        assert!(out.contains("rfw_webhook_dropped_total 2\n"));
+        assert!(out.contains("rfw_webhook_suppressed_total 9\n"));
+        for line in out.lines() {
+            assert!(
+                line.starts_with('#') || line.starts_with("rfw_webhook_"),
+                "{line}"
+            );
         }
     }
 
@@ -531,7 +661,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let c = cancel.clone();
         tokio::spawn(async move {
-            serve(format!("127.0.0.1:{port}"), registry, c).await;
+            serve(
+                format!("127.0.0.1:{port}"),
+                registry,
+                c,
+                Notifier::disabled(),
+            )
+            .await;
         });
 
         for _ in 0..100 {
@@ -567,6 +703,10 @@ mod tests {
         assert!(
             metrics.contains("rfw_bytes_sent_total{label=\"a:1->b:2\"} 7"),
             "{metrics}"
+        );
+        assert!(
+            metrics.contains("rfw_webhook_enabled 0\n"),
+            "webhook counters are part of the scrape: {metrics}"
         );
 
         let stats = get(port, "GET /stats HTTP/1.1\r\nHost: x\r\n\r\n").await;

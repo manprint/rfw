@@ -1,6 +1,6 @@
 [package]
 name = "rfw"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 rust-version = "1.89"
 description = "Rust Forwarder — TCP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
@@ -8,7 +8,7 @@ description = "Rust Forwarder — TCP port forwarder with hot-reload, auto-recon
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 # serde_yaml is unmaintained (0.9.34+deprecated); serde-saphyr is its actively
 # maintained, panic-free successor with the same serde-derive surface.
@@ -22,6 +22,15 @@ hickory-resolver = "0.26.3"
 socket2 = { version = "0.6.5", features = ["all"] }
 libc = "0.2.186"
 anyhow = "1.0.104"
+# Webhook alerting (Google Chat). TLS is rustls with the `ring` provider and
+# the bundled Mozilla root store: no OpenSSL, no system CA store (the runtime
+# image is distroless), and `ring` cross-compiles to every target build.sh
+# produces (aws-lc-rs needs cmake/bindgen on several of them).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "charset"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.9"
+serde_json = "1.0"
+url = "2.5.8"
 
 [dev-dependencies]
 libc = "0.2.186"

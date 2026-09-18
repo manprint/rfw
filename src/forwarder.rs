@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_resolver::TokioResolver;
 use tokio::io::AsyncWriteExt;
@@ -11,6 +11,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ForwarderConfig, KeepaliveConfig, KnobSnapshot, RuntimeKnobs};
+use crate::notify::{Event, Notifier};
 use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
 
 /// Stagger between parallel connect attempts to successive resolved addresses
@@ -18,6 +19,14 @@ use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
 /// dead first record costs ~250 ms instead of a full connect timeout, large
 /// enough that a healthy first record almost always wins on its own.
 const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Backoff between attempts to bind a local address that is taken.
+const BIND_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Local gate on the "connection limit reached" alert: the accept loop is a
+/// hot path, so the check is one `Instant` comparison, not a channel send per
+/// rejected connection. The notifier throttles further downstream.
+const LIMIT_ALERT_SPACING: Duration = Duration::from_secs(60);
 
 /// Apply per-socket tuning: disable Nagle, (optionally) size the kernel
 /// send/receive buffers, and (optionally) arm TCP keepalive. Failures are
@@ -116,6 +125,7 @@ pub async fn run_forwarder(
     knobs: Arc<RuntimeKnobs>,
     conn_tracker: TaskTracker,
     conn_limit: Option<Arc<Semaphore>>,
+    notifier: Notifier,
 ) {
     // Share config across connection tasks by refcount instead of deep-cloning
     // its strings per accepted connection.
@@ -129,6 +139,7 @@ pub async fn run_forwarder(
     let remote_literal: Option<IpAddr> = cfg.remote_host.parse().ok();
 
     // Bind with auto-reconnect loop
+    let mut bind_failures: u32 = 0;
     let listener = loop {
         tokio::select! {
             biased;
@@ -140,8 +151,17 @@ pub async fn run_forwarder(
                 match result {
                     Ok(l) => break l,
                     Err(e) => {
-                        error!(forwarder = %label, error = %e, "Bind failed, retry in 5s");
-                        if cancelled(&cancel, Duration::from_secs(5)).await {
+                        bind_failures = bind_failures.saturating_add(1);
+                        error!(forwarder = %label, error = %e, attempt = bind_failures, "Bind failed, retry in 5s");
+                        // Every failure is reported; the notifier folds repeats
+                        // into one message per throttle window.
+                        notifier.notify(Event::BindFailed {
+                            label: label.to_string(),
+                            local_addr: local_str.clone(),
+                            error: e.to_string(),
+                            attempts: bind_failures,
+                        });
+                        if cancelled(&cancel, BIND_RETRY_DELAY).await {
                             return;
                         }
                     }
@@ -151,6 +171,14 @@ pub async fn run_forwarder(
     };
 
     info!(forwarder = %label, "Listening on {} -> {}:{}", local_str, cfg.remote_host, cfg.remote_port);
+    if bind_failures > 0 {
+        notifier.notify(Event::BindRecovered {
+            label: label.to_string(),
+            local_addr: local_str.clone(),
+            failed_attempts: bind_failures,
+        });
+    }
+    let mut last_limit_alert: Option<Instant> = None;
 
     // Flip the health flag for as long as the accept loop below is alive.
     let _listening = ListeningGuard::new(stats.clone());
@@ -180,6 +208,14 @@ pub async fn run_forwarder(
                                     peer = %peer_addr,
                                     "Connection rejected: max_connections reached"
                                 );
+                                if last_limit_alert.is_none_or(|t| t.elapsed() >= LIMIT_ALERT_SPACING) {
+                                    last_limit_alert = Some(Instant::now());
+                                    warn!(forwarder = %label, "max_connections saturated; refusing new connections");
+                                    notifier.notify(Event::ConnectionLimitReached {
+                                        label: label.to_string(),
+                                        rejected_total: stats.snapshot().rejected_connections,
+                                    });
+                                }
                                 continue;
                             }
                         };
@@ -188,6 +224,7 @@ pub async fn run_forwarder(
                         let resolver = resolver.clone();
                         let s = stats.clone();
                         let conn_label = label.clone();
+                        let conn_notifier = notifier.clone();
                         // Snapshot the live data-plane knobs at accept time; in-flight
                         // connections keep their values across a hot-reload.
                         let knobs = knobs.snapshot();
@@ -200,7 +237,7 @@ pub async fn run_forwarder(
                             let _permit = permit;
                             if let Err(e) = proxy_connection(
                                 inbound, peer_addr, &fwd_cfg, &conn_label, &resolver, s,
-                                remote_literal, knobs,
+                                remote_literal, knobs, &conn_notifier,
                             ).await {
                                 warn!(forwarder = %conn_label, peer = %peer_addr, error = %e, "Proxy error");
                             }
@@ -272,7 +309,7 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
 /// An IP literal short-circuits the resolver entirely; anything else is looked
 /// up fresh so DNS changes are picked up per connection (hickory caches
 /// internally, so a repeated lookup is not a repeated network round trip).
-async fn resolve_targets(
+pub(crate) async fn resolve_targets(
     remote_host: &str,
     remote_port: u16,
     literal: Option<IpAddr>,
@@ -302,7 +339,7 @@ async fn resolve_targets(
 /// Attempts are started `CONNECT_ATTEMPT_DELAY` apart and race each other, so a
 /// dead first record costs one stagger instead of a whole connect timeout. The
 /// losing attempts are dropped as soon as one succeeds.
-async fn connect_racing(
+pub(crate) async fn connect_racing(
     addrs: &[std::net::SocketAddr],
     connect_timeout: Duration,
 ) -> Result<(TcpStream, std::net::SocketAddr), anyhow::Error> {
@@ -351,6 +388,7 @@ async fn proxy_connection(
     stats: Arc<ForwarderStats>,
     remote_literal: Option<IpAddr>,
     knobs: KnobSnapshot,
+    notifier: &Notifier,
 ) -> Result<(), anyhow::Error> {
     // Tune the client-side socket: disable Nagle (forwarded traffic is often
     // interactive) and optionally size the kernel buffers.
@@ -363,16 +401,51 @@ async fn proxy_connection(
         "inbound",
     );
 
-    let targets = resolve_targets(
+    let targets = match resolve_targets(
         &cfg.remote_host,
         cfg.remote_port,
         remote_literal,
         resolver,
         knobs.dns_timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            // Lets the monitor start its downtime clock now, not at its next tick.
+            stats.mark_connect_failed();
+            return Err(e);
+        }
+    };
 
-    let (mut outbound, remote_addr) = connect_racing(&targets, knobs.connect_timeout).await?;
+    // Report a DNS change the moment real traffic sees it: the address set is
+    // shared with the monitor, so exactly one of them raises the alert.
+    if remote_literal.is_none() {
+        let ips: Vec<IpAddr> = targets.iter().map(|a| a.ip()).collect();
+        if let Some(old) = stats.observe_addrs(&ips) {
+            let mut new = ips;
+            new.sort_unstable();
+            new.dedup();
+            info!(forwarder = %label, host = %cfg.remote_host, old = ?old, new = ?new, "Target DNS answer changed");
+            notifier.notify(Event::DnsChanged {
+                label: label.to_string(),
+                host: cfg.remote_host.clone(),
+                old,
+                new,
+            });
+        }
+    }
+
+    let (mut outbound, remote_addr) = match connect_racing(&targets, knobs.connect_timeout).await {
+        Ok(c) => {
+            stats.mark_connect_ok();
+            c
+        }
+        Err(e) => {
+            stats.mark_connect_failed();
+            return Err(e);
+        }
+    };
 
     tune_socket(
         &outbound,
@@ -725,6 +798,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::config::Settings;
+    use crate::testutil::{fake_dns_response, resolver_for, spawn_fake_dns};
 
     // ---- socket tuning ------------------------------------------------------
 
@@ -836,6 +910,7 @@ mod tests {
             knobs,
             tracker,
             None,
+            Notifier::disabled(),
         ));
 
         wait_listening(&stats, true).await;
@@ -873,6 +948,7 @@ mod tests {
             knobs,
             tracker,
             None,
+            Notifier::disabled(),
         ));
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -897,97 +973,6 @@ mod tests {
     // `TokioResolver` at it with the production `apply_resolver_policy`, and
     // drive `run_forwarder` against a hostname whose answer is flipped
     // underneath it.
-
-    /// Build a minimal DNS response for `query`: an A record with `ip`/`ttl`
-    /// for A questions, an empty NOERROR for anything else. Echoes the
-    /// question section verbatim.
-    fn fake_dns_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Option<Vec<u8>> {
-        if query.len() < 12 {
-            return None;
-        }
-        // Walk QNAME labels.
-        let mut off = 12;
-        loop {
-            let len = *query.get(off)? as usize;
-            off += 1;
-            if len == 0 {
-                break;
-            }
-            off += len;
-        }
-        let qtype = u16::from_be_bytes([*query.get(off)?, *query.get(off + 1)?]);
-        let q_end = off + 4;
-        query.get(..q_end)?;
-
-        let is_a = qtype == 1;
-        let mut resp = Vec::with_capacity(q_end + 16);
-        resp.extend_from_slice(&query[..2]); // ID
-        resp.extend_from_slice(&[0x81, 0x80]); // QR, RD, RA, NOERROR
-        resp.extend_from_slice(&[0, 1]); // QDCOUNT
-        resp.extend_from_slice(&[0, u8::from(is_a)]); // ANCOUNT
-        resp.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
-        resp.extend_from_slice(&query[12..q_end]); // question
-        if is_a {
-            resp.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to question
-            resp.extend_from_slice(&[0, 1, 0, 1]); // TYPE A, CLASS IN
-            resp.extend_from_slice(&ttl.to_be_bytes());
-            resp.extend_from_slice(&[0, 4]); // RDLENGTH
-            resp.extend_from_slice(&ip.octets());
-        }
-        Some(resp)
-    }
-
-    /// Fake resolver on an ephemeral UDP port. Answers every A question with
-    /// the IP currently stored in `answer` (as a `u32` from `Ipv4Addr`) and
-    /// counts A questions in `a_queries`.
-    async fn spawn_fake_dns(
-        answer: Arc<AtomicU32>,
-        a_queries: Arc<AtomicUsize>,
-        ttl: u32,
-    ) -> SocketAddr {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0_u8; 512];
-            loop {
-                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
-                    break;
-                };
-                let ip = Ipv4Addr::from(answer.load(Ordering::Relaxed));
-                if let Some(resp) = fake_dns_response(&buf[..n], ip, ttl) {
-                    // ANCOUNT == 1 means it was an A question.
-                    if resp[7] == 1 {
-                        a_queries.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let _ = sock.send_to(&resp, peer).await;
-                }
-            }
-        });
-        addr
-    }
-
-    /// A real hickory resolver pointed at the fake server, configured exactly
-    /// the way `ForwarderManager::new` configures the production one.
-    fn resolver_for(dns: SocketAddr) -> TokioResolver {
-        use hickory_resolver::config::{
-            ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig,
-        };
-        use hickory_resolver::net::runtime::TokioRuntimeProvider;
-
-        let mut conn = ConnectionConfig::udp();
-        conn.port = dns.port();
-        let mut ns = NameServerConfig::udp(dns.ip());
-        ns.connections = vec![conn];
-        let mut config = ResolverConfig::default();
-        config.add_name_server(ns);
-
-        let mut builder =
-            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-        crate::manager::apply_resolver_policy(builder.options_mut());
-        // Keep the host's /etc/hosts out of the picture.
-        builder.options_mut().use_hosts_file = ResolveHosts::Never;
-        builder.build().unwrap()
-    }
 
     /// Backend that answers the first bytes of every connection with `tag`
     /// and then echoes each further chunk prefixed with `tag:`.
@@ -1139,6 +1124,7 @@ mod tests {
             knobs,
             tracker,
             None,
+            Notifier::disabled(),
         ));
         wait_listening(&stats, true).await;
 
@@ -1248,6 +1234,7 @@ mod tests {
             knobs,
             tracker,
             None,
+            Notifier::disabled(),
         ));
         wait_listening(&stats, true).await;
 

@@ -27,7 +27,8 @@ forwarders:
 # Optional runtime settings (all fields optional; defaults shown).
 # CLI flags (--metrics-addr, --report-interval, --sample-interval,
 # --buffer-bytes, --socket-buffer-bytes, --splice, --max-connections,
-# --connect-timeout, --dns-timeout, --keepalive-*) override these.
+# --connect-timeout, --dns-timeout, --keepalive-*, --webhook-url,
+# --instance-name, --probe-interval, --unreachable-after) override these.
 # ------------------------------------------------------------
 settings:
   # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON,
@@ -71,6 +72,27 @@ settings:
   keepalive_idle_secs: 60
   keepalive_interval_secs: 10
   keepalive_retries: 3
+
+  # ── Alerting to a Google Chat webhook (startup only — a change needs a restart) ──
+  # Sends a message on: startup (with one reachability probe per target), a
+  # DNS answer change for a target, a target unreachable for longer than
+  # unreachable_after_secs (and its recovery), a local port that cannot be
+  # bound (and its recovery), config reload success/failure, max_connections
+  # saturation, internal problems, and shutdown.
+  # The URL carries the space's credentials (key= and token=): prefer the
+  # RFW_WEBHOOK_URL environment variable over writing it into this file.
+  # Omit / null to disable (default: disabled).
+  # webhook_url: "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=...&token=..."
+  # Name shown in every alert; defaults to the hostname.
+  # instance_name: "db-proxy-prod"
+  # Seconds between active probes of each target: resolve + one TCP connect,
+  # closed at once. Skipped while real connections keep succeeding, so a busy
+  # forwarder costs the backend no extra connections. (hot-reloadable)
+  probe_interval_secs: 30
+  # Seconds a target must fail continuously before the "unreachable" alert
+  # (default 300 = 5 minutes). Shorter blips are logged, not alerted.
+  # (hot-reloadable)
+  unreachable_after_secs: 300
 
 # ------------------------------------------------------------
 # Notes

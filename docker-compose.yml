@@ -14,7 +14,7 @@
 services:
   rfw:
     # Pin a release tag in production; `latest` moves on every release.
-    image: ghcr.io/manprint/rfw:v1.0.5
+    image: ghcr.io/manprint/rfw:v1.0.6
     container_name: rfw
     restart: unless-stopped
 
@@ -38,6 +38,14 @@ services:
       # ── Runtime settings ──
       # Both the console and file log sinks honour this.
       - RUST_LOG=info
+
+      # ── Alerting to Google Chat (optional) ──
+      # Incoming-webhook URL of the space. It carries credentials: keep it in
+      # an .env file (RFW_WEBHOOK_URL=https://chat.googleapis.com/v1/spaces/...)
+      # that is not committed, and reference it here.
+      # - RFW_WEBHOOK_URL=${RFW_WEBHOOK_URL}
+      # Name shown in every alert (default: container hostname).
+      # - RFW_INSTANCE_NAME=edge-proxy-1
 
     # ── Runtime flags ──
     # --log-dir "" keeps logs on stdout so the Docker log driver (and its

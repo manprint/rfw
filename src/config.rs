@@ -61,6 +61,12 @@ fn default_keepalive_interval() -> u64 {
 fn default_keepalive_retries() -> u32 {
     3
 }
+fn default_probe_interval() -> u64 {
+    30
+}
+fn default_unreachable_after() -> u64 {
+    300
+}
 
 /// Smallest accepted copy buffer. A zero-sized buffer makes
 /// `copy_bidirectional` spin at 100% CPU while moving no bytes, so it is
@@ -122,6 +128,23 @@ pub struct Settings {
     /// Unanswered probes before the connection is declared dead.
     #[serde(default = "default_keepalive_retries")]
     pub keepalive_retries: u32,
+    /// Google Chat incoming-webhook URL for operational alerts. `None`
+    /// disables alerting (default). Prefer the `RFW_WEBHOOK_URL` environment
+    /// variable in production: the URL carries the space's credentials.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Name identifying this instance in alerts. Defaults to the hostname.
+    #[serde(default)]
+    pub instance_name: Option<String>,
+    /// Seconds between active reachability probes of each target (one TCP
+    /// connect, closed immediately). Skipped while real connections keep
+    /// succeeding.
+    #[serde(default = "default_probe_interval")]
+    pub probe_interval_secs: u64,
+    /// Seconds a target must fail probes continuously before the
+    /// "unreachable" alert is raised (default 300 = 5 minutes).
+    #[serde(default = "default_unreachable_after")]
+    pub unreachable_after_secs: u64,
 }
 
 impl Default for Settings {
@@ -139,6 +162,10 @@ impl Default for Settings {
             keepalive_idle_secs: default_keepalive_idle(),
             keepalive_interval_secs: default_keepalive_interval(),
             keepalive_retries: default_keepalive_retries(),
+            webhook_url: None,
+            instance_name: None,
+            probe_interval_secs: default_probe_interval(),
+            unreachable_after_secs: default_unreachable_after(),
         }
     }
 }
@@ -196,6 +223,18 @@ impl Settings {
                 );
             }
         }
+        if self.probe_interval_secs == 0 {
+            anyhow::bail!("probe_interval_secs must be >= 1");
+        }
+        if self.unreachable_after_secs == 0 {
+            anyhow::bail!("unreachable_after_secs must be >= 1");
+        }
+        if let Some(url) = &self.webhook_url {
+            if let Err(e) = crate::notify::validate_webhook_url(url) {
+                // Never echo the URL back: it carries the webhook credentials.
+                anyhow::bail!("webhook_url is invalid: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -221,6 +260,12 @@ impl Settings {
         floor_u64("sample_interval_secs", &mut self.sample_interval_secs, 1);
         floor_u64("connect_timeout_secs", &mut self.connect_timeout_secs, 1);
         floor_u64("dns_timeout_secs", &mut self.dns_timeout_secs, 1);
+        floor_u64("probe_interval_secs", &mut self.probe_interval_secs, 1);
+        floor_u64(
+            "unreachable_after_secs",
+            &mut self.unreachable_after_secs,
+            1,
+        );
 
         let clamped_buffer = self.buffer_bytes.clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES);
         if clamped_buffer != self.buffer_bytes {
@@ -295,6 +340,9 @@ pub struct RuntimeKnobs {
     keepalive_idle_secs: AtomicU64,
     keepalive_interval_secs: AtomicU64,
     keepalive_retries: AtomicU32,
+    /// Target monitor cadence and alert threshold (read live by the monitor).
+    probe_interval_secs: AtomicU64,
+    unreachable_after_secs: AtomicU64,
 }
 
 impl RuntimeKnobs {
@@ -308,6 +356,8 @@ impl RuntimeKnobs {
             keepalive_idle_secs: AtomicU64::new(default_keepalive_idle()),
             keepalive_interval_secs: AtomicU64::new(default_keepalive_interval()),
             keepalive_retries: AtomicU32::new(default_keepalive_retries()),
+            probe_interval_secs: AtomicU64::new(default_probe_interval()),
+            unreachable_after_secs: AtomicU64::new(default_unreachable_after()),
         };
         knobs.update(s);
         knobs
@@ -335,6 +385,20 @@ impl RuntimeKnobs {
             .store(s.keepalive_interval_secs, Ordering::Relaxed);
         self.keepalive_retries
             .store(s.keepalive_retries, Ordering::Relaxed);
+        self.probe_interval_secs
+            .store(s.probe_interval_secs, Ordering::Relaxed);
+        self.unreachable_after_secs
+            .store(s.unreachable_after_secs, Ordering::Relaxed);
+    }
+
+    /// Cadence of the target monitor's active probes.
+    pub fn probe_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.probe_interval_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// Continuous failure time before the "target unreachable" alert.
+    pub fn unreachable_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.unreachable_after_secs.load(Ordering::Relaxed).max(1))
     }
 
     /// Returns `None` when keepalive is disabled (`keepalive_idle_secs == 0`).
@@ -465,6 +529,31 @@ pub struct CliArgs {
     #[arg(long = "keepalive-retries", value_name = "N")]
     pub keepalive_retries: Option<u32>,
 
+    /// Google Chat incoming-webhook URL for operational alerts (startup,
+    /// target unreachable, DNS change, bind failures, reload errors).
+    /// The URL carries credentials: prefer the RFW_WEBHOOK_URL environment
+    /// variable over a command-line argument visible in `ps`.
+    #[arg(
+        long = "webhook-url",
+        value_name = "URL",
+        env = "RFW_WEBHOOK_URL",
+        hide_env_values = true
+    )]
+    pub webhook_url: Option<String>,
+
+    /// Name identifying this instance in alerts (default: hostname)
+    #[arg(long = "instance-name", value_name = "NAME", env = "RFW_INSTANCE_NAME")]
+    pub instance_name: Option<String>,
+
+    /// Seconds between active reachability probes of each target (default 30)
+    #[arg(long = "probe-interval", value_name = "SECS")]
+    pub probe_interval_secs: Option<u64>,
+
+    /// Seconds a target must stay unreachable before the alert is sent
+    /// (default 300 = 5 minutes)
+    #[arg(long = "unreachable-after", value_name = "SECS")]
+    pub unreachable_after_secs: Option<u64>,
+
     /// Directory for the rolling JSON log file. Use `--log-dir ""` to disable
     /// file logging entirely and log to the console only.
     #[arg(long = "log-dir", default_value = "logs")]
@@ -497,6 +586,10 @@ impl Default for CliArgs {
             keepalive_idle_secs: None,
             keepalive_interval_secs: None,
             keepalive_retries: None,
+            webhook_url: None,
+            instance_name: None,
+            probe_interval_secs: None,
+            unreachable_after_secs: None,
             log_dir: "logs".to_string(),
             health_check: None,
             forwarders: Vec::new(),
@@ -660,6 +753,19 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     }
     if let Some(v) = cli.keepalive_retries {
         settings.keepalive_retries = v;
+    }
+    if let Some(url) = &cli.webhook_url {
+        // An empty value (e.g. `RFW_WEBHOOK_URL=` in a compose file) means off.
+        settings.webhook_url = Some(url.clone()).filter(|u| !u.trim().is_empty());
+    }
+    if let Some(name) = &cli.instance_name {
+        settings.instance_name = Some(name.clone());
+    }
+    if let Some(v) = cli.probe_interval_secs {
+        settings.probe_interval_secs = v;
+    }
+    if let Some(v) = cli.unreachable_after_secs {
+        settings.unreachable_after_secs = v;
     }
 
     settings.validate()?;
