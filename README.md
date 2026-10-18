@@ -184,7 +184,7 @@ On **hot-reload** the same values are *clamped* instead of rejected (a live
 process must not abort over an edit), and each correction is logged.
 
 These runtime options can also be set in the YAML config under a `settings:`
-block (CLI flags take precedence). See `forwarders.yml`.
+block (CLI flags take precedence, at startup and on hot-reload). See `forwarders.yml`.
 
 ## Configuration override behavior
 
@@ -192,6 +192,7 @@ block (CLI flags take precedence). See `forwarders.yml`.
 2. If **CLI args** are provided, they **replace** the YAML config (but can be overridden by env).
 3. If **neither** env vars nor CLI args are given, the **YAML config file** is used.
 4. If **no config source** is found, rfw prints an error and exits.
+5. On hot-reload the same precedence holds: command-line flags are re-applied over the file's `settings:` block, and when the forwarders come from `RFW_FORWARDER_N` or positional arguments the file's `forwarders:` list is ignored (logged at startup and on every reload); only its settings are applied.
 
 ## Hot-reload
 
@@ -200,6 +201,7 @@ When using `-f forwarders.yml`, rfw watches the YAML file for changes:
 - **New forwarders** added to the file are started automatically
 - **Removed forwarders** stop accepting new connections (in-flight connections keep running until they close)
 - **Unchanged forwarders** are unaffected
+- **Pinned forwarders**: if the forwarders were given via env vars or positional arguments, the `forwarders:` list in the file is not applied on reload
 
 Changes are debounced (1s window) to avoid reload storms.
 
@@ -208,6 +210,7 @@ Changes are debounced (1s window) to avoid reload storms.
 > `dns_timeout_secs`, `keepalive_idle_secs`, `keepalive_interval_secs`,
 > `keepalive_retries`, `probe_interval_secs`, `unreachable_after_secs`) live —
 > new connections pick up the new values; in-flight connections keep theirs.
+> CLI flags still win over the reloaded `settings:` block.
 > Changes to `report_interval_secs`, `sample_interval_secs`, `max_connections`,
 > `metrics_addr`, `webhook_url` and `instance_name` still require a restart.
 >

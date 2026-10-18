@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let _guard = logging::setup(&cli.log_dir)?;
 
     // Load forwarder configurations (YAML + CLI + env, merged with precedence)
-    let forwarders = config::load_forwarders(&cli)?;
+    let (forwarders, source) = config::load_forwarders_with_source(&cli)?;
 
     // Load runtime settings (YAML settings: block + CLI overrides).
     // Invalid values are rejected here rather than panicking a background task
@@ -96,6 +96,14 @@ async fn main() -> anyhow::Result<()> {
             fwd.remote_host,
             fwd.remote_port
         );
+    }
+    if let Some(path) = &cli.config_file {
+        if source != config::ForwarderSource::File {
+            info!(
+                "Forwarders come from {source}; the forwarders list in {} is ignored (its settings block still applies and hot-reloads)",
+                path.display()
+            );
+        }
     }
 
     // splice is Linux-only; warn once at startup if requested elsewhere
@@ -130,8 +138,12 @@ async fn main() -> anyhow::Result<()> {
         let path = config_path.clone();
         let mgr = manager.clone();
         let cancel = config_cancel.clone();
+        let policy = manager::ReloadPolicy {
+            cli: cli.clone(),
+            source,
+        };
         tokio::spawn(async move {
-            manager::watch_config_file(path, mgr, cancel).await;
+            manager::watch_config_file(path, mgr, cancel, policy).await;
         });
     }
 

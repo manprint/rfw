@@ -111,6 +111,103 @@ pub fn spawn_rfw(args: &[&str]) -> ChildGuard {
     ChildGuard(rfw_command(args).spawn().expect("spawn rfw"))
 }
 
+/// Captured stdout+stderr lines of an `rfw` child, ANSI stripped.
+pub struct LogTail {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl LogTail {
+    /// Poll every 50ms until a captured line contains `needle`; false on timeout.
+    pub async fn wait_for(&self, needle: &str, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if self.count(needle) > 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Number of captured lines containing `needle`.
+    pub fn count(&self, needle: &str) -> usize {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    /// Snapshot of every captured line so far.
+    pub fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+}
+
+/// Remove ANSI CSI sequences: ESC '[' ... final byte in 0x40..=0x7E.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for f in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&f) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Like `spawn_rfw`, but stdout+stderr are piped and captured line by line (ANSI stripped).
+/// Forces RUST_LOG=info; removes inherited RFW_FORWARDER_*, RFW_WEBHOOK_URL and
+/// RFW_INSTANCE_NAME (so a developer shell can never leak a real webhook into a test),
+/// then applies `envs`.
+pub fn spawn_rfw_logged(args: &[&str], envs: &[(&str, &str)]) -> (ChildGuard, LogTail) {
+    use std::io::{BufRead, BufReader};
+
+    let mut cmd = rfw_command(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("RFW_FORWARDER_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env_remove("RFW_WEBHOOK_URL")
+        .env_remove("RFW_INSTANCE_NAME")
+        .env("RUST_LOG", "info");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().expect("spawn rfw");
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    spawn_line_reader(stdout, lines.clone());
+    spawn_line_reader(stderr, lines.clone());
+    return (ChildGuard(child), LogTail { lines });
+
+    fn spawn_line_reader<R: std::io::Read + Send + 'static>(
+        pipe: R,
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines() {
+                let Ok(line) = line else { break };
+                lines.lock().unwrap().push(strip_ansi(&line));
+            }
+        });
+    }
+}
+
 /// In-process echo server: every connection echoes bytes back until EOF.
 /// Binds an ephemeral port itself and returns it, so it can never collide with
 /// a port another test is about to use.

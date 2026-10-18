@@ -466,7 +466,7 @@ pub struct KnobSnapshot {
     pub keepalive: Option<KeepaliveConfig>,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "rfw",
     version,
@@ -674,50 +674,72 @@ pub(crate) fn load_yaml_forwarders(
     Ok(load_yaml_config(path)?.forwarders)
 }
 
-/// Load forwarders merging YAML file, CLI args, and env vars.
+/// Where the running forwarder list came from at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwarderSource {
+    Env,
+    Cli,
+    File,
+    None,
+}
+
+impl std::fmt::Display for ForwarderSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ForwarderSource::Env => "RFW_FORWARDER_N environment variables",
+            ForwarderSource::Cli => "command-line arguments",
+            ForwarderSource::File => "config file",
+            ForwarderSource::None => "nowhere",
+        })
+    }
+}
+
+/// Load forwarders merging YAML file, CLI args, and env vars, and report which
+/// source the returned list came from.
 ///
 /// Precedence: env vars > CLI args > YAML file.
 /// - If env vars are set, they completely replace all other sources.
 /// - If CLI args are given, they replace the YAML config.
 /// - Otherwise the YAML file is used.
-pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
-    let configured_forwarders = if !cli.forwarders.is_empty() {
+pub fn load_forwarders_with_source(
+    cli: &CliArgs,
+) -> Result<(Vec<ForwarderConfig>, ForwarderSource), anyhow::Error> {
+    let (configured_forwarders, configured_source) = if !cli.forwarders.is_empty() {
         // CLI args: parse and use instead of YAML
-        cli.forwarders
+        let parsed = cli
+            .forwarders
             .iter()
             .map(|s| parse_forwarder(s).map_err(|e| anyhow::anyhow!("{}", e)))
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        (parsed, ForwarderSource::Cli)
     } else if let Some(path) = &cli.config_file {
         // YAML file
-        load_yaml_forwarders(path)?
+        (load_yaml_forwarders(path)?, ForwarderSource::File)
     } else {
-        Vec::new()
+        (Vec::new(), ForwarderSource::None)
     };
 
     // Env vars override everything
     let env_forwarders = load_env_forwarders();
-    let forwarders = if env_forwarders.is_empty() {
-        configured_forwarders
+    let (forwarders, source) = if env_forwarders.is_empty() {
+        (configured_forwarders, configured_source)
     } else {
-        env_forwarders
+        (env_forwarders, ForwarderSource::Env)
     };
 
     validate_no_duplicates(&forwarders)?;
-    Ok(forwarders)
+    Ok((forwarders, source))
 }
 
-/// Load runtime settings: YAML `settings:` block (if a config file is given),
-/// with CLI flags overriding individual fields. Missing/unreadable file falls
-/// back to defaults (the forwarder load path already surfaces file errors).
-pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
-    let mut settings = match &cli.config_file {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(content) => serde_saphyr::from_str::<ConfigFile>(&content)?.settings,
-            Err(_) => Settings::default(),
-        },
-        None => Settings::default(),
-    };
+/// Test-only convenience: the forwarder list without its source.
+#[cfg(test)]
+pub fn load_forwarders(cli: &CliArgs) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
+    Ok(load_forwarders_with_source(cli)?.0)
+}
 
+/// Apply every CLI flag the operator actually passed over `settings`.
+/// Shared by startup (`load_settings`) and hot-reload, so CLI flags win in both.
+pub fn apply_cli_overrides(settings: &mut Settings, cli: &CliArgs) {
     if let Some(addr) = &cli.metrics_addr {
         settings.metrics_addr = Some(addr.clone());
     }
@@ -767,6 +789,21 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     if let Some(v) = cli.unreachable_after_secs {
         settings.unreachable_after_secs = v;
     }
+}
+
+/// Load runtime settings: YAML `settings:` block (if a config file is given),
+/// with CLI flags overriding individual fields. Missing/unreadable file falls
+/// back to defaults (the forwarder load path already surfaces file errors).
+pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
+    let mut settings = match &cli.config_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(content) => serde_saphyr::from_str::<ConfigFile>(&content)?.settings,
+            Err(_) => Settings::default(),
+        },
+        None => Settings::default(),
+    };
+
+    apply_cli_overrides(&mut settings, cli);
 
     settings.validate()?;
     Ok(settings)
@@ -1413,5 +1450,95 @@ mod tests {
         assert_eq!(cli.log_dir, "logs");
         let cli = CliArgs::parse_from(["rfw", "--log-dir", "", "127.0.0.1:1:b:2"]);
         assert_eq!(cli.log_dir, "");
+    }
+
+    #[test]
+    fn apply_cli_overrides_overrides_only_given_flags() {
+        let mut s = Settings {
+            buffer_bytes: 4096,
+            probe_interval_secs: 30,
+            ..Settings::default()
+        };
+        let cli = CliArgs {
+            buffer_bytes: Some(2048),
+            use_splice: true,
+            ..CliArgs::default()
+        };
+        apply_cli_overrides(&mut s, &cli);
+        assert_eq!(s.buffer_bytes, 2048);
+        assert!(s.use_splice);
+        assert_eq!(s.probe_interval_secs, 30);
+        assert_eq!(s.keepalive_idle_secs, 60);
+
+        let before = s.clone();
+        apply_cli_overrides(&mut s, &CliArgs::default());
+        assert_eq!(s.buffer_bytes, before.buffer_bytes);
+        assert_eq!(s.probe_interval_secs, before.probe_interval_secs);
+        assert_eq!(s.connect_timeout_secs, before.connect_timeout_secs);
+        assert_eq!(s.use_splice, before.use_splice);
+    }
+
+    #[test]
+    fn load_forwarders_reports_its_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let env = ForwarderEnvGuard::set(&[("RFW_FORWARDER_1", "127.0.0.1:1:127.0.0.1:2")]);
+        let (fwd, src) = load_forwarders_with_source(&CliArgs::default()).unwrap();
+        assert_eq!((fwd.len(), src), (1, ForwarderSource::Env));
+        drop(env);
+
+        let _env = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs {
+            forwarders: vec!["127.0.0.1:3:127.0.0.1:4".into()],
+            ..CliArgs::default()
+        };
+        let (fwd, src) = load_forwarders_with_source(&cli).unwrap();
+        assert_eq!((fwd.len(), src), (1, ForwarderSource::Cli));
+
+        let path = write_temp(
+            "src-file",
+            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 5, remote_host: b, remote_port: 6}\n",
+        );
+        let cli = CliArgs {
+            config_file: Some(path.clone()),
+            ..CliArgs::default()
+        };
+        let (fwd, src) = load_forwarders_with_source(&cli).unwrap();
+        assert_eq!((fwd.len(), src), (1, ForwarderSource::File));
+        let _ = std::fs::remove_file(&path);
+
+        let (fwd, src) = load_forwarders_with_source(&CliArgs::default()).unwrap();
+        assert!(fwd.is_empty());
+        assert_eq!(src, ForwarderSource::None);
+
+        assert_eq!(
+            ForwarderSource::Env.to_string(),
+            "RFW_FORWARDER_N environment variables"
+        );
+        assert_eq!(ForwarderSource::Cli.to_string(), "command-line arguments");
+        assert_eq!(ForwarderSource::File.to_string(), "config file");
+        assert_eq!(ForwarderSource::None.to_string(), "nowhere");
+    }
+
+    #[test]
+    fn load_settings_equals_file_plus_overrides() {
+        let path = write_temp(
+            "settings-eq",
+            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2}\nsettings:\n  buffer_bytes: 4096\n  probe_interval_secs: 30\n",
+        );
+        let cli = CliArgs {
+            config_file: Some(path.clone()),
+            buffer_bytes: Some(2048),
+            ..CliArgs::default()
+        };
+        let s = load_settings(&cli).unwrap();
+        assert_eq!(s.buffer_bytes, 2048);
+        assert_eq!(s.probe_interval_secs, 30);
+
+        let mut m = load_yaml_config(&path).unwrap().settings;
+        apply_cli_overrides(&mut m, &cli);
+        assert_eq!(m.buffer_bytes, 2048);
+        assert_eq!(m.probe_interval_secs, 30);
+        let _ = std::fs::remove_file(&path);
     }
 }

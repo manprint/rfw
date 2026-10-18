@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use crate::config::{load_yaml_config, ForwarderConfig, RuntimeKnobs, Settings};
+use crate::config::{
+    apply_cli_overrides, load_yaml_config, CliArgs, ForwarderConfig, ForwarderSource, RuntimeKnobs,
+    Settings,
+};
 use crate::forwarder::{rate_sampler, run_forwarder, stats_reporter};
 use crate::monitor::{probe_all, run_monitor};
 use crate::notify::{Event as Alert, Notifier, ProbeReport};
@@ -338,11 +341,21 @@ async fn cancelled_during(cancel: &CancellationToken, dur: Duration) -> bool {
     }
 }
 
+/// What a hot-reload may change, fixed at startup.
+#[derive(Debug, Clone)]
+pub struct ReloadPolicy {
+    /// Re-applied over the file's `settings:` on every reload, so CLI flags keep winning.
+    pub cli: CliArgs,
+    /// Where the running forwarders came from. Only `File` lets a reload sync the list.
+    pub source: ForwarderSource,
+}
+
 /// Watch a YAML config file for changes and hot-reload forwarders.
 pub async fn watch_config_file(
     config_path: PathBuf,
     manager: Arc<ForwarderManager>,
     cancel: CancellationToken,
+    policy: ReloadPolicy,
 ) {
     let notifier = manager.notifier();
     let path = match config_path.canonicalize() {
@@ -490,8 +503,18 @@ pub async fn watch_config_file(
                     Ok(loaded) => {
                         let before: std::collections::HashSet<String> =
                             manager.running_labels().await.into_iter().collect();
-                        manager.update_knobs(&loaded.settings);
-                        manager.sync(&loaded.forwarders).await;
+                        let mut settings = loaded.settings;
+                        apply_cli_overrides(&mut settings, &policy.cli);
+                        manager.update_knobs(&settings);
+                        if policy.source == ForwarderSource::File {
+                            manager.sync(&loaded.forwarders).await;
+                        } else {
+                            info!(
+                                source = %policy.source,
+                                "Forwarders are pinned by {}: the file's forwarders list is ignored on reload (settings applied)",
+                                policy.source
+                            );
+                        }
                         let after: std::collections::HashSet<String> =
                             manager.running_labels().await.into_iter().collect();
                         let mut added: Vec<String> = after.difference(&before).cloned().collect();
@@ -502,7 +525,7 @@ pub async fn watch_config_file(
                             added = ?added,
                             removed = ?removed,
                             "Config reloaded: {} forwarders active",
-                            loaded.forwarders.len()
+                            after.len()
                         );
                         notifier.notify(Alert::ConfigReloaded {
                             active: after.len(),
@@ -892,5 +915,165 @@ mod tests {
             now,
             window
         ));
+    }
+
+    // ---- reload policy (B1) -------------------------------------------------
+
+    fn temp_yaml(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rfw-mgr-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("forwarders.yml");
+        std::fs::write(&path, body).expect("write yaml");
+        path
+    }
+
+    fn yaml(fwd: &ForwarderConfig, settings: &str) -> String {
+        format!(
+            "forwarders:\n  - {{local_host: \"{}\", local_port: {}, remote_host: \"{}\", remote_port: {}}}\n{settings}",
+            fwd.local_host, fwd.local_port, fwd.remote_host, fwd.remote_port
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_reapplies_cli_overrides_over_file_settings() {
+        use crate::config::{load_settings, CliArgs, ForwarderSource};
+        let (p, r) = (free_port().await, free_port().await);
+        let path = temp_yaml(
+            "cli-over-file",
+            &yaml(
+                &cfg(p, r),
+                "settings:\n  buffer_bytes: 4096\n  probe_interval_secs: 30\n",
+            ),
+        );
+        let cli = CliArgs {
+            config_file: Some(path.clone()),
+            buffer_bytes: Some(2048),
+            ..Default::default()
+        };
+        let settings = load_settings(&cli).unwrap();
+        let mgr = Arc::new(ForwarderManager::new(&settings, Notifier::disabled()).unwrap());
+        mgr.start_all(&[cfg(p, r)]).await;
+
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch_config_file(
+            path.clone(),
+            mgr.clone(),
+            cancel.clone(),
+            ReloadPolicy {
+                cli: cli.clone(),
+                source: ForwarderSource::File,
+            },
+        ));
+
+        let reloaded = yaml(
+            &cfg(p, r),
+            "settings:\n  buffer_bytes: 8192\n  probe_interval_secs: 7\n",
+        );
+        let mut applied = false;
+        for _ in 0..30 {
+            std::fs::write(&path, &reloaded).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mgr.knobs.probe_interval() == Duration::from_secs(7) {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "reload never applied");
+        assert_eq!(mgr.knobs.buffer_bytes(), 2048);
+
+        cancel.cancel();
+        let _ = watcher.await;
+        mgr.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_sync_pinned_forwarders() {
+        use crate::config::{CliArgs, ForwarderSource};
+        let (pa, pb, r) = (free_port().await, free_port().await, free_port().await);
+        let path = temp_yaml("pinned", &yaml(&cfg(pb, r), ""));
+        let mgr = manager();
+        mgr.start_all(&[cfg(pa, r)]).await;
+        wait_listening(pa).await;
+
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch_config_file(
+            path.clone(),
+            mgr.clone(),
+            cancel.clone(),
+            ReloadPolicy {
+                cli: CliArgs::default(),
+                source: ForwarderSource::Cli,
+            },
+        ));
+
+        let reloaded = yaml(&cfg(pb, r), "settings:\n  probe_interval_secs: 7\n");
+        let mut applied = false;
+        for _ in 0..30 {
+            std::fs::write(&path, &reloaded).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mgr.knobs.probe_interval() == Duration::from_secs(7) {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "reload never applied");
+        assert_eq!(mgr.running_labels().await, vec![cfg(pa, r).label()]);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", pb))
+            .await
+            .is_err());
+
+        cancel.cancel();
+        let _ = watcher.await;
+        mgr.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reload_syncs_file_forwarders() {
+        use crate::config::{CliArgs, ForwarderSource};
+        let (pa, pb, r) = (free_port().await, free_port().await, free_port().await);
+        let path = temp_yaml("file-sync", &yaml(&cfg(pa, r), ""));
+        let mgr = manager();
+        mgr.start_all(&[cfg(pa, r)]).await;
+        wait_listening(pa).await;
+
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch_config_file(
+            path.clone(),
+            mgr.clone(),
+            cancel.clone(),
+            ReloadPolicy {
+                cli: CliArgs::default(),
+                source: ForwarderSource::File,
+            },
+        ));
+
+        let reloaded = yaml(&cfg(pb, r), "settings:\n  probe_interval_secs: 7\n");
+        let want = cfg(pb, r).label();
+        let mut applied = false;
+        for _ in 0..30 {
+            std::fs::write(&path, &reloaded).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mgr.running_labels().await.contains(&want) {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied, "reload never applied");
+        assert!(!mgr.running_labels().await.contains(&cfg(pa, r).label()));
+        wait_listening(pb).await;
+
+        cancel.cancel();
+        let _ = watcher.await;
+        mgr.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

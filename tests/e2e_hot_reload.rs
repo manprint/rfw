@@ -8,7 +8,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{free_port, http_get, spawn_echo, spawn_rfw, spawn_tagged, wait_port, TempConfig};
+use common::{
+    free_port, http_get, spawn_echo, spawn_rfw, spawn_rfw_logged, spawn_tagged, wait_port,
+    TempConfig,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -300,4 +303,126 @@ async fn reload_preserves_counters_of_untouched_forwarders() {
         2,
         "both forwarders must be exposed exactly once: {after}"
     );
+}
+
+/// B1: forwarders given on the command line stay pinned across a reload; the
+/// file's `forwarders:` list is ignored (its settings still apply).
+#[tokio::test]
+async fn reload_keeps_cli_forwarders_and_ignores_the_files_list() {
+    let cli_port = free_port();
+    let file_port = free_port();
+    let a = spawn_tagged(b"A").await;
+    let b = spawn_tagged(b"B").await;
+
+    let cfg = TempConfig::new("pinned-cli", &config_with(file_port, b, ""));
+    let (_guard, log) = spawn_rfw_logged(
+        &[
+            "-f",
+            &cfg.path_str(),
+            &format!("127.0.0.1:{cli_port}:127.0.0.1:{a}"),
+        ],
+        &[],
+    );
+    wait_port(cli_port).await;
+    assert!(
+        log.wait_for(
+            "Forwarders come from command-line arguments",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    assert!(
+        log.wait_for("Watching config file", Duration::from_secs(5))
+            .await,
+        "{:?}",
+        log.lines()
+    );
+
+    cfg.rewrite(&config_with(
+        file_port,
+        b,
+        "settings:\n  probe_interval_secs: 7\n",
+    ));
+    assert!(
+        log.wait_for(
+            "forwarders list is ignored on reload",
+            Duration::from_secs(15)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    assert!(
+        log.wait_for(
+            "Config reloaded: 1 forwarders active",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+
+    assert_eq!(probe(cli_port).await.as_deref(), Some("A"));
+    assert!(TcpStream::connect(("127.0.0.1", file_port)).await.is_err());
+}
+
+/// B1: same, for forwarders that came from `RFW_FORWARDER_N`.
+#[tokio::test]
+async fn reload_keeps_env_forwarders() {
+    let env_port = free_port();
+    let file_port = free_port();
+    let a = spawn_tagged(b"A").await;
+    let b = spawn_tagged(b"B").await;
+
+    let cfg = TempConfig::new("pinned-env", &config_with(file_port, b, ""));
+    let fwd = format!("127.0.0.1:{env_port}:127.0.0.1:{a}");
+    let (_guard, log) = spawn_rfw_logged(
+        &["-f", &cfg.path_str()],
+        &[("RFW_FORWARDER_1", fwd.as_str())],
+    );
+    wait_port(env_port).await;
+    assert!(
+        log.wait_for(
+            "Forwarders come from RFW_FORWARDER_N environment variables",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    assert!(
+        log.wait_for("Watching config file", Duration::from_secs(5))
+            .await,
+        "{:?}",
+        log.lines()
+    );
+
+    cfg.rewrite(&config_with(
+        file_port,
+        b,
+        "settings:\n  probe_interval_secs: 7\n",
+    ));
+    assert!(
+        log.wait_for(
+            "forwarders list is ignored on reload",
+            Duration::from_secs(15)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    assert!(
+        log.wait_for(
+            "Config reloaded: 1 forwarders active",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+
+    assert_eq!(probe(env_port).await.as_deref(), Some("A"));
+    assert!(TcpStream::connect(("127.0.0.1", file_port)).await.is_err());
 }
