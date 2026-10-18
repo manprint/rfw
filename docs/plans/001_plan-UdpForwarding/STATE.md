@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: P0 / 1) |
+| ID / attempt | — (last closed: 1.1 / 1) |
 | Status | none |
-| Intent | CLI overrides re-applied on reload; env/CLI forwarders pinned (B1) |
+| Intent | Protocol in config: type, parsing, label, duplicates, UDP settings, gate D17 |
 | Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
-| File / unit heading | phase_01.md "0.1 Reload: override CLI riapplicati e forwarder env/CLI pinned" |
+| File / unit heading | phase_02.md "1.1" |
 | Current step | none |
-| Next eligible plan unit | 1.1, phase_02.md |
-| Unit base | c50db1f; branch: main; owned changes: src/config.rs, src/manager.rs, src/main.rs, tests/common/mod.rs, tests/e2e_hot_reload.rs, README.md |
-| Repo state | HEAD c50db1f; untracked `docs/plans/001_plan-UdpForwarding/` only |
+| Next eligible plan unit | 1.2, phase_02.md |
+| Unit base | dedf948; branch: main; owned changes: src/config.rs, src/forwarder.rs/manager.rs/monitor.rs (test literals), src/main.rs, tests/e2e_lifecycle.rs |
+| Repo state | HEAD dedf948 |
 
-Next action: open 1.1 (agent-2:sonnet).
+Next action: open 1.2 (agent-3:haiku).
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 1.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (Protocol, label /udp, D1a parsing, (protocol,addr) duplicates, udp_* settings+CLI, D17 gate), test literals in forwarder/manager/monitor, e2e_lifecycle +2 | G-HYG pass; config::tests 47 passed incl. 9 new; e2e_lifecycle 17 passed | unit:1.1:1 |
 | plan | 001 / 1 | 1 | agent-1:opus | overview.md, phase_01–04.md, STATE.md (untracked) | readiness check in §7 | staged with 0.1 (unit:0.1:1) |
 | phase-close | P0 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass (see §7); review approve | unit:P0:1 |
 | sub-phase | 0.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (ForwarderSource, load_forwarders_with_source, apply_cli_overrides), manager.rs (ReloadPolicy, reload re-applies CLI, pinned sync), main.rs, tests/common (LogTail, spawn_rfw_logged), e2e_hot_reload (+2), README (override point 5, pinned) | G-HYG pass; G-U0.1 unit 60 passed incl. 6 new; e2e_hot_reload 8 passed; red: 2 e2e failed before fix | unit:0.1:1 |
@@ -363,6 +364,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 1.1 post-diff | agent-1:opus | rev 1; dedf948 + 1.1 diff | I-1 TCP label byte-identical; D1a strings; D4 dup key; D12 validate/clamp; D17 gate in both load paths | approve |
 | P0 phase review | agent-1:opus | rev 1; 003e943 | D20 behavior, 6 unit + 2 e2e tests, README point 5/pinned accurate vs log texts, no TCP data-path change | approve |
 | 0.1 post-diff | agent-1:opus | rev 1; base c50db1f + 0.1 working diff | D20 reload: settings + apply_cli_overrides then update_knobs; sync only when source File; pinned log text; startup log; no `{:?}` of CliArgs/ReloadPolicy in logs; README matches | approve |
 | Plan readiness (quality checklist) | agent-1:opus | rev 1, all plan files | checklist "Plan readiness"; see the readiness notes below | READY |
@@ -399,7 +401,7 @@ none
 | ID | Phase file | Depends on | Status | Attempt | Evidence / reason |
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0.1 pass; review agent-1:opus |
-| 1.1 | phase_02.md | P0 | TODO | 1 | — |
+| 1.1 | phase_02.md | P0 | DONE | 1 | G-U1.1 pass; review agent-1:opus |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
@@ -420,7 +422,7 @@ README obligation per phase:
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
-| 1 | phase_02.md | P1 | TODO | — |
+| 1 | phase_02.md | P1 | IN_PROGRESS | — |
 | 2 | phase_03.md | P2 | TODO | — |
 | 3 | phase_04.md | P3 | TODO | — |
 
@@ -438,17 +440,17 @@ automatically satisfy dependent units.
 | `manager::tests::reload_syncs_file_forwarders` | 0.1 | G-U0.1 | pass | 0.1/1 |
 | e2e `reload_keeps_cli_forwarders_and_ignores_the_files_list` | 0.1 | G-U0.1 | pass | 0.1/1 |
 | e2e `reload_keeps_env_forwarders` | 0.1 | G-U0.1 | pass | 0.1/1 |
-| `config::tests::parse_forwarder_accepts_protocol_suffixes` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::parse_forwarder_rejects_unknown_or_empty_suffix` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::tcp_label_is_byte_identical_to_v1_0_6` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::udp_label_has_the_udp_suffix` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::yaml_protocol_defaults_aliases_and_rejects_unknown` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::duplicates_are_keyed_by_protocol_and_address` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::udp_settings_defaults_validate_and_clamp` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::cli_udp_flags_override_settings` | 1.1 | G-U1.1 | TODO | — |
-| `config::tests::udp_forwarders_are_rejected_until_the_engine_lands` | 1.1 (removed in 2.2) | G-U1.1 | TODO | — |
-| e2e `invalid_protocol_suffix_is_rejected` | 1.1 | G-U1.1 | TODO | — |
-| e2e `udp_forwarder_is_refused_until_supported` | 1.1 (removed in 2.2) | G-U1.1 | TODO | — |
+| `config::tests::parse_forwarder_accepts_protocol_suffixes` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::parse_forwarder_rejects_unknown_or_empty_suffix` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::tcp_label_is_byte_identical_to_v1_0_6` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::udp_label_has_the_udp_suffix` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::yaml_protocol_defaults_aliases_and_rejects_unknown` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::duplicates_are_keyed_by_protocol_and_address` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::udp_settings_defaults_validate_and_clamp` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::cli_udp_flags_override_settings` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| `config::tests::udp_forwarders_are_rejected_until_the_engine_lands` | 1.1 (removed in 2.2) | G-U1.1 | pass | 1.1/1 |
+| e2e `invalid_protocol_suffix_is_rejected` | 1.1 | G-U1.1 | pass | 1.1/1 |
+| e2e `udp_forwarder_is_refused_until_supported` | 1.1 (removed in 2.2) | G-U1.1 | pass | 1.1/1 |
 | `stats::tests::registry_records_the_protocol` | 1.2 | G-U1.2 | TODO | — |
 | `stats::tests::snapshot_carries_datagram_counters` | 1.2 | G-U1.2 | TODO | — |
 | `metrics::tests::tcp_only_exposition_has_no_datagram_families` | 1.2 | G-U1.2 | TODO | — |

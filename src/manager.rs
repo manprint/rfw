@@ -601,7 +601,7 @@ mod tests {
         assert!(watched_path_matches_event_path(&path, &path));
     }
 
-    use crate::config::Settings;
+    use crate::config::{Protocol, Settings};
     use tokio::net::TcpListener;
 
     fn cfg(local_port: u16, remote_port: u16) -> ForwarderConfig {
@@ -610,6 +610,7 @@ mod tests {
             local_port,
             remote_host: "127.0.0.1".into(),
             remote_port,
+            protocol: Protocol::Tcp,
         }
     }
 

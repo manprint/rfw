@@ -5,21 +5,48 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// Forwarder definition: local_host:local_port:remote_host:remote_port
+/// Transport of a forwarder. TCP is the default everywhere (CLI, env, YAML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    #[serde(alias = "TCP")]
+    Tcp,
+    #[serde(alias = "UDP")]
+    Udp,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
+/// Forwarder definition: local_host:local_port:remote_host:remote_port[/tcp|/udp]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwarderConfig {
     pub local_host: String,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
+    /// `tcp` (default) or `udp`
+    #[serde(default)]
+    pub protocol: Protocol,
 }
 
 impl ForwarderConfig {
     pub fn label(&self) -> String {
-        format!(
+        let base = format!(
             "{}:{}->{}:{}",
             self.local_host, self.local_port, self.remote_host, self.remote_port
-        )
+        );
+        match self.protocol {
+            Protocol::Tcp => base,
+            Protocol::Udp => format!("{base}/{}", self.protocol.as_str()),
+        }
     }
 
     pub fn local_addr(&self) -> String {
@@ -67,6 +94,12 @@ fn default_probe_interval() -> u64 {
 fn default_unreachable_after() -> u64 {
     300
 }
+fn default_udp_session_timeout() -> u64 {
+    60
+}
+fn default_udp_max_sessions() -> usize {
+    16384
+}
 
 /// Smallest accepted copy buffer. A zero-sized buffer makes
 /// `copy_bidirectional` spin at 100% CPU while moving no bytes, so it is
@@ -75,6 +108,9 @@ pub const MIN_BUFFER_BYTES: usize = 1024;
 /// Largest accepted copy buffer. Each connection allocates two of these on the
 /// portable path, so an unbounded value is an easy way to OOM the process.
 pub const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// Largest accepted `udp_max_sessions`. Each UDP session holds one socket (one
+/// file descriptor), so an unbounded value is an easy way to exhaust them.
+pub const MAX_UDP_SESSIONS: usize = 1_048_576;
 
 /// Process-global runtime settings (one HTTP endpoint, one sampler, one reporter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +181,14 @@ pub struct Settings {
     /// "unreachable" alert is raised (default 300 = 5 minutes).
     #[serde(default = "default_unreachable_after")]
     pub unreachable_after_secs: u64,
+    /// Seconds a UDP session (one client address) may stay idle, no datagram
+    /// in either direction, before its upstream socket is closed. Live on reload.
+    #[serde(default = "default_udp_session_timeout")]
+    pub udp_session_timeout_secs: u64,
+    /// Upper bound on concurrent UDP sessions across all UDP forwarders.
+    /// Each session holds one socket (one file descriptor). Startup-only.
+    #[serde(default = "default_udp_max_sessions")]
+    pub udp_max_sessions: usize,
 }
 
 impl Default for Settings {
@@ -166,6 +210,8 @@ impl Default for Settings {
             instance_name: None,
             probe_interval_secs: default_probe_interval(),
             unreachable_after_secs: default_unreachable_after(),
+            udp_session_timeout_secs: default_udp_session_timeout(),
+            udp_max_sessions: default_udp_max_sessions(),
         }
     }
 }
@@ -229,6 +275,15 @@ impl Settings {
         if self.unreachable_after_secs == 0 {
             anyhow::bail!("unreachable_after_secs must be >= 1");
         }
+        if self.udp_session_timeout_secs == 0 {
+            anyhow::bail!("udp_session_timeout_secs must be >= 1");
+        }
+        if !(1..=MAX_UDP_SESSIONS).contains(&self.udp_max_sessions) {
+            anyhow::bail!(
+                "udp_max_sessions must be between 1 and {MAX_UDP_SESSIONS} (got {})",
+                self.udp_max_sessions
+            );
+        }
         if let Some(url) = &self.webhook_url {
             if let Err(e) = crate::notify::validate_webhook_url(url) {
                 // Never echo the URL back: it carries the webhook credentials.
@@ -266,6 +321,11 @@ impl Settings {
             &mut self.unreachable_after_secs,
             1,
         );
+        floor_u64(
+            "udp_session_timeout_secs",
+            &mut self.udp_session_timeout_secs,
+            1,
+        );
 
         let clamped_buffer = self.buffer_bytes.clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES);
         if clamped_buffer != self.buffer_bytes {
@@ -276,6 +336,17 @@ impl Settings {
                 "Invalid setting clamped"
             );
             self.buffer_bytes = clamped_buffer;
+        }
+
+        let clamped_sessions = self.udp_max_sessions.clamp(1, MAX_UDP_SESSIONS);
+        if clamped_sessions != self.udp_max_sessions {
+            warn!(
+                field = "udp_max_sessions",
+                got = self.udp_max_sessions,
+                clamped_to = clamped_sessions,
+                "Invalid setting clamped"
+            );
+            self.udp_max_sessions = clamped_sessions;
         }
 
         if self.socket_buffer_bytes == Some(0) {
@@ -554,6 +625,14 @@ pub struct CliArgs {
     #[arg(long = "unreachable-after", value_name = "SECS")]
     pub unreachable_after_secs: Option<u64>,
 
+    /// Seconds a UDP session may stay idle before it is closed (default 60)
+    #[arg(long = "udp-session-timeout", value_name = "SECS")]
+    pub udp_session_timeout_secs: Option<u64>,
+
+    /// Max concurrent UDP sessions across all UDP forwarders (default 16384)
+    #[arg(long = "udp-max-sessions", value_name = "N")]
+    pub udp_max_sessions: Option<usize>,
+
     /// Directory for the rolling JSON log file. Use `--log-dir ""` to disable
     /// file logging entirely and log to the console only.
     #[arg(long = "log-dir", default_value = "logs")]
@@ -565,7 +644,7 @@ pub struct CliArgs {
     #[arg(long = "health-check", value_name = "HOST:PORT")]
     pub health_check: Option<String>,
 
-    /// Forwarders in format local_host:local_port:remote_host:remote_port
+    /// Forwarders in format local_host:local_port:remote_host:remote_port[/tcp|/udp]
     #[arg(trailing_var_arg = true)]
     pub forwarders: Vec<String>,
 }
@@ -590,6 +669,8 @@ impl Default for CliArgs {
             instance_name: None,
             probe_interval_secs: None,
             unreachable_after_secs: None,
+            udp_session_timeout_secs: None,
+            udp_max_sessions: None,
             log_dir: "logs".to_string(),
             health_check: None,
             forwarders: Vec::new(),
@@ -597,12 +678,27 @@ impl Default for CliArgs {
     }
 }
 
-/// Parse a forwarder string "host:port:remote_host:remote_port"
+/// Parse a forwarder string "host:port:remote_host:remote_port[/tcp|/udp]"
 pub fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
-    let parts: Vec<&str> = s.split(':').collect();
+    let (body, protocol) = match s.rsplit_once('/') {
+        None => (s, Protocol::Tcp),
+        Some((body, suffix)) => {
+            let protocol = if suffix.eq_ignore_ascii_case("tcp") {
+                Protocol::Tcp
+            } else if suffix.eq_ignore_ascii_case("udp") {
+                Protocol::Udp
+            } else {
+                return Err(format!(
+                    "Unknown protocol suffix '/{suffix}' in '{s}': expected /tcp or /udp"
+                ));
+            };
+            (body, protocol)
+        }
+    };
+    let parts: Vec<&str> = body.split(':').collect();
     if parts.len() != 4 {
         return Err(format!(
-            "Invalid forwarder format '{s}': expected local_host:local_port:remote_host:remote_port"
+            "Invalid forwarder format '{s}': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
         ));
     }
     let local_port: u16 = parts[1]
@@ -616,6 +712,7 @@ pub fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
         local_port,
         remote_host: parts[2].to_string(),
         remote_port,
+        protocol,
     })
 }
 
@@ -661,6 +758,7 @@ pub(crate) fn load_yaml_config(path: &std::path::Path) -> Result<LoadedConfig, a
     let content = std::fs::read_to_string(path)?;
     let cf: ConfigFile = serde_saphyr::from_str(&content)?;
     validate_no_duplicates(&cf.forwarders)?;
+    reject_unsupported_protocols(&cf.forwarders)?;
     Ok(LoadedConfig {
         forwarders: cf.forwarders,
         settings: cf.settings,
@@ -728,6 +826,7 @@ pub fn load_forwarders_with_source(
     };
 
     validate_no_duplicates(&forwarders)?;
+    reject_unsupported_protocols(&forwarders)?;
     Ok((forwarders, source))
 }
 
@@ -789,6 +888,12 @@ pub fn apply_cli_overrides(settings: &mut Settings, cli: &CliArgs) {
     if let Some(v) = cli.unreachable_after_secs {
         settings.unreachable_after_secs = v;
     }
+    if let Some(v) = cli.udp_session_timeout_secs {
+        settings.udp_session_timeout_secs = v;
+    }
+    if let Some(v) = cli.udp_max_sessions {
+        settings.udp_max_sessions = v;
+    }
 }
 
 /// Load runtime settings: YAML `settings:` block (if a config file is given),
@@ -809,17 +914,35 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     Ok(settings)
 }
 
-/// Check for duplicate local addresses among forwarders
+/// Check for duplicate local endpoints among forwarders. The key is the
+/// protocol plus the local address, so a TCP and a UDP forwarder may share a port.
 fn validate_no_duplicates(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> {
     let mut seen = std::collections::HashSet::new();
     for f in fwd {
         let addr = f.local_addr();
-        if !seen.insert(addr.clone()) {
+        if !seen.insert((f.protocol, addr.clone())) {
+            let shown = match f.protocol {
+                Protocol::Tcp => addr,
+                Protocol::Udp => format!("{addr}/udp"),
+            };
             anyhow::bail!(
                 "Duplicate local address '{}'. Each forwarder needs a unique local endpoint.",
-                addr
+                shown
             );
         }
+    }
+    Ok(())
+}
+
+/// Temporary until sub-phase 2.2: the UDP engine does not exist yet, so any UDP
+/// forwarder is refused at every entry point (env, CLI, file, reload) instead of
+/// being silently ignored.
+fn reject_unsupported_protocols(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> {
+    if let Some(f) = fwd.iter().find(|f| f.protocol == Protocol::Udp) {
+        anyhow::bail!(
+            "UDP forwarder '{}' is not supported by this build yet; refusing to start it",
+            f.label()
+        );
     }
     Ok(())
 }
@@ -980,12 +1103,14 @@ mod tests {
                 local_port: 8080,
                 remote_host: "a.com".into(),
                 remote_port: 80,
+                protocol: Protocol::Tcp,
             },
             ForwarderConfig {
                 local_host: "0.0.0.0".into(),
                 local_port: 8080,
                 remote_host: "b.com".into(),
                 remote_port: 80,
+                protocol: Protocol::Tcp,
             },
         ];
         assert!(validate_no_duplicates(&f).is_err());
@@ -998,6 +1123,7 @@ mod tests {
             local_port: 9090,
             remote_host: "example.com".into(),
             remote_port: 443,
+            protocol: Protocol::Tcp,
         };
         assert_eq!(f.label(), "127.0.0.1:9090->example.com:443");
     }
@@ -1540,5 +1666,219 @@ mod tests {
         assert_eq!(m.buffer_bytes, 2048);
         assert_eq!(m.probe_interval_secs, 30);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Protocol (UDP forwarding, sub-phase 1.1) ---------------------------
+
+    fn fwd(protocol: Protocol, port: u16) -> ForwarderConfig {
+        ForwarderConfig {
+            local_host: "0.0.0.0".into(),
+            local_port: port,
+            remote_host: "db.example.com".into(),
+            remote_port: port,
+            protocol,
+        }
+    }
+
+    #[test]
+    fn parse_forwarder_accepts_protocol_suffixes() {
+        assert_eq!(parse_forwarder("a:1:b:2").unwrap().protocol, Protocol::Tcp);
+        assert_eq!(
+            parse_forwarder("a:1:b:2/udp").unwrap().protocol,
+            Protocol::Udp
+        );
+        assert_eq!(
+            parse_forwarder("a:1:b:2/UDP").unwrap().protocol,
+            Protocol::Udp
+        );
+        assert_eq!(
+            parse_forwarder("a:1:b:2/Tcp").unwrap().protocol,
+            Protocol::Tcp
+        );
+        let f = parse_forwarder("a:1:b:2/udp").unwrap();
+        assert_eq!(f.local_host, "a");
+        assert_eq!(f.local_port, 1);
+        assert_eq!(f.remote_host, "b");
+        assert_eq!(f.remote_port, 2);
+    }
+
+    #[test]
+    fn parse_forwarder_rejects_unknown_or_empty_suffix() {
+        assert_eq!(
+            parse_forwarder("a:1:b:2/sctp").unwrap_err(),
+            "Unknown protocol suffix '/sctp' in 'a:1:b:2/sctp': expected /tcp or /udp"
+        );
+        assert_eq!(
+            parse_forwarder("a:1:b:53/").unwrap_err(),
+            "Unknown protocol suffix '/' in 'a:1:b:53/': expected /tcp or /udp"
+        );
+        assert_eq!(
+            parse_forwarder("/udp").unwrap_err(),
+            "Invalid forwarder format '/udp': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+        );
+        assert_eq!(
+            parse_forwarder("a:b:2/udp").unwrap_err(),
+            "Invalid forwarder format 'a:b:2/udp': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+        );
+    }
+
+    #[test]
+    fn tcp_label_is_byte_identical_to_v1_0_6() {
+        let f = ForwarderConfig {
+            local_host: "0.0.0.0".into(),
+            local_port: 5432,
+            remote_host: "db.example.com".into(),
+            remote_port: 5432,
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(f.label(), "0.0.0.0:5432->db.example.com:5432");
+    }
+
+    #[test]
+    fn udp_label_has_the_udp_suffix() {
+        let f = fwd(Protocol::Udp, 5432);
+        assert_eq!(f.label(), "0.0.0.0:5432->db.example.com:5432/udp");
+    }
+
+    #[test]
+    fn yaml_protocol_defaults_aliases_and_rejects_unknown() {
+        let entry = |extra: &str| {
+            format!(
+                "forwarders:\n  - {{local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2{extra}}}\n"
+            )
+        };
+        let proto = |extra: &str| {
+            serde_saphyr::from_str::<ConfigFile>(&entry(extra))
+                .expect("parse")
+                .forwarders[0]
+                .protocol
+        };
+        assert_eq!(proto(""), Protocol::Tcp);
+        assert_eq!(proto(", protocol: udp"), Protocol::Udp);
+        assert_eq!(proto(", protocol: UDP"), Protocol::Udp);
+
+        let path = write_temp("protocol-sctp", &entry(", protocol: sctp"));
+        let res = load_yaml_config(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_err(), "unknown protocol must be a parse error");
+    }
+
+    #[test]
+    fn duplicates_are_keyed_by_protocol_and_address() {
+        validate_no_duplicates(&[fwd(Protocol::Tcp, 53), fwd(Protocol::Udp, 53)])
+            .expect("tcp and udp may share a port");
+
+        let err = validate_no_duplicates(&[fwd(Protocol::Udp, 53), fwd(Protocol::Udp, 53)])
+            .expect_err("udp+udp must clash");
+        assert!(
+            err.to_string()
+                .contains("Duplicate local address '0.0.0.0:53/udp'"),
+            "{err}"
+        );
+
+        let err = validate_no_duplicates(&[fwd(Protocol::Tcp, 8080), fwd(Protocol::Tcp, 8080)])
+            .expect_err("tcp+tcp must clash");
+        assert!(
+            err.to_string()
+                .contains("Duplicate local address '0.0.0.0:8080'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn udp_settings_defaults_validate_and_clamp() {
+        let d = Settings::default();
+        assert_eq!(d.udp_session_timeout_secs, 60);
+        assert_eq!(d.udp_max_sessions, 16384);
+        d.validate().expect("defaults are valid");
+
+        let bad = |s: Settings| s.validate().is_err();
+        assert!(bad(Settings {
+            udp_session_timeout_secs: 0,
+            ..Settings::default()
+        }));
+        assert!(bad(Settings {
+            udp_max_sessions: 0,
+            ..Settings::default()
+        }));
+        assert!(bad(Settings {
+            udp_max_sessions: MAX_UDP_SESSIONS + 1,
+            ..Settings::default()
+        }));
+        Settings {
+            udp_max_sessions: MAX_UDP_SESSIONS,
+            ..Settings::default()
+        }
+        .validate()
+        .expect("MAX_UDP_SESSIONS is accepted");
+
+        let mut s = Settings {
+            udp_session_timeout_secs: 0,
+            udp_max_sessions: 0,
+            ..Settings::default()
+        };
+        s.clamp_in_place();
+        assert_eq!(s.udp_session_timeout_secs, 1);
+        assert_eq!(s.udp_max_sessions, 1);
+        let mut s = Settings {
+            udp_max_sessions: MAX_UDP_SESSIONS + 5,
+            ..Settings::default()
+        };
+        s.clamp_in_place();
+        assert_eq!(s.udp_max_sessions, MAX_UDP_SESSIONS);
+    }
+
+    #[test]
+    fn cli_udp_flags_override_settings() {
+        let cli = CliArgs::try_parse_from([
+            "rfw",
+            "--udp-session-timeout",
+            "5",
+            "--udp-max-sessions",
+            "10",
+            "127.0.0.1:1:127.0.0.1:2/udp",
+        ])
+        .expect("parse cli");
+        let mut s = Settings::default();
+        apply_cli_overrides(&mut s, &cli);
+        assert_eq!(s.udp_session_timeout_secs, 5);
+        assert_eq!(s.udp_max_sessions, 10);
+        assert_eq!(
+            cli.forwarders,
+            vec!["127.0.0.1:1:127.0.0.1:2/udp".to_string()]
+        );
+    }
+
+    #[test]
+    fn udp_forwarders_are_rejected_until_the_engine_lands() {
+        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
+        const MSG: &str = "is not supported by this build yet";
+
+        {
+            let _env = ForwarderEnvGuard::set(&[]);
+            let cli = CliArgs {
+                forwarders: vec!["127.0.0.1:1:127.0.0.1:2/udp".to_string()],
+                ..CliArgs::default()
+            };
+            let err = load_forwarders_with_source(&cli).expect_err("cli udp must be refused");
+            assert!(err.to_string().contains(MSG), "{err}");
+        }
+        {
+            let _env =
+                ForwarderEnvGuard::set(&[("RFW_FORWARDER_1", "127.0.0.1:1:127.0.0.1:2/udp")]);
+            let err = load_forwarders_with_source(&CliArgs::default())
+                .expect_err("env udp must be refused");
+            assert!(err.to_string().contains(MSG), "{err}");
+        }
+        let path = write_temp(
+            "udp-gate",
+            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2, protocol: udp}\n",
+        );
+        let res = load_yaml_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let Err(err) = res else {
+            panic!("file udp must be refused");
+        };
+        assert!(err.to_string().contains(MSG), "{err}");
     }
 }

@@ -797,7 +797,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::config::Settings;
+    use crate::config::{Protocol, Settings};
     use crate::testutil::{fake_dns_response, resolver_for, spawn_fake_dns};
 
     // ---- socket tuning ------------------------------------------------------
@@ -897,6 +897,7 @@ mod tests {
             local_port: port,
             remote_host: "127.0.0.1".into(),
             remote_port: 9,
+            protocol: Protocol::Tcp,
         };
         let stats = Arc::new(ForwarderStats::new(cfg.label()));
         assert!(!stats.snapshot().listening, "not bound yet");
@@ -937,6 +938,7 @@ mod tests {
             local_port: port,
             remote_host: "127.0.0.1".into(),
             remote_port: 9,
+            protocol: Protocol::Tcp,
         };
         let stats = Arc::new(ForwarderStats::new(cfg.label()));
         let (knobs, tracker, cancel) = forwarder_deps(&Settings::default());
@@ -1109,6 +1111,7 @@ mod tests {
             local_port,
             remote_host: "db.test".into(),
             remote_port: backend_port,
+            protocol: Protocol::Tcp,
         };
         let stats = Arc::new(ForwarderStats::new(cfg.label()));
         let (knobs, tracker, cancel) = forwarder_deps(&Settings {
@@ -1219,6 +1222,7 @@ mod tests {
             local_port,
             remote_host: "db.test".into(),
             remote_port: backend_port,
+            protocol: Protocol::Tcp,
         };
         let stats = Arc::new(ForwarderStats::new(cfg.label()));
         let (knobs, tracker, cancel) = forwarder_deps(&Settings {

@@ -310,7 +310,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
-    use crate::config::Settings;
+    use crate::config::{Protocol, Settings};
     use crate::testutil::{resolver_for, spawn_fake_dns};
 
     fn cfg(remote_host: &str, remote_port: u16) -> Arc<ForwarderConfig> {
@@ -319,6 +319,7 @@ mod tests {
             local_port: 1,
             remote_host: remote_host.into(),
             remote_port,
+            protocol: Protocol::Tcp,
         })
     }
 
@@ -443,12 +444,14 @@ mod tests {
                 local_port: 1,
                 remote_host: "127.0.0.1".into(),
                 remote_port: pd,
+                protocol: Protocol::Tcp,
             },
             ForwarderConfig {
                 local_host: "127.0.0.1".into(),
                 local_port: 2,
                 remote_host: "127.0.0.1".into(),
                 remote_port: pa,
+                protocol: Protocol::Tcp,
             },
         ];
         let reports = probe_all(&configs, system_resolver(), &knobs(30, 300)).await;

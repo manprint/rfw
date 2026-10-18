@@ -84,6 +84,65 @@ fn malformed_forwarder_argument_is_rejected() {
     assert!(err.contains("Invalid forwarder format"), "{err}");
 }
 
+#[test]
+fn invalid_protocol_suffix_is_rejected() {
+    let out = rfw_command(&["127.0.0.1:1:127.0.0.1:2/sctp"])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run rfw");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Unknown protocol suffix '/sctp'"), "{err}");
+}
+
+/// Run a command that must refuse to start: exit non zero within 10 s and report
+/// that UDP is not supported yet. Removed together with the gate in 2.2.
+fn assert_udp_refused(mut cmd: std::process::Command, what: &str) {
+    let mut child = cmd
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rfw");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}: rfw did not exit within 10 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!status.success(), "{what}: rfw must exit non zero");
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut err)
+        .expect("read stderr");
+    assert!(
+        err.contains("is not supported by this build yet"),
+        "{what}: {err}"
+    );
+}
+
+#[test]
+fn udp_forwarder_is_refused_until_supported() {
+    // (a) command-line argument
+    let p = free_port();
+    let arg = format!("127.0.0.1:{p}:127.0.0.1:9/udp");
+    assert_udp_refused(rfw_command(&[&arg]), "cli");
+
+    // (b) environment variable, with any inherited RFW_FORWARDER_* removed
+    let p = free_port();
+    let mut cmd = rfw_command(&[]);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("RFW_FORWARDER_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("RFW_FORWARDER_1", format!("127.0.0.1:{p}:127.0.0.1:9/udp"));
+    assert_udp_refused(cmd, "env");
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------------
