@@ -179,10 +179,12 @@ pub fn hold(a: &Args) {
     let ports: u16 = a.num("ports", 1);
     let conns: usize = a.num("conns", 1000);
     let hold_s: f64 = a.num("hold", 10.0);
-    let threads: usize = a.num("threads", 8).min(conns.max(1));
     // `--burst B`: echo B bytes through every connection (16 KiB chunks) before
     // holding, so the forwarder's per-connection copy buffers are really touched.
+    // The echo is ping-pong, so a slow-latency forwarder (Nagle + delayed ACK)
+    // needs many connections in flight to finish in reasonable time.
     let burst: usize = a.num("burst", 0);
+    let threads: usize = a.num("threads", if burst > 0 { 128 } else { 8 }).min(conns.max(1));
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads)
         .map(|t| {

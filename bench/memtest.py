@@ -139,7 +139,7 @@ def hold(ctx, v, kind, n, hold_s, burst=0):
     pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
     ready = None
     t0 = time.time()
-    while time.time() - t0 < 120:
+    while time.time() - t0 < 240:
         if not select.select([pr.stdout], [], [], 5)[0]:
             continue
         line = pr.stdout.readline()
@@ -163,7 +163,7 @@ def t_hold(ctx, vcls, kind, n, burst=0):
         pr, ready = hold(ctx, v, kind, n, 14, burst)
         if not ready:
             pr.kill()
-            raise RuntimeError(f"client never became ready within 120 s (forwarder stalled at N={n})")
+            raise RuntimeError(f"client never became ready within 240 s (forwarder stalled at N={n})")
         time.sleep(4)
         m1 = v.mem()
         info = proc_info(v)
