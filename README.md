@@ -88,7 +88,7 @@ A TCP and a UDP forwarder may share the same local port; two UDP (or two TCP) fo
 127.0.0.1:8080:192.168.1.100:80         → local web proxy
 0.0.0.0:3306:db-prod.example.com:3306   → database tunnel
 0.0.0.0:443:app.azure.com:443           → cloud service proxy
-0.0.0.0:5353:1.1.1.1:53/udp             → DNS over UDP
+0.0.0.0:1053:1.1.1.1:53/udp             → DNS over UDP
 ```
 
 ## Configuration
@@ -115,7 +115,7 @@ forwarders:
     remote_port: 3306
 
   - local_host: "0.0.0.0"
-    local_port: 5353
+    local_port: 1053
     remote_host: "1.1.1.1"
     remote_port: 53
     protocol: udp     # tcp (default) or udp
@@ -138,7 +138,7 @@ The YAML file is **watched for changes** — edit it and rfw picks up new forwar
 ```bash
 export RFW_FORWARDER_1=127.0.0.1:8080:172.16.0.5:80
 export RFW_FORWARDER_2=0.0.0.0:3306:db-prod.example.com:3306
-export RFW_FORWARDER_3=0.0.0.0:5353:1.1.1.1:53/udp
+export RFW_FORWARDER_3=0.0.0.0:1053:1.1.1.1:53/udp
 rfw
 ```
 
@@ -511,7 +511,7 @@ the current throughput rate:
 ```
 ─── Traffic Report ──────────────────────────────────
   127.0.0.1:8080->172.16.0.5:80      sent=  1.230 GB  recv=  4.560 GB  tx=12.300 MB/s  rx=45.600 MB/s  active=3
-  0.0.0.0:5353->1.1.1.1:53/udp       sent=  2.100 MB  recv=  3.400 MB  tx=  0.100 MB/s  rx=  0.200 MB/s  sessions=12  dgrams tx=8800 rx=8795 drop=5
+  0.0.0.0:1053->1.1.1.1:53/udp       sent=  2.100 MB  recv=  3.400 MB  tx=  0.100 MB/s  rx=  0.200 MB/s  sessions=12  dgrams tx=8800 rx=8795 drop=5
   TOTAL (all forwarders, lifetime)    sent=  1.230 GB  recv=  4.560 GB
 ──────────────────────────────────────────────────────
 ```
@@ -769,6 +769,11 @@ docker run --rm -p 8080:8080 -p 8081:8081 \
     -e RFW_FORWARDER_2=0.0.0.0:8081:api.example.com:443 \
   ghcr.io/manprint/rfw:latest
 
+# UDP: publish the port with the /udp suffix, or Docker forwards TCP only
+docker run --rm -p 1053:1053/udp \
+    -e RFW_FORWARDER_1=0.0.0.0:1053:1.1.1.1:53/udp \
+  ghcr.io/manprint/rfw:latest
+
 # Or with a config file mounted
 docker run --rm -p 8080:8080 \
     -v ./forwarders.yml:/etc/rfw/forwarders.yml:ro \
@@ -783,7 +788,9 @@ docker compose up -d
 
 In production pin a release tag (`ghcr.io/manprint/rfw:v1.1.0`) rather than
 `latest`, which moves on every release. Edit `docker-compose.yml` to configure
-your forwarders via env vars.
+your forwarders via env vars. For a UDP forwarder, publish its port with the
+`/udp` suffix (`"1053:1053/udp"`); a port served over both TCP and UDP needs
+both entries. With `network_mode: host` no publishing is needed.
 
 ### Production recipe: database behind a cloud DNS name (socat replacement)
 

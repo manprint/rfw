@@ -23,12 +23,42 @@ forwarders:
     remote_host: "app.azure.com"
     remote_port: 443
 
-  # Forward UDP port 5353 to a DNS resolver (one upstream socket per client)
+  # ── UDP ──
+  # Add `protocol: udp` (default: tcp). Each client address gets its own
+  # session (one upstream socket) until it stays idle for
+  # udp_session_timeout_secs; datagram boundaries are preserved.
+
+  # DNS over UDP: local port 1053 to a public resolver.
   - local_host: "0.0.0.0"
-    local_port: 5353
+    local_port: 1053
     remote_host: "1.1.1.1"
     remote_port: 53
     protocol: udp
+
+  # DNS over TCP on the same local port: a TCP and a UDP forwarder may share a
+  # port (two UDP or two TCP forwarders may not).
+  - local_host: "0.0.0.0"
+    local_port: 1053
+    remote_host: "1.1.1.1"
+    remote_port: 53
+    protocol: tcp
+
+  # Syslog to a collector by hostname. The name is re-resolved every second;
+  # when its addresses change, sessions to the old ones are closed and the
+  # next datagram opens a session to the new address.
+  - local_host: "0.0.0.0"
+    local_port: 5514
+    remote_host: "syslog.example.com"
+    remote_port: 514
+    protocol: udp
+
+  # WireGuard / QUIC-style bulk UDP: consider `udp_gro_gso: true` below
+  # (Linux only) and a larger socket_buffer_bytes.
+  # - local_host: "0.0.0.0"
+  #   local_port: 51820
+  #   remote_host: "vpn.example.com"
+  #   remote_port: 51820
+  #   protocol: udp
 
 # ------------------------------------------------------------
 # Optional runtime settings (all fields optional; defaults shown).

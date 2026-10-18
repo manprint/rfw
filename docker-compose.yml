@@ -23,17 +23,31 @@ services:
       - "8080:8080"
       - "8081:8081"
       - "8082:8082"
+      # UDP forwarders need the /udp suffix, or Docker publishes TCP only.
+      - "1053:1053/udp"
+      # A port served over both TCP and UDP needs both entries:
+      # - "1053:1053/tcp"
+      # - "5514:5514/udp"
+      # - "51820:51820/udp"
       # Add more ports as needed for your forwarders
       # Stats endpoint (/metrics, /stats). Keep it off public networks.
       # - "127.0.0.1:9090:9090"
 
     environment:
       # ── Forwarder configuration via env vars ──
-      # Format: local_host:local_port:remote_host:remote_port
-      # Env vars override CLI args and config file.
+      # Format: local_host:local_port:remote_host:remote_port[/tcp|/udp]
+      # (no suffix = tcp). Env vars override CLI args and config file.
       - RFW_FORWARDER_1=0.0.0.0:8080:example.com:80
       - RFW_FORWARDER_2=0.0.0.0:8081:api.example.com:443
-      # - RFW_FORWARDER_3=0.0.0.0:3306:prod-db.example.com:3306
+      # DNS over UDP to a public resolver (publish 1053/udp above)
+      - RFW_FORWARDER_3=0.0.0.0:1053:1.1.1.1:53/udp
+      # Same local port over TCP: a TCP and a UDP forwarder may share it
+      # - RFW_FORWARDER_4=0.0.0.0:1053:1.1.1.1:53/tcp
+      # Syslog to a collector by hostname (re-resolved every second)
+      # - RFW_FORWARDER_5=0.0.0.0:5514:syslog.example.com:514/udp
+      # WireGuard
+      # - RFW_FORWARDER_6=0.0.0.0:51820:vpn.example.com:51820/udp
+      # - RFW_FORWARDER_7=0.0.0.0:3306:prod-db.example.com:3306
 
       # ── Runtime settings ──
       # Both the console and file log sinks honour this.
@@ -57,6 +71,12 @@ services:
     #   unless published above; with network_mode: host bind 127.0.0.1 instead.
     # TCP keepalive is on by default (60s idle, 10s interval, 3 probes) so a
     #   peer that vanishes without closing is reaped in ~90s instead of never.
+    # UDP (optional flags, defaults shown):
+    #   --udp-session-timeout closes a client's session after this many idle
+    #     seconds (hot-reloadable from a YAML file);
+    #   --udp-max-sessions caps sessions across all UDP forwarders; datagrams
+    #     from new clients beyond it are dropped and counted;
+    #   --udp-gro-gso enables the Linux GRO/GSO fast path for bulk UDP.
     command:
       - --log-dir
       - ""
@@ -64,6 +84,11 @@ services:
       - "512"
       - --metrics-addr
       - 0.0.0.0:9090
+      # - --udp-session-timeout
+      # - "60"
+      # - --udp-max-sessions
+      # - "16384"
+      # - --udp-gro-gso
 
     # ── Optional: mount a YAML config file ──
     # Mount the *directory*, not the single file: editors save by replacing
@@ -76,6 +101,9 @@ services:
     # ── File descriptors ──
     # Each proxied connection holds two sockets. Docker's default soft limit is
     # often 1024, i.e. ~500 connections before accept() fails with EMFILE.
+    # Each UDP session holds one upstream socket: at startup rfw raises its soft
+    # limit to udp_max_sessions + 256 when the hard limit allows (65536 here
+    # covers the default 16384 sessions).
     ulimits:
       nofile:
         soft: 65536
@@ -93,6 +121,7 @@ services:
     # ── Graceful shutdown ──
     # rfw handles SIGTERM and drains in-flight connections for up to 10s.
     # A shorter grace period than that truncates transfers on every deploy.
+    # UDP sessions have nothing to drain and close at once.
     stop_grace_period: 15s
 
     # ── Health check ──
