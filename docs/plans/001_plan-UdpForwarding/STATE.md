@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 3.1 / 1) |
+| ID / attempt | — (last closed: 3.2 / 1) |
 | Status | none |
-| Intent | offload module (GRO/GSO), engine wiring, udp_gro_gso setting/CLI/knob |
+| Intent | GRO/GSO forwarder-level + e2e tests, udp_gso_bench, README/forwarders.yml |
 | Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
-| File / unit heading | 3.1 Modulo offload, wiring nel motore, setting/knob/CLI |
+| File / unit heading | 3.2 Test end-to-end GRO/GSO, benchmark, documentazione |
 | Current step | none |
-| Next eligible plan unit | 3.2 |
-| Unit base | 51e0bbb; branch: main; owned changes: src/udp.rs src/config.rs src/stats.rs src/main.rs |
-| Repo state | HEAD 51e0bbb |
+| Next eligible plan unit | P3 |
+| Unit base | c6c8589; branch: main; owned changes: src/udp.rs (tests only) tests/common/mod.rs tests/e2e_udp.rs README.md forwarders.yml |
+| Repo state | HEAD c6c8589 |
 
-Next action: dispatch 3.2 to agent-2:sonnet (e2e GRO/GSO, udp_gso_bench, README per D32a)
+Next action: P3: G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH, G-GSO-BENCH, G-FINAL, README accuracy, review
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 3.2 / 1 | 3 | agent-2:sonnet (impl), agent-1:opus (review) | udp.rs tests (4 forwarder-level GRO/GSO tests + helpers), tests/common (set_udp_gro, gso_send, gro_recv, spawn_udp_gso_echo), e2e_udp (reference_scenario(extra_args), 3 e2e + ignored udp_gso_bench), README (GRO/GSO subsection, CLI, YAML, hot-reload per D32a, Test), forwarders.yml | G-HYG pass; G-U3.2: udp::tests 29, e2e_udp 15 + 2 ignored; new tests ×4; e2e_udp 30/31 full runs green (1 flake in tcp_and_udp_share_a_port_independently, see §10); udp_gso_bench speedup 3.24 | unit:3.2:1 |
 | sub-phase | 3.1 / 1 | 3 | agent-2:sonnet (impl), agent-1:opus (review + D32a decision) | udp.rs (mod offload: set_gro/recv/send/send_chunks; ListenerOffload, apply_gro_knob, drain_listener_gro, on_client_buffer, forward_upstream_coalesced, drain_upstream_gro, reply_coalesced, Pending; 10 tests), config.rs (udp_gro_gso setting/CLI/knob + test), stats.rs (add_rejected), main.rs (non-Linux warn) | G-HYG pass; G-U3.1 73 passed incl. 10 new udp + config test; udp::tests 25 (15 pre-existing unchanged); new tests ×4; e2e_udp 12+1 ignored; red: gro_aware_receive_is_exact_after_gro_is_disabled failed on kernel 7.0 → rev 3 | unit:3.1:1 |
 | phase-close | P2 / 1 | 2 | agent-1:opus | STATE.md, tests/e2e_udp.rs (port race), README (Signals), Dockerfile (label) | G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH pass; review approve | unit:P2:1 |
 | sub-phase | 2.3 / 1 | 2 | agent-3:haiku (impl), agent-1:opus (review) | README (intro, features, syntax, YAML, env, CLI ref, hot-reload, How it works/UDP, UDP tuning, logging, traffic report, metrics, alerting, tests, structure), forwarders.yml (UDP entry + commented udp_* settings), config.rs (example test 4 forwarders, 1 UDP) | G-U2.3 1 passed; fmt + clippy exit 0 | unit:2.3:1 |
@@ -376,6 +377,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 3.2 post-diff | agent-1:opus | rev 3; working tree on c6c8589 | test oracles vs phase_04 3.2 tables; README log strings vs src (D32a disable text, fallback warns, unsupported warn, latch warn); no production change | approve |
 | 3.1 post-diff | agent-1:opus | rev 3; working tree on 51e0bbb | 9 unsafe blocks (cmsg CMSG_SPACE/CMSG_LEN(2) u16, int GRO read unaligned, aligned CmsgBuf, try_init storage, live local pointers); D32a: no production set_gro(false); D7a single-flag try_io; I-4 listener sync; default path dispatch on gro_aware/gro only | approve |
 | 3.1 pre-dispatch | agent-1:opus | rev 2; 51e0bbb | skeleton B vs HEAD udp.rs: REPLY_BUF, Gates, open_session, forward_upstream, drain_upstream, SessionDrain::Blocked(Vec<u8>), inc_rejected; D7a already in drain_upstream_gro; offload::recv(.., want_from) | approve dispatch |
 | 2.3 post-diff | agent-1:opus | rev 2; working tree on 165788d | README claims vs udp.rs constants (batch 64, sweep/DNS 1 s, grace 2 s, fd headroom 256, rmem_max warn), notify THROTTLE_LIMIT 5 min (correct vs D16 local 60 s spacing), ICMP quiet 3 s | approve |
@@ -413,6 +415,7 @@ none
 ## 10. Do-not-repeat
 - In UDP tests, never reserve a port with `free_udp_port()` and bind it yourself later: parallel tests' `127.0.0.1:0`
   client sockets can take it (AddrInUse, P2). Bind `:0` and read the port, or let rfw bind (it retries).
+- Observed flake (3.2): `e2e_udp::tcp_and_udp_share_a_port_independently` failed once at `tcp echo read` (1 in 31 full runs; 0/20 in a dedicated loop by agent-1:opus). Same TCP harness class as the lifecycle flake below; rerun once before treating as a regression.
 - Pre-existing flake (not plan-caused): `e2e_lifecycle::sigterm_drains_an_in_flight_transfer` can fail with ConnectionRefused after `wait_port` (1/7 runs at P0). Rerun once to confirm before treating as a regression; do not "fix" it inside an unrelated unit.
 - Local cross-compile for Windows GNU/Darwin without Docker fails (no mingw `x86_64-w64-mingw32-gcc` for ring, no
   macOS SDK). Use G-XPLAT in Docker. Do not install toolchains on the host.
@@ -433,7 +436,7 @@ none
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | G-U2.2 pass; review agent-1:opus |
 | 2.3 | phase_03.md | 2.2 | DONE | 1 | G-U2.3 pass; review agent-1:opus |
 | 3.1 | phase_04.md | P2 | DONE | 1 | G-U3.1 pass; review agent-1:opus |
-| 3.2 | phase_04.md | 3.1 | TODO | 1 | — |
+| 3.2 | phase_04.md | 3.1 | DONE | 1 | G-U3.2 pass; review agent-1:opus |
 
 README obligation per phase:
 
@@ -536,14 +539,14 @@ automatically satisfy dependent units.
 | `udp::tests::reply_coalesced_falls_back_once_and_delivers_everything` | 3.1 | G-U3.1 | pass | 3.1/1 |
 | `udp::tests::forward_upstream_coalesced_falls_back_and_counts` | 3.1 | G-U3.1 | pass | 3.1/1 |
 | `config::tests::udp_gro_gso_setting_cli_and_knob` | 3.1 | G-U3.1 | pass | 3.1/1 |
-| `udp::tests::gro_gso_path_preserves_datagram_boundaries` | 3.2 | G-U3.2 | TODO | — |
-| `udp::tests::gro_toggle_never_merges_datagrams` | 3.2 | G-U3.2 | TODO | — |
-| `udp::tests::coalesced_burst_from_a_refused_client_counts_every_datagram` | 3.2 | G-U3.2 | TODO | — |
-| `udp::tests::first_burst_of_a_new_session_is_never_dropped` | 3.2 | G-U3.2 | TODO | — |
-| e2e_udp `udp_gro_gso_flag_preserves_datagrams_byte_exact` | 3.2 | G-U3.2 | TODO | — |
-| e2e_udp `udp_gro_gso_flag_hot_reload_toggles` | 3.2 | G-U3.2 | TODO | — |
-| e2e_udp `reference_scenario_with_udp_gro_gso` | 3.2 | G-U3.2, G-FINAL | TODO | — |
-| e2e_udp `udp_gso_bench` (ignored) | 3.2 | G-GSO-BENCH | TODO | — |
+| `udp::tests::gro_gso_path_preserves_datagram_boundaries` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| `udp::tests::gro_toggle_never_merges_datagrams` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| `udp::tests::coalesced_burst_from_a_refused_client_counts_every_datagram` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| `udp::tests::first_burst_of_a_new_session_is_never_dropped` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| e2e_udp `udp_gro_gso_flag_preserves_datagrams_byte_exact` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| e2e_udp `udp_gro_gso_flag_hot_reload_toggles` | 3.2 | G-U3.2 | pass | 3.2/1 |
+| e2e_udp `reference_scenario_with_udp_gro_gso` | 3.2 | G-U3.2, G-FINAL | pass | 3.2/1 |
+| e2e_udp `udp_gso_bench` (ignored) | 3.2 | G-GSO-BENCH | pass | 3.2/1 |
 
 ### Documentation
 | Document/sections | Owning unit | Status | Evidence |

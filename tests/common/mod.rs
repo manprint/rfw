@@ -531,3 +531,178 @@ pub fn stat_of(body: &str, label: &str, field: &str) -> Option<u64> {
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
+
+// ---------------------------------------------------------------------------
+// UDP GRO/GSO helpers (Linux). The binary's `offload` module is not visible to
+// integration tests, so these are a deliberate small copy of its primitives.
+// ---------------------------------------------------------------------------
+
+/// Control-message buffer, aligned for `cmsghdr`.
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+struct CmsgBuf([u8; 64]);
+
+/// Enable UDP_GRO on a socket (tests only). Panics if the kernel lacks it.
+#[cfg(target_os = "linux")]
+pub fn set_udp_gro(sock: &impl std::os::fd::AsRawFd) {
+    let one: libc::c_int = 1;
+    // SAFETY: `one` outlives the call and the length matches its type.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "UDP_GRO: {}", std::io::Error::last_os_error());
+}
+
+/// One sendmsg with a UDP_SEGMENT cmsg: `payload` is cut every `segment` bytes by the kernel.
+#[cfg(target_os = "linux")]
+pub fn gso_send(
+    sock: &std::net::UdpSocket,
+    payload: &[u8],
+    segment: u16,
+    to: std::net::SocketAddr,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let addr = socket2::SockAddr::from(to);
+    let mut cmsg = CmsgBuf([0; 64]);
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    // SAFETY: `msghdr` is plain old data; all-zero is a valid empty header.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = addr.as_ptr() as *mut libc::c_void;
+    msg.msg_namelen = addr.len();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if segment > 0 {
+        // SAFETY: 64 aligned bytes hold CMSG_SPACE(2); the header pointer comes
+        // from CMSG_FIRSTHDR on that buffer.
+        unsafe {
+            msg.msg_control = cmsg.0.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as _;
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_UDP;
+            (*c).cmsg_type = libc::UDP_SEGMENT;
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<u16>(), segment);
+        }
+    }
+    // SAFETY: every pointer in `msg` refers to a live local buffer.
+    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, 0) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// GRO-aware recvmsg: (len, segment, from); segment 0 = single datagram.
+#[cfg(target_os = "linux")]
+pub fn gro_recv(
+    sock: &std::net::UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, usize, std::net::SocketAddr)> {
+    use std::os::fd::AsRawFd;
+    let mut cmsg = CmsgBuf([0; 64]);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: `msghdr` is plain old data; all-zero is a valid empty header.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.0.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.0.len() as _;
+    let fd = sock.as_raw_fd();
+    // SAFETY: `try_init` passes zeroed storage and its size; the kernel writes
+    // at most `msg_namelen` bytes there and reports the length.
+    let (n, addr) = unsafe {
+        socket2::SockAddr::try_init(|storage, len| {
+            msg.msg_name = storage.cast();
+            msg.msg_namelen = *len;
+            let n = libc::recvmsg(fd, &mut msg, 0);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            *len = msg.msg_namelen;
+            Ok(n as usize)
+        })
+    }?;
+    let from = addr
+        .as_socket()
+        .ok_or_else(|| std::io::Error::other("recvmsg: non-IP source address"))?;
+    let mut segment = 0;
+    // SAFETY: the CMSG_* walk stays within `msg_control`/`msg_controllen` as
+    // updated by the kernel; the payload is read unaligned.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_UDP && (*c).cmsg_type == libc::UDP_GRO {
+                let v = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>());
+                segment = usize::try_from(v).unwrap_or(0);
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    Ok((n, segment, from))
+}
+
+/// Echo server with UDP_GRO: echoes every receive with the same segmentation
+/// (GSO when coalesced). A std thread on a blocking socket with a 100 ms read
+/// timeout; it ends when the process exits. Binds an unclaimed ephemeral port.
+#[cfg(target_os = "linux")]
+pub fn spawn_udp_gso_echo() -> u16 {
+    let sock = 'bound: {
+        for _ in 0..1000 {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = s.local_addr().unwrap().port();
+            if claimed_ports().lock().unwrap().insert(port) {
+                break 'bound s;
+            }
+        }
+        panic!("could not bind an unclaimed UDP port");
+    };
+    set_udp_gro(&sock);
+    sock.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let port = sock.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = vec![0_u8; 128 * 1024];
+        loop {
+            let (n, segment, from) = match gro_recv(&sock, &mut buf) {
+                Ok(r) => r,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(_) => continue,
+            };
+            if segment > 0 && segment < n {
+                // GSO sends carry at most 64 whole segments and 65507 bytes.
+                let step = segment * (65_507 / segment).clamp(1, 64);
+                for chunk in buf[..n].chunks(step) {
+                    let seg = if chunk.len() > segment {
+                        segment as u16
+                    } else {
+                        0
+                    };
+                    let _ = gso_send(&sock, chunk, seg, from);
+                }
+            } else {
+                let _ = sock.send_to(&buf[..n], from);
+            }
+        }
+    });
+    port
+}

@@ -36,7 +36,7 @@ forwarders:
 # --buffer-bytes, --socket-buffer-bytes, --splice, --max-connections,
 # --connect-timeout, --dns-timeout, --keepalive-*, --webhook-url,
 # --instance-name, --probe-interval, --unreachable-after,
-# --udp-session-timeout, --udp-max-sessions) override these.
+# --udp-session-timeout, --udp-max-sessions, --udp-gro-gso) override these.
 # ------------------------------------------------------------
 settings:
   # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON,
@@ -88,6 +88,11 @@ settings:
   # change needs a restart). Datagrams from new clients beyond it are dropped
   # and counted in rfw_rejected_connections_total.
   # udp_max_sessions: 16384
+  # Linux only (ignored elsewhere), hot-reloadable. Receive coalesced UDP bursts
+  # (UDP_GRO) and forward them with segmented sends (UDP_SEGMENT); datagram
+  # boundaries and order are unchanged. Turning it off stops GRO on new sessions;
+  # a listener that already has UDP_GRO keeps it until restart.
+  # udp_gro_gso: false   # Linux only, hot-reloadable
 
   # ── Alerting to a Google Chat webhook (startup only — a change needs a restart) ──
   # Sends a message on: startup (with one reachability probe per target), a

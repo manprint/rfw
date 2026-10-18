@@ -2512,4 +2512,214 @@ mod tests {
             assert!(buf[..n].iter().all(|b| *b == i), "piece {i}");
         }
     }
+
+    // ---- Forwarder-level GRO/GSO tests (3.2) ---------------------------------
+
+    /// Backend with UDP_GRO that echoes every receive with the same segmentation
+    /// (GSO when coalesced). A std thread that lives until the process exits.
+    /// `None` on a kernel without UDP_GRO.
+    #[cfg(target_os = "linux")]
+    fn spawn_gso_echo_local() -> Option<u16> {
+        use std::os::fd::AsRawFd;
+        let sock = gro_socket()?;
+        sock.set_nonblocking(false).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = sock.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let fd = sock.as_raw_fd();
+            let mut buf = vec![0_u8; offload::GRO_BUF_BYTES];
+            loop {
+                let Ok(r) = offload::recv(fd, &mut buf, true) else {
+                    continue; // read timeout
+                };
+                let to = socket2::SockAddr::from(r.from.unwrap());
+                if offload::is_coalesced(r.len, r.segment) {
+                    let _ = offload::send_chunks(&buf[..r.len], r.segment, |c, seg| {
+                        offload::send(fd, c, seg, Some(&to))
+                    });
+                } else {
+                    let _ = offload::send(fd, &buf[..r.len], 0, Some(&to));
+                }
+            }
+        });
+        Some(port)
+    }
+
+    /// Plain echo backend (no GRO) recording every datagram it receives, in order.
+    #[cfg(target_os = "linux")]
+    fn spawn_recording_echo() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0_u8; 65536];
+            loop {
+                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
+                    log.lock().unwrap().push(buf[..n].to_vec());
+                    let _ = sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// `n` datagrams of `seg` bytes; datagram `i` of burst `b` is `[b, i]` repeated.
+    #[cfg(target_os = "linux")]
+    fn unit_burst(b: u8, n: usize, seg: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                (0..seg)
+                    .map(|k| if k % 2 == 0 { b } else { i as u8 })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Send `datagrams` in one sendmsg from a plain client socket; GSO with
+    /// segment = the first datagram's length (the last may be shorter), or a
+    /// plain send for a single datagram.
+    #[cfg(target_os = "linux")]
+    fn send_burst(c: &UdpSocket, port: u16, datagrams: &[Vec<u8>]) {
+        use std::os::fd::AsRawFd;
+        let seg = if datagrams.len() > 1 {
+            datagrams[0].len() as u16
+        } else {
+            0
+        };
+        let to = socket2::SockAddr::from(SocketAddr::from(([127, 0, 0, 1], port)));
+        offload::send(c.as_raw_fd(), &datagrams.concat(), seg, Some(&to)).unwrap();
+    }
+
+    /// Expect every datagram back, identical and in order, within `within` in total.
+    #[cfg(target_os = "linux")]
+    async fn expect_echoes(c: &UdpSocket, datagrams: &[Vec<u8>], within: Duration, what: &str) {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut buf = vec![0_u8; 65536];
+        for (i, want) in datagrams.iter().enumerate() {
+            let got = tokio::time::timeout_at(deadline, c.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: echo {i}/{} missing", datagrams.len()))
+                .unwrap();
+            assert_eq!(&buf[..got.0], want.as_slice(), "{what}: echo {i} differs");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gro_settings() -> Settings {
+        Settings {
+            udp_gro_gso: true,
+            ..Settings::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gro_gso_path_preserves_datagram_boundaries() {
+        let Some(echo) = spawn_gso_echo_local() else {
+            return;
+        };
+        let f = start_fwd("127.0.0.1", echo, gro_settings()).await;
+        let c = client().await;
+        let mut tail = unit_burst(2, 11, 1000);
+        tail[10].truncate(300);
+        let bursts = [
+            ("64 x 1000", unit_burst(0, 64, 1000)),
+            ("10 x 1000 + 300", tail),
+            ("single 1000", unit_burst(3, 1, 1000)),
+        ];
+        for (what, burst) in &bursts {
+            send_burst(&c, f.port, burst);
+            expect_echoes(&c, burst, Duration::from_secs(3), what).await;
+        }
+        wait_until(
+            || load(&f.stats.datagrams_received) == 76,
+            Duration::from_secs(3),
+            "received counter",
+        )
+        .await;
+        assert_eq!(load(&f.stats.datagrams_sent), 76);
+        assert_eq!(load(&f.stats.datagrams_received), 76);
+        assert_eq!(load(&f.stats.datagrams_dropped), 0);
+        assert_eq!(load(&f.stats.bytes_sent), 75_300);
+        assert_eq!(load(&f.stats.bytes_received), 75_300);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gro_toggle_never_merges_datagrams() {
+        let (backend, seen) = spawn_recording_echo();
+        let f = start_fwd("127.0.0.1", backend, Settings::default()).await;
+        for round in 0..6_u8 {
+            f.knobs.update(&Settings {
+                udp_gro_gso: round % 2 == 0,
+                ..Settings::default()
+            });
+            tokio::time::sleep(Duration::from_millis(1300)).await; // one sweep tick applies it
+            seen.lock().unwrap().clear();
+            let burst = unit_burst(round, 32, 500);
+            let c = client().await; // a new session under the current knob state
+            send_burst(&c, f.port, &burst);
+            expect_echoes(
+                &c,
+                &burst,
+                Duration::from_secs(3),
+                &format!("round {round}"),
+            )
+            .await;
+            let recorded = seen.lock().unwrap().clone();
+            assert_eq!(recorded, burst, "backend datagrams in round {round}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_burst_from_a_refused_client_counts_every_datagram() {
+        let (echo, _) = spawn_udp_echo("127.0.0.1:0").await;
+        let settings = Settings {
+            udp_gro_gso: true,
+            udp_max_sessions: 1,
+            ..Settings::default()
+        };
+        let f = start_fwd("127.0.0.1", echo, settings).await;
+        let a = client().await;
+        assert!(roundtrip(&a, f.port, b"a", Duration::from_secs(2))
+            .await
+            .is_some());
+        let b = client().await;
+        send_burst(&b, f.port, &unit_burst(0, 10, 100));
+        wait_until(
+            || load(&f.stats.rejected_connections) == 10,
+            Duration::from_secs(2),
+            "rejected_connections == 10",
+        )
+        .await;
+        assert!(load(&f.stats.datagrams_dropped) >= 10);
+        let mut buf = vec![0_u8; 65536];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a refused client must receive nothing"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_burst_of_a_new_session_is_never_dropped() {
+        let Some(echo) = spawn_gso_echo_local() else {
+            return;
+        };
+        let f = start_fwd("127.0.0.1", echo, gro_settings()).await;
+        for i in 0..20_u8 {
+            let c = client().await;
+            let burst = unit_burst(i, 16, 200);
+            send_burst(&c, f.port, &burst);
+            expect_echoes(&c, &burst, Duration::from_secs(2), &format!("client {i}")).await;
+        }
+        assert_eq!(load(&f.stats.datagrams_dropped), 0);
+    }
 }

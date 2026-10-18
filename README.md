@@ -6,6 +6,7 @@
 
 - **TCP and UDP forwarding** — Bidirectional proxy between local and remote hosts; UDP keeps one upstream socket per client address (session), preserving datagram boundaries
 - **UDP sessions** — Idle timeout (`udp_session_timeout_secs`, default 60s, hot-reloadable), global cap `udp_max_sessions` (default 16384), drops counted, never blocking other clients
+- **UDP GRO/GSO (Linux, opt-in)** — `udp_gro_gso` / `--udp-gro-gso` receives coalesced UDP bursts and forwards them with segmented sends, cutting syscalls on high-packet-rate flows; datagram boundaries and order are unchanged (see [UDP GRO/GSO](#udp-grogso-linux-opt-in))
 - **Multiple forwarders** — Run many forwarders in a single process
 - **Configuration sources** — CLI args, YAML file, or environment variables
 - **Hot-reload** — Watch YAML config file for changes, apply without restart
@@ -128,7 +129,9 @@ rfw -f forwarders.yml
 
 The `protocol` key accepts `tcp` or `udp` (case-insensitive); any other value is a parse error. A misspelled key name is ignored, and the forwarder then stays TCP.
 
-The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold, `udp_session_timeout_secs`) are hot-reloaded; interval, `max_connections`, `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
+The `settings:` block also accepts `udp_gro_gso: true` (Linux only, default `false`, hot-reloadable) to enable the UDP GRO/GSO fast path; see [UDP GRO/GSO](#udp-grogso-linux-opt-in).
+
+The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold, `udp_session_timeout_secs`, `udp_gro_gso`) are hot-reloaded; interval, `max_connections`, `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
 
 ### 3. Environment variables
 
@@ -178,6 +181,8 @@ Options:
                                   it is closed (default 60; hot-reloadable)
       --udp-max-sessions <N>      Max concurrent UDP sessions across all UDP
                                   forwarders (default 16384; startup only)
+      --udp-gro-gso               Linux only: use UDP GRO/GSO for UDP
+                                  forwarders (default off; hot-reloadable)
       --log-dir <DIR>             Rolling JSON log directory; "" disables file
                                   logging (default "logs")
       --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
@@ -228,8 +233,13 @@ Changes are debounced (1s window) to avoid reload storms.
 > (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, `connect_timeout_secs`,
 > `dns_timeout_secs`, `keepalive_idle_secs`, `keepalive_interval_secs`,
 > `keepalive_retries`, `probe_interval_secs`, `unreachable_after_secs`,
-> `udp_session_timeout_secs`) live —
+> `udp_session_timeout_secs`, `udp_gro_gso`) live —
 > new connections pick up the new values; in-flight connections keep theirs.
+> For `udp_gro_gso` the listener follows within one second (the next sweep
+> tick), while a UDP session keeps the mode it was opened with until it closes.
+> Turning it off stops GRO on new sessions; a listener that already has
+> `UDP_GRO` keeps it until restart (its receives stay GRO-aware, and
+> datagram boundaries are still preserved).
 > CLI flags still win over the reloaded `settings:` block.
 > Changes to `report_interval_secs`, `sample_interval_secs`, `max_connections`,
 > `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` still require a restart.
@@ -400,6 +410,48 @@ new values without a restart. `max_connections` is fixed at startup.
   `rfw_rejected_connections_total`; the other sessions keep working.
 - `--udp-session-timeout <SECS>` (default 60) sets how long an idle session
   lives, and it is hot-reloadable.
+
+### UDP GRO/GSO (Linux, opt-in)
+
+With `udp_gro_gso: true` (YAML) or `--udp-gro-gso` (CLI), rfw asks the kernel
+to coalesce bursts of equal-sized UDP datagrams on receive (`UDP_GRO`) and
+sends such a burst on with a single segmented `sendmsg` (`UDP_SEGMENT`), in both
+directions. rfw never merges datagrams itself: only a buffer the kernel already
+delivered coalesced is sent segmented, with the same segment size, so the
+datagrams leave exactly as they arrived (same boundaries, same order). A
+datagram that arrives alone is forwarded alone. Counters stay per datagram:
+`datagrams_*` count segments and `bytes_*` count payload bytes. A single send
+carries at most 64 segments and 65 507 bytes; longer bursts are split.
+
+When it helps: high-packet-rate flows where the peer or the NIC already uses
+GSO/GRO, typically bulk QUIC-like transfers. For sparse, single-datagram
+traffic it brings no benefit, which is why it is off by default.
+
+- **Requirements:** Linux with kernel 5.0+ (`UDP_GRO`). On an older kernel rfw
+  logs `UDP GRO is not supported by this kernel (Linux 5.0+ required); udp_gro_gso has no effect`
+  once per forwarder and carries on without it. If setting `UDP_GRO` on the
+  listener fails for another reason, rfw logs
+  `Setting UDP_GRO on the listener failed; udp_gro_gso has no effect on this forwarder until restart`
+  once.
+- **Hot reload:** the listener follows the setting at the next sweep tick (at
+  most one second) and logs `UDP GRO/GSO enabled on the listener`. A UDP session
+  fixes its mode when it opens and keeps it until it closes. Turning the setting
+  off stops GRO on **new** sessions and logs
+  `UDP GRO/GSO disabled on the listener for new sessions (UDP_GRO stays set on the listener socket until restart)`:
+  a listener that already has `UDP_GRO` keeps it until restart, and its receives
+  stay GRO-aware, so bursts already queued are still forwarded as separate
+  datagrams.
+- **Automatic fallback:** if the kernel rejects a segmented send, rfw splits the
+  buffer in userspace, delivers every datagram, and sends one datagram at a time
+  from then on for that session (client to target) or for the listener (replies). It logs one of
+  `UDP GSO rejected by the kernel for a session; it now sends one datagram at a time` (client to target) or
+  `UDP GSO rejected by the kernel on the listener; replies now go one datagram at a time` (target to client).
+- **Other platforms:** ignored. rfw logs
+  `udp_gro_gso is only supported on Linux; ignored` at startup when it is set.
+- **Benchmark:** `cargo test --release --test e2e_udp udp_gso_bench -- --ignored --exact --nocapture`
+  runs two rfw instances (plain and `--udp-gro-gso`) against a GRO/GSO echo
+  backend and prints a `UDP_GSO_BENCH` line with the throughput of each, the
+  speedup and the loss.
 
 ## Logging
 
@@ -964,7 +1016,7 @@ The suite has six parts:
 | `tests/e2e_forward.rs` | byte-exact forwarding and live cumulative metrics, on both the portable and `splice` paths |
 | `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe including `503` while a port cannot be bound and recovery once it frees |
 | `tests/e2e_hot_reload.rs` | re-targeting a port without an outage, add/remove, malformed and duplicate configs, live knob reloads, counter continuity |
-| `tests/e2e_udp.rs` | UDP round trips and metrics, env and YAML `protocol: udp` with hot-reload re-target, TCP and UDP sharing a port, duplicate UDP rejected, idle-session expiry, `udp_max_sessions` cap and counting, `/` returning `503` while a UDP port is taken, `SIGTERM` with idle sessions, rate-limited drop logs, closed UDP target reported unreachable, a TCP and UDP reference scenario; `udp_bench` is ignored by default (run it with `cargo test --release --test e2e_udp udp_bench -- --ignored --nocapture`) |
+| `tests/e2e_udp.rs` | UDP round trips and metrics, env and YAML `protocol: udp` with hot-reload re-target, TCP and UDP sharing a port, duplicate UDP rejected, idle-session expiry, `udp_max_sessions` cap and counting, `/` returning `503` while a UDP port is taken, `SIGTERM` with idle sessions, rate-limited drop logs, closed UDP target reported unreachable, a TCP and UDP reference scenario (also with `--udp-gro-gso`), the GRO/GSO flag preserving datagrams byte-exact, and the GRO/GSO hot-reload toggle; `udp_bench` and `udp_gso_bench` are ignored by default (run them with `cargo test --release --test e2e_udp udp_bench -- --ignored --nocapture` and `cargo test --release --test e2e_udp udp_gso_bench -- --ignored --exact --nocapture`) |
 | `tests/e2e_webhook.rs` | the real binary against an in-process webhook sink: startup report with a reachable and an unreachable target, target outage → single alert → recovery, taken port → alert → recovery, reload success and failure, `SIGTERM` "stopping" message, invalid URL rejected without echoing it, `--help`, `rfw_target_reachable` and `rfw_webhook_*` on `/metrics` |
 
 The e2e suites spawn the real binary and drive it over real sockets, so they

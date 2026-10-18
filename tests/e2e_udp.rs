@@ -14,6 +14,8 @@ use common::{
     spawn_rfw_logged, spawn_udp_echo, spawn_udp_echo_on, spawn_udp_tagged, stat_of, udp_client,
     udp_roundtrip, wait_for_stats, wait_port, wait_udp_forwarding, wait_udp_port_free, TempConfig,
 };
+#[cfg(target_os = "linux")]
+use common::{gso_send, spawn_udp_gso_echo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -504,6 +506,17 @@ fn reference_yaml(p: u16, e_tcp: u16, e_udp: u16, timeout: u64) -> String {
 /// The reference scenario of the plan: a TCP and a UDP forwarder on one port.
 #[tokio::test]
 async fn reference_scenario_tcp_and_udp_side_by_side() {
+    reference_scenario(&[]).await;
+}
+
+/// Same scenario with the Linux GRO/GSO fast path switched on from the CLI.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reference_scenario_with_udp_gro_gso() {
+    reference_scenario(&["--udp-gro-gso"]).await;
+}
+
+async fn reference_scenario(extra_args: &[&str]) {
     let p = free_dual_port();
     let m = free_port();
     let e_tcp = spawn_echo().await;
@@ -514,7 +527,15 @@ async fn reference_scenario_tcp_and_udp_side_by_side() {
     // 1. start
     let cfg = TempConfig::new("reference", &reference_yaml(p, e_tcp, e_udp, 30));
     let metrics_addr = format!("127.0.0.1:{m}");
-    let mut rfw = spawn_rfw(&["-f", &cfg.path_str(), "--metrics-addr", &metrics_addr]);
+    let cfg_path = cfg.path_str();
+    let mut args = vec![
+        "-f",
+        cfg_path.as_str(),
+        "--metrics-addr",
+        metrics_addr.as_str(),
+    ];
+    args.extend_from_slice(extra_args);
+    let mut rfw = spawn_rfw(&args);
     wait_port(p).await;
     wait_port(m).await;
     wait_metrics_contains(
@@ -750,4 +771,226 @@ async fn udp_bench() {
 
     assert_eq!(loss, 0, "windowed_loss must be 0");
     assert!(overhead <= 200, "p50_overhead_us {overhead} > 200");
+}
+
+// ---------------------------------------------------------------------------
+// Linux UDP GRO/GSO fast path
+// ---------------------------------------------------------------------------
+
+/// A blocking std client on an unclaimed port with a 3 s read timeout.
+#[cfg(target_os = "linux")]
+async fn gso_client() -> std::net::UdpSocket {
+    let s = udp_client().await.into_std().unwrap();
+    s.set_nonblocking(false).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s
+}
+
+/// `n` datagrams of `seg` bytes; datagram `i` of burst `b` is `[b, i]` repeated.
+#[cfg(target_os = "linux")]
+fn burst_datagrams(b: u8, n: usize, seg: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            (0..seg)
+                .map(|k| if k % 2 == 0 { b } else { i as u8 })
+                .collect()
+        })
+        .collect()
+}
+
+/// Send `datagrams` in one GSO sendmsg to `127.0.0.1:port` and expect every one
+/// of them back, identical and in order.
+#[cfg(target_os = "linux")]
+fn gso_roundtrip_exact(c: &std::net::UdpSocket, port: u16, datagrams: &[Vec<u8>], what: &str) {
+    let seg = datagrams[0].len();
+    let payload: Vec<u8> = datagrams.concat();
+    let to = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    gso_send(c, &payload, seg as u16, to).expect("gso send");
+    let mut buf = vec![0_u8; 65536];
+    for (i, want) in datagrams.iter().enumerate() {
+        let (n, _) = c
+            .recv_from(&mut buf)
+            .unwrap_or_else(|e| panic!("{what}: echo {i}/{} missing: {e}", datagrams.len()));
+        assert_eq!(&buf[..n], want.as_slice(), "{what}: echo {i} differs");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_gro_gso_flag_preserves_datagrams_byte_exact() {
+    let echo = spawn_udp_gso_echo();
+    let (p, m) = (free_udp_port(), free_port());
+    let label = udp_label(p, echo);
+    let fwd = format!("127.0.0.1:{p}:127.0.0.1:{echo}/udp");
+    let metrics_addr = format!("127.0.0.1:{m}");
+    let (_rfw, log) = spawn_rfw_logged(
+        &["--udp-gro-gso", "--metrics-addr", &metrics_addr, &fwd],
+        &[],
+    );
+    wait_port(m).await;
+    assert!(
+        log.wait_for(
+            "UDP GRO/GSO enabled on the listener",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    let probe = udp_client().await;
+    wait_udp_forwarding(&probe, p).await;
+
+    let stats = http_get(m, "/stats").await;
+    let field = |name: &str| stat_of(&stats, &label, name).expect("stat");
+    let (s0, r0, d0) = (
+        field("datagrams_sent"),
+        field("datagrams_received"),
+        field("datagrams_dropped"),
+    );
+
+    let c = gso_client().await;
+    for b in 0..5_u8 {
+        gso_roundtrip_exact(&c, p, &burst_datagrams(b, 64, 1000), &format!("burst {b}"));
+    }
+
+    wait_stat(m, &label, "datagrams_sent", Duration::from_secs(3), |v| {
+        v == s0 + 320
+    })
+    .await;
+    wait_stat(
+        m,
+        &label,
+        "datagrams_received",
+        Duration::from_secs(3),
+        |v| v == r0 + 320,
+    )
+    .await;
+    wait_stat(
+        m,
+        &label,
+        "datagrams_dropped",
+        Duration::from_secs(3),
+        |v| v == d0,
+    )
+    .await;
+}
+
+fn gro_yaml(local: u16, remote: u16, gro: bool) -> String {
+    format!(
+        "forwarders:\n  - {{local_host: \"127.0.0.1\", local_port: {local}, remote_host: \"127.0.0.1\", remote_port: {remote}, protocol: udp}}\nsettings:\n  udp_gro_gso: {gro}\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_gro_gso_flag_hot_reload_toggles() {
+    let echo = spawn_udp_gso_echo();
+    let p = free_udp_port();
+    let cfg = TempConfig::new("udp-gro-toggle", &gro_yaml(p, echo, false));
+    let (_rfw, log) = spawn_rfw_logged(&["-f", &cfg.path_str()], &[]);
+    let probe = udp_client().await;
+    wait_udp_forwarding(&probe, p).await;
+
+    let c = gso_client().await;
+    gso_roundtrip_exact(&c, p, &burst_datagrams(0, 16, 500), "gro off");
+
+    cfg.rewrite(&gro_yaml(p, echo, true));
+    assert!(
+        log.wait_for(
+            "UDP GRO/GSO enabled on the listener",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    gso_roundtrip_exact(&c, p, &burst_datagrams(1, 16, 500), "gro on");
+
+    cfg.rewrite(&gro_yaml(p, echo, false));
+    assert!(
+        log.wait_for(
+            "UDP GRO/GSO disabled on the listener",
+            Duration::from_secs(5)
+        )
+        .await,
+        "{:?}",
+        log.lines()
+    );
+    gso_roundtrip_exact(&c, p, &burst_datagrams(2, 16, 500), "gro off again");
+}
+
+/// One rfw run of the GSO benchmark: 4 clients, one 16 x 1200 B GSO burst in
+/// flight each for 5 s, then 1 s of drain. Returns (Mbit/s of echoes, sent, received).
+#[cfg(target_os = "linux")]
+async fn gso_bench_run(echo: u16, extra: &[&str]) -> (f64, u64, u64) {
+    let p = free_udp_port();
+    let fwd = format!("127.0.0.1:{p}:127.0.0.1:{echo}/udp");
+    let mut args = extra.to_vec();
+    args.push(fwd.as_str());
+    let _rfw = spawn_rfw(&args);
+    let probe = udp_client().await;
+    wait_udp_forwarding(&probe, p).await;
+
+    let sent = Arc::new(AtomicU64::new(0));
+    let received = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let c = gso_client().await;
+        c.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let (sent, received) = (sent.clone(), received.clone());
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let to = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+            let payload = vec![0xa5_u8; 16 * 1200];
+            let mut buf = vec![0_u8; 65536];
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                gso_send(&c, &payload, 1200, to).expect("gso send");
+                sent.fetch_add(16, Ordering::Relaxed);
+                let mut got = 0;
+                while got < 16 {
+                    if c.recv_from(&mut buf).is_err() {
+                        break;
+                    }
+                    got += 1;
+                    received.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let drain_end = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < drain_end {
+                if c.recv_from(&mut buf).is_ok() {
+                    received.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let secs = 5.0_f64.max(started.elapsed().as_secs_f64() - 1.0);
+    let (s, r) = (
+        sent.load(Ordering::Relaxed),
+        received.load(Ordering::Relaxed),
+    );
+    (r as f64 * 1200.0 * 8.0 / secs / 1e6, s, r)
+}
+
+/// Release-mode benchmark of the GRO/GSO fast path, run by G-GSO-BENCH only.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn udp_gso_bench() {
+    let echo = spawn_udp_gso_echo();
+    let (plain, sent_p, recv_p) = gso_bench_run(echo, &[]).await;
+    let (gso, sent_g, recv_g) = gso_bench_run(echo, &["--udp-gro-gso"]).await;
+    let loss_plain = sent_p.saturating_sub(recv_p);
+    let loss_gso = sent_g.saturating_sub(recv_g);
+    let speedup = gso / plain;
+    println!(
+        "UDP_GSO_BENCH plain_mbit_s={plain:.1} gso_mbit_s={gso:.1} speedup={speedup:.2} loss_plain={loss_plain} loss_gso={loss_gso}"
+    );
+    assert_eq!(loss_plain, 0, "loss_plain must be 0");
+    assert_eq!(loss_gso, 0, "loss_gso must be 0");
+    assert!(speedup >= 1.0, "speedup {speedup:.2} < 1.0");
 }
