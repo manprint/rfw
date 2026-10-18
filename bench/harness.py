@@ -639,6 +639,19 @@ class RfwGro(RfwNative):
     extra = ["--udp-gro-gso"]
 
 
+def _tuned(vname, text, args, base=RfwNative):
+    return type(vname.replace("-", "_"), (base,), {"name": vname, "desc": text, "extra": args})
+
+
+RfwBuf16k = _tuned("rfw-buf16k", "rfw --buffer-bytes 16384 (tuning)", ["--buffer-bytes", "16384"])
+RfwBuf256k = _tuned("rfw-buf256k", "rfw --buffer-bytes 262144 (tuning)", ["--buffer-bytes", "262144"])
+RfwSock4m = _tuned("rfw-sock4m", "rfw --socket-buffer-bytes 4 MiB (tuning)", ["--socket-buffer-bytes", "4194304"])
+RfwSpliceBuf256k = _tuned("rfw-splice-buf256k", "rfw --splice --buffer-bytes 262144 (256 KiB pipes, tuning)",
+                          ["--splice", "--buffer-bytes", "262144"])
+RfwGroSock4m = _tuned("rfw-gro-sock4m", "rfw --udp-gro-gso --socket-buffer-bytes 4 MiB (tuning)",
+                      ["--udp-gro-gso", "--socket-buffer-bytes", "4194304"])
+
+
 class RfwDocker(Variant):
     name = "rfw-d-host"
     desc = "rfw image, docker run --network host (production recipe)"
@@ -742,7 +755,8 @@ class RfwDockerReleasedSplice(RfwDockerReleased):
 
 ALL_VARIANTS = [Direct, DockerNat, DockerProxy, Socat, SocatTuned, RfwNative, RfwSplice, RfwWorkers1, RfwWorkers4, RfwGro, RfwDocker,
                 RfwDockerSplice, RfwDockerUnconfined, RfwDockerPrivileged, RfwDockerSysRes, RfwDockerBridge,
-                RfwDockerDefaultUlimit, RfwDockerCompose, RfwDockerReleased, RfwDockerReleasedSplice]
+                RfwDockerDefaultUlimit, RfwDockerCompose, RfwDockerReleased, RfwDockerReleasedSplice,
+                RfwBuf16k, RfwBuf256k, RfwSock4m, RfwSpliceBuf256k, RfwGroSock4m]
 VARIANTS = {v.name: v for v in ALL_VARIANTS}
 
 

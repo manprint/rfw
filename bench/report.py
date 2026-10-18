@@ -17,7 +17,8 @@ import statistics
 import sys
 
 ORDER = ["direct", "docker-nat", "docker-proxy", "socat", "socat-nodelay", "rfw", "rfw-w1", "rfw-w4", "rfw-splice", "rfw-gro", "rfw-d-host",
-         "rfw-d-host-splice", "rfw-d-unconfined", "rfw-d-privileged", "rfw-d-splice-sysres", "rfw-d-bridge", "rfw-d-default-ulimit", "rfw-d-v1.1.0", "rfw-d-v1.1.0-splice"]
+         "rfw-d-host-splice", "rfw-d-unconfined", "rfw-d-privileged", "rfw-d-splice-sysres", "rfw-d-bridge", "rfw-d-default-ulimit", "rfw-d-compose", "rfw-d-v1.1.0", "rfw-d-v1.1.0-splice",
+         "rfw-buf16k", "rfw-buf256k", "rfw-sock4m", "rfw-splice-buf256k", "rfw-gro-sock4m"]
 RFW = [v for v in ORDER if v.startswith("rfw")]
 
 
