@@ -551,7 +551,7 @@ pub struct KnobSnapshot {
 #[command(
     name = "rfw",
     version,
-    about = "Rust Forwarder — TCP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
+    about = "Rust Forwarder — TCP/UDP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
 )]
 pub struct CliArgs {
     /// Path to YAML configuration file
@@ -768,7 +768,6 @@ pub(crate) fn load_yaml_config(path: &std::path::Path) -> Result<LoadedConfig, a
     let content = std::fs::read_to_string(path)?;
     let cf: ConfigFile = serde_saphyr::from_str(&content)?;
     validate_no_duplicates(&cf.forwarders)?;
-    reject_unsupported_protocols(&cf.forwarders)?;
     Ok(LoadedConfig {
         forwarders: cf.forwarders,
         settings: cf.settings,
@@ -836,7 +835,6 @@ pub fn load_forwarders_with_source(
     };
 
     validate_no_duplicates(&forwarders)?;
-    reject_unsupported_protocols(&forwarders)?;
     Ok((forwarders, source))
 }
 
@@ -940,19 +938,6 @@ fn validate_no_duplicates(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> 
                 shown
             );
         }
-    }
-    Ok(())
-}
-
-/// Temporary until sub-phase 2.2: the UDP engine does not exist yet, so any UDP
-/// forwarder is refused at every entry point (env, CLI, file, reload) instead of
-/// being silently ignored.
-fn reject_unsupported_protocols(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> {
-    if let Some(f) = fwd.iter().find(|f| f.protocol == Protocol::Udp) {
-        anyhow::bail!(
-            "UDP forwarder '{}' is not supported by this build yet; refusing to start it",
-            f.label()
-        );
     }
     Ok(())
 }
@@ -1877,38 +1862,5 @@ mod tests {
             cli.forwarders,
             vec!["127.0.0.1:1:127.0.0.1:2/udp".to_string()]
         );
-    }
-
-    #[test]
-    fn udp_forwarders_are_rejected_until_the_engine_lands() {
-        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
-        const MSG: &str = "is not supported by this build yet";
-
-        {
-            let _env = ForwarderEnvGuard::set(&[]);
-            let cli = CliArgs {
-                forwarders: vec!["127.0.0.1:1:127.0.0.1:2/udp".to_string()],
-                ..CliArgs::default()
-            };
-            let err = load_forwarders_with_source(&cli).expect_err("cli udp must be refused");
-            assert!(err.to_string().contains(MSG), "{err}");
-        }
-        {
-            let _env =
-                ForwarderEnvGuard::set(&[("RFW_FORWARDER_1", "127.0.0.1:1:127.0.0.1:2/udp")]);
-            let err = load_forwarders_with_source(&CliArgs::default())
-                .expect_err("env udp must be refused");
-            assert!(err.to_string().contains(MSG), "{err}");
-        }
-        let path = write_temp(
-            "udp-gate",
-            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2, protocol: udp}\n",
-        );
-        let res = load_yaml_config(&path);
-        let _ = std::fs::remove_file(&path);
-        let Err(err) = res else {
-            panic!("file udp must be refused");
-        };
-        assert!(err.to_string().contains(MSG), "{err}");
     }
 }

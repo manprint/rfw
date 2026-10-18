@@ -27,10 +27,10 @@ use hickory_resolver::TokioResolver;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{ForwarderConfig, RuntimeKnobs};
+use crate::config::{ForwarderConfig, Protocol, RuntimeKnobs};
 use crate::forwarder::{connect_racing, resolve_targets};
 use crate::notify::{fmt_duration, Event, Notifier, ProbeReport};
-use crate::stats::ForwarderStats;
+use crate::stats::{ForwarderStats, IcmpKind, UdpSample};
 
 /// While the target is down, probe at most this far apart (still bounded by
 /// `probe_interval`), so the alert lands close to the configured threshold
@@ -115,7 +115,10 @@ pub async fn probe_all(
     for (i, cfg) in configs.iter().cloned().enumerate() {
         let resolver = resolver.clone();
         set.spawn(async move {
-            let outcome = probe_target(&cfg, &resolver, dns_timeout, connect_timeout).await;
+            let outcome = match cfg.protocol {
+                Protocol::Tcp => probe_target(&cfg, &resolver, dns_timeout, connect_timeout).await,
+                Protocol::Udp => probe_udp_target(&cfg, &resolver, dns_timeout).await,
+            };
             (
                 i,
                 ProbeReport {
@@ -154,6 +157,35 @@ async fn cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
     }
 }
 
+/// Wait for the next probe tick: the interval (shortened while down), or an
+/// early kick from the data path. Returns `true` if cancelled.
+async fn wait_for_tick(
+    cancel: &CancellationToken,
+    stats: &ForwarderStats,
+    interval: Duration,
+    is_down: bool,
+    previous: Instant,
+) -> bool {
+    let wait = if is_down {
+        interval.min(DOWN_PROBE_INTERVAL)
+    } else {
+        interval
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return true,
+        _ = tokio::time::sleep(wait) => {}
+        _ = stats.probe_kick().notified() => {
+            // A real connection just failed: probe soon, not in a stampede.
+            let spacing = KICK_MIN_SPACING.saturating_sub(previous.elapsed());
+            if !spacing.is_zero() && cancelled(cancel, spacing).await {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Run the monitor for one forwarder until `cancel` fires.
 ///
 /// The first probe runs immediately so the `target_reachable` gauge is
@@ -167,6 +199,9 @@ pub async fn run_monitor(
     knobs: Arc<RuntimeKnobs>,
     notifier: Notifier,
 ) {
+    if cfg.protocol == Protocol::Udp {
+        return run_udp_monitor(cfg, cancel, stats, resolver, knobs, notifier).await;
+    }
     let label = cfg.label();
     let target = format!("{}:{}", cfg.remote_host, cfg.remote_port);
     let mut down: Option<Downtime> = None;
@@ -175,22 +210,8 @@ pub async fn run_monitor(
     loop {
         let interval = knobs.probe_interval();
         if let Some(previous) = last_probe {
-            let wait = if down.is_some() {
-                interval.min(DOWN_PROBE_INTERVAL)
-            } else {
-                interval
-            };
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(wait) => {}
-                _ = stats.probe_kick().notified() => {
-                    // A real connection just failed: probe soon, not in a stampede.
-                    let spacing = KICK_MIN_SPACING.saturating_sub(previous.elapsed());
-                    if !spacing.is_zero() && cancelled(&cancel, spacing).await {
-                        return;
-                    }
-                }
+            if wait_for_tick(&cancel, &stats, interval, down.is_some(), previous).await {
+                return;
             }
         }
         if cancel.is_cancelled() {
@@ -219,24 +240,7 @@ pub async fn run_monitor(
 
         if let Some(o) = &outcome {
             if !o.addrs.is_empty() {
-                if let Some(old) = stats.observe_addrs(&o.addrs) {
-                    let mut new = o.addrs.clone();
-                    new.sort_unstable();
-                    new.dedup();
-                    info!(
-                        forwarder = %label,
-                        host = %cfg.remote_host,
-                        old = ?old,
-                        new = ?new,
-                        "Target DNS answer changed"
-                    );
-                    notifier.notify(Event::DnsChanged {
-                        label: label.clone(),
-                        host: cfg.remote_host.clone(),
-                        old,
-                        new,
-                    });
-                }
+                report_dns_change(&label, &cfg.remote_host, &o.addrs, &stats, &notifier);
             }
         }
 
@@ -246,59 +250,251 @@ pub async fn run_monitor(
         };
 
         match result {
-            Ok(address) => {
-                stats.set_target_reachable(true);
-                if let Some(d) = down.take() {
-                    let down_for = d.since.elapsed();
-                    if d.alerted {
-                        info!(
-                            forwarder = %label,
-                            down_for = %fmt_duration(down_for),
-                            "Target reachable again"
-                        );
-                        notifier.notify(Event::TargetRecovered {
-                            label: label.clone(),
-                            target: target.clone(),
-                            down_for,
-                            address,
-                        });
-                    } else {
-                        info!(
-                            forwarder = %label,
-                            down_for = %fmt_duration(down_for),
-                            "Target reachable again (outage stayed below the alert threshold)"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                stats.set_target_reachable(false);
-                let threshold = knobs.unreachable_after();
-                let d = down.get_or_insert_with(|| {
-                    warn!(forwarder = %label, error = %e, "Target probe failed; watching");
-                    Downtime {
-                        since: Instant::now(),
-                        alerted: false,
-                    }
-                });
-                let down_for = d.since.elapsed();
-                if !d.alerted && down_for >= threshold {
-                    d.alerted = true;
-                    error!(
-                        forwarder = %label,
-                        down_for = %fmt_duration(down_for),
-                        error = %e,
-                        "Target unreachable beyond the alert threshold"
-                    );
-                    notifier.notify(Event::TargetUnreachable {
-                        label: label.clone(),
-                        target: target.clone(),
-                        down_for,
-                        last_error: e,
-                    });
-                }
+            Ok(address) => record_up(&label, &target, &mut down, address, &stats, &notifier),
+            Err(e) => record_down(&label, &target, &mut down, e, &stats, &knobs, &notifier),
+        }
+    }
+}
+
+/// Report a changed DNS answer, if `addrs` differs from the last observed set.
+fn report_dns_change(
+    label: &str,
+    host: &str,
+    addrs: &[IpAddr],
+    stats: &ForwarderStats,
+    notifier: &Notifier,
+) {
+    if let Some(old) = stats.observe_addrs(addrs) {
+        let mut new = addrs.to_vec();
+        new.sort_unstable();
+        new.dedup();
+        info!(
+            forwarder = %label,
+            host = %host,
+            old = ?old,
+            new = ?new,
+            "Target DNS answer changed"
+        );
+        notifier.notify(Event::DnsChanged {
+            label: label.to_string(),
+            host: host.to_string(),
+            old,
+            new,
+        });
+    }
+}
+
+/// The target looks reachable: set the gauge and close any open outage.
+fn record_up(
+    label: &str,
+    target: &str,
+    down: &mut Option<Downtime>,
+    address: Option<SocketAddr>,
+    stats: &ForwarderStats,
+    notifier: &Notifier,
+) {
+    stats.set_target_reachable(true);
+    if let Some(d) = down.take() {
+        let down_for = d.since.elapsed();
+        if d.alerted {
+            info!(
+                forwarder = %label,
+                down_for = %fmt_duration(down_for),
+                "Target reachable again"
+            );
+            notifier.notify(Event::TargetRecovered {
+                label: label.to_string(),
+                target: target.to_string(),
+                down_for,
+                address,
+            });
+        } else {
+            info!(
+                forwarder = %label,
+                down_for = %fmt_duration(down_for),
+                "Target reachable again (outage stayed below the alert threshold)"
+            );
+        }
+    }
+}
+
+/// The target looks unreachable: set the gauge, start or extend the outage,
+/// and alert once it has lasted `unreachable_after`.
+fn record_down(
+    label: &str,
+    target: &str,
+    down: &mut Option<Downtime>,
+    error: String,
+    stats: &ForwarderStats,
+    knobs: &RuntimeKnobs,
+    notifier: &Notifier,
+) {
+    stats.set_target_reachable(false);
+    let threshold = knobs.unreachable_after();
+    let d = down.get_or_insert_with(|| {
+        warn!(forwarder = %label, error = %error, "Target probe failed; watching");
+        Downtime {
+            since: Instant::now(),
+            alerted: false,
+        }
+    });
+    let down_for = d.since.elapsed();
+    if !d.alerted && down_for >= threshold {
+        d.alerted = true;
+        error!(
+            forwarder = %label,
+            down_for = %fmt_duration(down_for),
+            error = %error,
+            "Target unreachable beyond the alert threshold"
+        );
+        notifier.notify(Event::TargetUnreachable {
+            label: label.to_string(),
+            target: target.to_string(),
+            down_for,
+            last_error: error,
+        });
+    }
+}
+
+/// An ICMP error older than this, with traffic still flowing and no newer
+/// error, no longer counts: the kernel would have reported a fresh one (ICMP is
+/// rate-limited to about 1/s per destination).
+const ICMP_QUIET_MS: u64 = 3_000;
+
+/// Passive verdict on a UDP target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpVerdict {
+    Up,
+    Down {
+        kind: IcmpKind,
+        age_ms: u64,
+    },
+    /// No new evidence either way: keep the current state.
+    Hold,
+}
+
+/// Decide from the data-path evidence alone; nothing is ever sent to the target.
+/// Rows are evaluated in order. Recovery needs positive evidence (a reply, or
+/// traffic that no longer draws ICMP errors); silence freezes the state.
+fn udp_verdict(cur: &UdpSample, prev: Option<&UdpSample>) -> UdpVerdict {
+    let Some((icmp_ms, kind)) = cur.icmp else {
+        return UdpVerdict::Up;
+    };
+    if cur.reply_ms.is_some_and(|r| r >= icmp_ms) {
+        return UdpVerdict::Up;
+    }
+    let down = UdpVerdict::Down {
+        kind,
+        age_ms: cur.now_ms.saturating_sub(icmp_ms),
+    };
+    let Some(prev) = prev else {
+        return down;
+    };
+    if prev.icmp.map(|(ms, _)| ms) != Some(icmp_ms) {
+        return down;
+    }
+    if cur.now_ms.saturating_sub(icmp_ms) < ICMP_QUIET_MS {
+        return down;
+    }
+    if cur.sent > prev.sent {
+        return UdpVerdict::Up;
+    }
+    UdpVerdict::Hold
+}
+
+/// Resolve the UDP target (DNS only; UDP has no handshake to probe).
+pub async fn probe_udp_target(
+    cfg: &ForwarderConfig,
+    resolver: &TokioResolver,
+    dns_timeout: Duration,
+) -> ProbeOutcome {
+    let literal: Option<IpAddr> = cfg.remote_host.parse().ok();
+    let started = Instant::now();
+    let targets = match resolve_targets(
+        &cfg.remote_host,
+        cfg.remote_port,
+        literal,
+        resolver,
+        dns_timeout,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return ProbeOutcome {
+                addrs: Vec::new(),
+                result: Err(e.to_string()),
             }
         }
+    };
+    let elapsed = started.elapsed();
+    let addrs = if literal.is_some() {
+        Vec::new()
+    } else {
+        targets.iter().map(|a| a.ip()).collect()
+    };
+    match targets.first() {
+        Some(first) => ProbeOutcome {
+            addrs,
+            result: Ok((*first, elapsed)),
+        },
+        None => ProbeOutcome {
+            addrs,
+            result: Err("no address resolved".to_string()),
+        },
+    }
+}
+
+/// Passive monitor for a UDP forwarder: DNS observation plus [`udp_verdict`].
+async fn run_udp_monitor(
+    cfg: Arc<ForwarderConfig>,
+    cancel: CancellationToken,
+    stats: Arc<ForwarderStats>,
+    resolver: Arc<TokioResolver>,
+    knobs: Arc<RuntimeKnobs>,
+    notifier: Notifier,
+) {
+    let label = cfg.label();
+    let target = format!("{}:{}", cfg.remote_host, cfg.remote_port);
+    let mut down: Option<Downtime> = None;
+    let mut last_probe: Option<Instant> = None;
+    let mut prev: Option<UdpSample> = None;
+
+    loop {
+        let interval = knobs.probe_interval();
+        if let Some(previous) = last_probe {
+            if wait_for_tick(&cancel, &stats, interval, down.is_some(), previous).await {
+                return;
+            }
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+        last_probe = Some(Instant::now());
+
+        let o = probe_udp_target(&cfg, &resolver, knobs.dns_timeout()).await;
+        if !o.addrs.is_empty() {
+            report_dns_change(&label, &cfg.remote_host, &o.addrs, &stats, &notifier);
+        }
+        let cur = stats.udp_sample();
+        match o.result {
+            Err(e) => record_down(&label, &target, &mut down, e, &stats, &knobs, &notifier),
+            Ok((addr, _)) => match udp_verdict(&cur, prev.as_ref()) {
+                UdpVerdict::Up => {
+                    record_up(&label, &target, &mut down, Some(addr), &stats, &notifier)
+                }
+                UdpVerdict::Down { kind, age_ms } => {
+                    let error = format!(
+                        "{} from the target {} ago; no reply since",
+                        kind.as_str(),
+                        fmt_duration(Duration::from_millis(age_ms))
+                    );
+                    record_down(&label, &target, &mut down, error, &stats, &knobs, &notifier)
+                }
+                UdpVerdict::Hold => {}
+            },
+        }
+        prev = Some(cur);
     }
 }
 
@@ -311,7 +507,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
-    use crate::config::{Protocol, Settings};
+    use crate::config::Settings;
     use crate::testutil::{resolver_for, spawn_fake_dns};
 
     fn cfg(remote_host: &str, remote_port: u16) -> Arc<ForwarderConfig> {
@@ -710,5 +906,184 @@ mod tests {
             .await
             .expect("monitor must exit promptly on cancel")
             .unwrap();
+    }
+
+    fn udp_cfg(remote_port: u16) -> Arc<ForwarderConfig> {
+        Arc::new(ForwarderConfig {
+            protocol: Protocol::Udp,
+            ..(*cfg("127.0.0.1", remote_port)).clone()
+        })
+    }
+
+    fn sample(now_ms: u64, icmp_ms: Option<u64>, reply_ms: Option<u64>, sent: u64) -> UdpSample {
+        UdpSample {
+            now_ms,
+            icmp: icmp_ms.map(|ms| (ms, IcmpKind::PortUnreachable)),
+            reply_ms,
+            sent,
+        }
+    }
+
+    #[test]
+    fn udp_verdict_truth_table() {
+        let down = |age_ms| UdpVerdict::Down {
+            kind: IcmpKind::PortUnreachable,
+            age_ms,
+        };
+        // 1: no ICMP at all.
+        assert_eq!(
+            udp_verdict(&sample(10_000, None, None, 5), None),
+            UdpVerdict::Up
+        );
+        // 2: a reply at or after the ICMP error.
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), Some(1_000), 5), None),
+            UdpVerdict::Up
+        );
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), Some(2_000), 5), None),
+            UdpVerdict::Up
+        );
+        // 3: no previous tick.
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), Some(500), 5), None),
+            down(9_000)
+        );
+        // 4: an ICMP error newer than the previous tick saw.
+        let prev = sample(9_000, Some(1_000), None, 5);
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(9_500), None, 5), Some(&prev)),
+            down(500)
+        );
+        let prev_none = sample(9_000, None, None, 5);
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), None, 9), Some(&prev_none)),
+            down(9_000)
+        );
+        // 5: same ICMP error, still younger than the quiet period.
+        let prev = sample(3_000, Some(1_000), None, 5);
+        assert_eq!(
+            udp_verdict(&sample(3_999, Some(1_000), None, 9), Some(&prev)),
+            down(2_999)
+        );
+        // 6: old error, more traffic since the last tick and no new error: Up
+        // (the boundary age == ICMP_QUIET_MS is included).
+        let prev = sample(3_000, Some(1_000), None, 5);
+        assert_eq!(
+            udp_verdict(&sample(4_000, Some(1_000), None, 6), Some(&prev)),
+            UdpVerdict::Up
+        );
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), None, 6), Some(&prev)),
+            UdpVerdict::Up
+        );
+        // 7: old error, no traffic: freeze.
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(1_000), None, 5), Some(&prev)),
+            UdpVerdict::Hold
+        );
+        // Order: row 2 beats row 4 (new ICMP, but a newer reply).
+        let prev = sample(9_000, Some(1_000), None, 5);
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(9_500), Some(9_600), 5), Some(&prev)),
+            UdpVerdict::Up
+        );
+        // Order: row 4 beats row 6 (new ICMP even though traffic grew).
+        assert_eq!(
+            udp_verdict(&sample(10_000, Some(9_500), None, 50), Some(&prev)),
+            down(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_monitor_alerts_on_icmp_and_recovers_on_reply() {
+        let cfg = udp_cfg(9);
+        let stats = Arc::new(ForwarderStats::with_protocol(cfg.label(), Protocol::Udp));
+        let (notifier, mut rx) = Notifier::for_test();
+        let cancel = CancellationToken::new();
+        let _task = tokio::spawn(run_monitor(
+            cfg.clone(),
+            cancel.clone(),
+            stats.clone(),
+            system_resolver(),
+            knobs(1, 1),
+            notifier,
+        ));
+        wait_reachable(&stats, Some(true)).await;
+
+        let alert = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                tokio::select! {
+                    ev = rx.recv() => break ev.expect("channel open"),
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                        stats.mark_udp_icmp_error(stats.now_ms(), IcmpKind::PortUnreachable);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("alert must arrive in time");
+        match alert {
+            Event::TargetUnreachable { last_error, .. } => {
+                assert!(
+                    last_error.contains("port unreachable from the target"),
+                    "{last_error}"
+                );
+            }
+            other => panic!("expected TargetUnreachable, got {other:?}"),
+        }
+
+        stats.mark_connect_ok_at(stats.now_ms());
+        match next_event(&mut rx, Duration::from_secs(5)).await {
+            Event::TargetRecovered { .. } => {}
+            other => panic!("expected TargetRecovered, got {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn udp_monitor_freezes_without_new_evidence() {
+        let cfg = udp_cfg(9);
+        let stats = Arc::new(ForwarderStats::with_protocol(cfg.label(), Protocol::Udp));
+        let (notifier, mut rx) = Notifier::for_test();
+        let cancel = CancellationToken::new();
+        let _task = tokio::spawn(run_monitor(
+            cfg.clone(),
+            cancel.clone(),
+            stats.clone(),
+            system_resolver(),
+            knobs(1, 10),
+            notifier,
+        ));
+        wait_reachable(&stats, Some(true)).await;
+
+        stats.mark_udp_icmp_error(stats.now_ms(), IcmpKind::PortUnreachable);
+        let t0 = Instant::now();
+        while stats.target_reachable() != Some(false) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "the ICMP error must flip the target to down"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Hold after the quiet period: the 10 s threshold is never evaluated.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(6), rx.recv())
+                .await
+                .is_err(),
+            "no alert without fresh evidence"
+        );
+        assert_eq!(stats.target_reachable(), Some(false));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn udp_probe_is_dns_only() {
+        let c = (*udp_cfg(9)).clone();
+        let reports = probe_all(&[c], system_resolver(), &knobs(30, 300)).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].protocol, Protocol::Udp);
+        let (addr, _) = reports[0].outcome.as_ref().expect("DNS-only probe");
+        assert_eq!(*addr, "127.0.0.1:9".parse::<SocketAddr>().unwrap());
     }
 }

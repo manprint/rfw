@@ -263,12 +263,18 @@ impl Event {
                 old,
                 new,
             } => {
+                let consequence = if label.ends_with("/udp") {
+                    "New UDP sessions now go to the new address; sessions to addresses no longer published were closed."
+                } else {
+                    "New connections now go to the new address; connections already open stay on the old one."
+                };
                 text.push_str(&format!(
-                    "🔵 *DNS change* for {}\nForwarder {}\n{} → {}\nNew connections now go to the new address; connections already open stay on the old one.",
+                    "🔵 *DNS change* for {}\nForwarder {}\n{} → {}\n{}",
                     mono(host),
                     mono(label),
                     mono(&join_ips(old)),
-                    mono(&join_ips(new))
+                    mono(&join_ips(new)),
+                    consequence
                 ));
             }
             Event::TargetUnreachable {
@@ -1697,5 +1703,30 @@ mod tests {
         n.notify(Event::Started { forwarders: vec![] });
         n.notify(Event::Started { forwarders: vec![] });
         assert_eq!(n.counters().snapshot().dropped, 1);
+    }
+
+    #[test]
+    fn dns_change_render_mentions_udp_sessions() {
+        let inst = instance();
+        let render = |label: &str| {
+            Event::DnsChanged {
+                label: label.into(),
+                host: "db.example".into(),
+                old: vec!["10.0.0.1".parse().unwrap()],
+                new: vec!["10.0.0.2".parse().unwrap()],
+            }
+            .render(&inst, 0)
+        };
+        let udp = render("0.0.0.0:53->db.example:53/udp");
+        assert!(
+            udp.contains("New UDP sessions now go to the new address"),
+            "{udp}"
+        );
+        let tcp = render("0.0.0.0:80->db.example:80");
+        assert!(
+            tcp.contains("connections already open stay on the old one"),
+            "{tcp}"
+        );
+        assert!(!tcp.contains("UDP sessions"), "{tcp}");
     }
 }

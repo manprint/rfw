@@ -379,3 +379,155 @@ impl Drop for TempConfig {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// UDP helpers
+// ---------------------------------------------------------------------------
+
+/// Reserve a free UDP port on 127.0.0.1 for a process that will bind it itself
+/// (the `rfw` child). Claimed in the shared set, like [`free_port`].
+pub fn free_udp_port() -> u16 {
+    let mut claimed = claimed_ports().lock().unwrap();
+    for _ in 0..1000 {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if claimed.insert(port) {
+            return port;
+        }
+    }
+    panic!("could not reserve an unused UDP port");
+}
+
+/// Reserve a port number that is free for TCP *and* UDP on 127.0.0.1.
+pub fn free_dual_port() -> u16 {
+    let mut claimed = claimed_ports().lock().unwrap();
+    for _ in 0..1000 {
+        let tcp = StdListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
+            continue;
+        }
+        if claimed.insert(port) {
+            return port;
+        }
+    }
+    panic!("could not reserve a port free for both TCP and UDP");
+}
+
+/// Bind an in-process UDP socket on a port nothing else in this binary has claimed.
+async fn bind_unclaimed_udp() -> tokio::net::UdpSocket {
+    for _ in 0..1000 {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        if claimed_ports().lock().unwrap().insert(port) {
+            return sock;
+        }
+    }
+    panic!("could not bind an unclaimed UDP port");
+}
+
+/// Serve `sock`: answer every datagram with `tag` followed by the payload.
+fn serve_udp(sock: tokio::net::UdpSocket, tag: &'static [u8]) {
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 65536];
+        let mut out = Vec::with_capacity(65536 + tag.len());
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            out.clear();
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&buf[..n]);
+            let _ = sock.send_to(&out, from).await;
+        }
+    });
+}
+
+/// In-process UDP echo server on a fresh ephemeral port.
+pub async fn spawn_udp_echo() -> u16 {
+    let sock = bind_unclaimed_udp().await;
+    let port = sock.local_addr().unwrap().port();
+    serve_udp(sock, b"");
+    port
+}
+
+/// UDP echo server on a given port (e.g. one reserved with [`free_udp_port`]).
+/// Panics if the bind fails.
+pub async fn spawn_udp_echo_on(port: u16) {
+    let sock = tokio::net::UdpSocket::bind(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|e| panic!("bind udp echo on {port}: {e}"));
+    serve_udp(sock, b"");
+}
+
+/// UDP server answering every datagram with `tag` + payload: tells which backend answered.
+pub async fn spawn_udp_tagged(tag: &'static [u8]) -> u16 {
+    let sock = bind_unclaimed_udp().await;
+    let port = sock.local_addr().unwrap().port();
+    serve_udp(sock, tag);
+    port
+}
+
+/// A UDP client socket bound to 127.0.0.1:0.
+pub async fn udp_client() -> tokio::net::UdpSocket {
+    bind_unclaimed_udp().await
+}
+
+/// Send `payload` to 127.0.0.1:`port` and wait up to `within` for one reply.
+pub async fn udp_roundtrip(
+    c: &tokio::net::UdpSocket,
+    port: u16,
+    payload: &[u8],
+    within: Duration,
+) -> Option<Vec<u8>> {
+    c.send_to(payload, ("127.0.0.1", port)).await.ok()?;
+    let mut buf = vec![0_u8; 65536];
+    let (n, _) = tokio::time::timeout(within, c.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Retry "ping" every 100ms for up to 10s until rfw answers; returns the reply.
+/// Afterwards the client socket is drained, so late replies to earlier retries
+/// cannot be mistaken for answers to later requests.
+pub async fn wait_udp_forwarding(c: &tokio::net::UdpSocket, port: u16) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Some(reply) = udp_roundtrip(c, port, b"ping", Duration::from_millis(100)).await {
+            let mut buf = vec![0_u8; 65536];
+            while let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(100), c.recv_from(&mut buf)).await
+            {
+            }
+            return reply;
+        }
+    }
+    panic!("udp port {port} never forwarded");
+}
+
+/// Poll every 50ms for up to 5s until binding UDP 127.0.0.1:`port` succeeds.
+pub async fn wait_udp_port_free(port: u16) {
+    for _ in 0..100 {
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("udp port {port} never became free");
+}
+
+/// Value of `"field":N` inside the /stats object whose label is `label`.
+pub fn stat_of(body: &str, label: &str, field: &str) -> Option<u64> {
+    let start = body.find(&format!("\"label\":\"{label}\""))?;
+    let obj = &body[start..];
+    let obj = &obj[..obj.find('}')?];
+    let rest = &obj[obj.find(&format!("\"{field}\":"))? + field.len() + 3..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}

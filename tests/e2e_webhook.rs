@@ -10,7 +10,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{free_port, rfw_command, spawn_echo, spawn_rfw, wait_port, ChildGuard, TempConfig};
+use common::{
+    free_port, free_udp_port, rfw_command, spawn_echo, spawn_rfw, spawn_udp_echo,
+    spawn_udp_echo_on, udp_client, wait_port, ChildGuard, TempConfig,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -237,6 +240,69 @@ async fn target_outage_and_recovery_are_alerted() {
         text.contains(&format!("Answering at `127.0.0.1:{}`", backend.port)),
         "{text}"
     );
+}
+
+/// A UDP target is only resolved at startup, never probed: the message says so
+/// and does not call it unreachable.
+#[tokio::test]
+async fn startup_reports_udp_targets_as_resolved() {
+    let (hook, mut rx) = spawn_webhook_sink().await;
+    let udp_echo = spawn_udp_echo().await;
+    let tcp_echo = spawn_echo().await;
+    let (lu, lt) = (free_udp_port(), free_port());
+    let fwd_udp = format!("127.0.0.1:{lu}:127.0.0.1:{udp_echo}/udp");
+    let fwd_tcp = format!("127.0.0.1:{lt}:127.0.0.1:{tcp_echo}");
+    let _rfw = rfw_with_webhook(&hook, &[&fwd_udp, &fwd_tcp]);
+    wait_port(lt).await;
+
+    let text = expect_message(&mut rx, Duration::from_secs(15), &["*rfw started*"]).await;
+    assert!(text.contains("udp: passive check"), "{text}");
+    assert!(text.contains("resolved to"), "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+    assert!(
+        text.contains("✅ reachable at"),
+        "the TCP row stays active: {text}"
+    );
+}
+
+/// ICMP port-unreachable evidence from the data path raises the outage alert for a
+/// UDP forwarder; replies from the target afterwards raise the recovery.
+#[tokio::test]
+async fn udp_outage_is_alerted_and_recovery_reported() {
+    let (hook, mut rx) = spawn_webhook_sink().await;
+    let q = free_udp_port();
+    let local = free_udp_port();
+    let fwd = format!("127.0.0.1:{local}:127.0.0.1:{q}/udp");
+    let _rfw = rfw_with_webhook(
+        &hook,
+        &["--probe-interval", "1", "--unreachable-after", "2", &fwd],
+    );
+    expect_message(&mut rx, Duration::from_secs(15), &["*rfw started*"]).await;
+
+    // Keep traffic flowing: every datagram to the closed port draws an ICMP error.
+    let client = udp_client().await;
+    let sender = tokio::spawn(async move {
+        loop {
+            let _ = client.send_to(b"hello", ("127.0.0.1", local)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    expect_message(
+        &mut rx,
+        Duration::from_secs(20),
+        &["*Target unreachable*", "port unreachable from the target"],
+    )
+    .await;
+
+    spawn_udp_echo_on(q).await;
+    expect_message(
+        &mut rx,
+        Duration::from_secs(15),
+        &["*Target reachable again*"],
+    )
+    .await;
+    sender.abort();
 }
 
 /// A taken local port is alerted (once per throttle window, not once per 5 s

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::CliArgs;
+use crate::config::{CliArgs, Protocol};
 use crate::notify::{Event, InstanceInfo, Notifier, WebhookConfig};
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -85,17 +85,22 @@ async fn main() -> anyhow::Result<()> {
                rfw -f forwarders.yml\n\
                rfw localhost:8080:example.com:80 localhost:8081:other.com:443\n\n\
              Environment: RFW_FORWARDER_1, RFW_FORWARDER_2, ... override everything.\n\n\
-             Forwarder format: local_host:local_port:remote_host:remote_port"
+             Forwarder format: local_host:local_port:remote_host:remote_port[/tcp|/udp]"
         );
     }
 
     info!("Starting rfw with {} forwarder(s):", forwarders.len());
     for fwd in &forwarders {
         info!(
-            "  {} -> {}:{}",
+            "  {} -> {}:{}{}",
             fwd.local_addr(),
             fwd.remote_host,
-            fwd.remote_port
+            fwd.remote_port,
+            if fwd.protocol == Protocol::Udp {
+                " (udp)"
+            } else {
+                ""
+            }
         );
     }
     if let Some(path) = &cli.config_file {
@@ -128,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
         }
         None => (Notifier::disabled(), None),
     };
+
+    // Every UDP session holds one upstream socket: make room for them.
+    if forwarders.iter().any(|f| f.protocol == Protocol::Udp) {
+        udp::ensure_fd_budget(settings.udp_max_sessions);
+    }
 
     // Create manager and start all forwarders
     let manager = Arc::new(manager::ForwarderManager::new(&settings, notifier.clone())?);
@@ -182,6 +192,13 @@ async fn main() -> anyhow::Result<()> {
             let report = mgr.startup_report(&configs).await;
             for r in &report {
                 match &r.outcome {
+                    Ok((addr, latency)) if r.protocol == Protocol::Udp => info!(
+                        forwarder = %r.label,
+                        target = %r.target,
+                        via = %addr,
+                        latency_ms = latency.as_millis(),
+                        "Startup probe: target resolved (udp, passive monitoring)"
+                    ),
                     Ok((addr, latency)) => info!(
                         forwarder = %r.label,
                         target = %r.target,
@@ -212,6 +229,8 @@ async fn main() -> anyhow::Result<()> {
         .collect()
         .await
         .iter()
+        // only TCP connections are drained; UDP sessions end at once
+        .filter(|s| s.protocol == Protocol::Tcp)
         .map(|s| s.active_connections)
         .sum();
     notifier.notify(Event::Stopping {

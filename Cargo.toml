@@ -3,7 +3,7 @@ name = "rfw"
 version = "1.0.6"
 edition = "2021"
 rust-version = "1.89"
-description = "Rust Forwarder — TCP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
+description = "Rust Forwarder — TCP/UDP port forwarder with hot-reload, auto-reconnect, and dynamic DNS"
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }

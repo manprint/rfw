@@ -829,6 +829,80 @@ async fn run_dns_refresher(
     }
 }
 
+/// Headroom for listeners, TCP connections, the log file, DNS and the metrics endpoint.
+#[cfg(unix)]
+const FD_HEADROOM: u64 = 256;
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum FdPlan {
+    Enough,
+    Raise { to: u64, sufficient: bool },
+    Short,
+}
+
+#[cfg(unix)]
+fn fd_plan(soft: u64, hard: u64, needed: u64) -> FdPlan {
+    if soft >= needed {
+        FdPlan::Enough
+    } else if hard > soft {
+        let to = hard.min(needed);
+        FdPlan::Raise {
+            to,
+            sufficient: to >= needed,
+        }
+    } else {
+        FdPlan::Short
+    }
+}
+
+/// Make room for `udp_max_sessions` upstream sockets: raise the soft
+/// RLIMIT_NOFILE when the hard limit allows, warn when it cannot suffice.
+// `rlim_t` is not u64 on every unix target (32-bit, some BSDs): keep the casts.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn ensure_fd_budget(udp_max_sessions: usize) {
+    let needed = udp_max_sessions as u64 + FD_HEADROOM;
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid, writable `rlimit` for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        warn!(error = %io::Error::last_os_error(), "Could not read the open-file limit; not adjusting it");
+        return;
+    }
+    let (soft, hard) = (rl.rlim_cur as u64, rl.rlim_max as u64);
+    let mut current = soft;
+    let sufficient = match fd_plan(soft, hard, needed) {
+        FdPlan::Enough => return,
+        FdPlan::Short => false,
+        FdPlan::Raise { to, sufficient } => {
+            let raised = libc::rlimit {
+                rlim_cur: to as libc::rlim_t,
+                rlim_max: rl.rlim_max,
+            };
+            // SAFETY: `raised` is a valid `rlimit`; the call only reads it.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                info!("Raised the open-file soft limit from {soft} to {to} for udp_max_sessions");
+                current = to;
+                sufficient
+            } else {
+                warn!(error = %io::Error::last_os_error(), "Could not raise the open-file soft limit");
+                false
+            }
+        }
+    };
+    if !sufficient {
+        warn!(
+            "Open-file limit {current} is below udp_max_sessions + {FD_HEADROOM} = {needed}; UDP sessions beyond it will fail to open (raise ulimit -n / LimitNOFILE, or lower udp_max_sessions)"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_fd_budget(_udp_max_sessions: usize) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,5 +1421,33 @@ mod tests {
         assert!(same_addr_set(&[a, b], &[b, a]));
         assert!(!same_addr_set(&[a], &[a, b]));
         assert!(same_addr_set(&[a, a], &[a]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_budget_math() {
+        assert_eq!(fd_plan(20000, 20000, 16640), FdPlan::Enough);
+        assert_eq!(
+            fd_plan(1024, 1048576, 16640),
+            FdPlan::Raise {
+                to: 16640,
+                sufficient: true
+            }
+        );
+        assert_eq!(
+            fd_plan(1024, 4096, 16640),
+            FdPlan::Raise {
+                to: 4096,
+                sufficient: false
+            }
+        );
+        assert_eq!(fd_plan(1024, 1024, 16640), FdPlan::Short);
+        assert_eq!(
+            fd_plan(1024, u64::MAX, 16640),
+            FdPlan::Raise {
+                to: 16640,
+                sufficient: true
+            }
+        );
     }
 }

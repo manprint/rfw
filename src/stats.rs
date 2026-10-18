@@ -23,6 +23,37 @@ pub enum IcmpKind {
     NetworkUnreachable = 3,
 }
 
+impl IcmpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IcmpKind::PortUnreachable => "port unreachable",
+            IcmpKind::HostUnreachable => "host unreachable",
+            IcmpKind::NetworkUnreachable => "network unreachable",
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::PortUnreachable),
+            2 => Some(Self::HostUnreachable),
+            3 => Some(Self::NetworkUnreachable),
+            _ => None,
+        }
+    }
+}
+
+/// What the UDP monitor needs from the data path, read in one go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpSample {
+    pub now_ms: u64,
+    /// `(ms, kind)` of the latest ICMP error, if any.
+    pub icmp: Option<(u64, IcmpKind)>,
+    /// ms of the latest recorded reply (`last_connect_ok_ms`), if any.
+    pub reply_ms: Option<u64>,
+    /// Lifetime client -> target datagrams.
+    pub sent: u64,
+}
+
 /// Per-forwarder traffic counters.
 ///
 /// `bytes_sent` / `bytes_received` are **lifetime-monotonic**: they accumulate
@@ -244,6 +275,23 @@ impl ForwarderStats {
         match self.last_connect_ok_ms.load(Ordering::Relaxed) {
             NEVER_MS => None,
             ms => Some(Duration::from_millis(self.elapsed_ms().saturating_sub(ms))),
+        }
+    }
+
+    /// Snapshot of the passive-monitor evidence (ICMP, replies, traffic).
+    pub fn udp_sample(&self) -> UdpSample {
+        let icmp_ms = self.udp_icmp_error_ms.load(Ordering::Relaxed);
+        let icmp = if icmp_ms == NEVER_MS {
+            None
+        } else {
+            IcmpKind::from_u8(self.udp_icmp_kind.load(Ordering::Relaxed)).map(|k| (icmp_ms, k))
+        };
+        let reply = self.last_connect_ok_ms.load(Ordering::Relaxed);
+        UdpSample {
+            now_ms: self.now_ms(),
+            icmp,
+            reply_ms: (reply != NEVER_MS).then_some(reply),
+            sent: self.datagrams_sent.load(Ordering::Relaxed),
         }
     }
 
@@ -792,5 +840,21 @@ mod tests {
         assert_eq!(snap.datagrams_sent, 3);
         assert_eq!(snap.datagrams_received, 2);
         assert_eq!(snap.datagrams_dropped, 1);
+    }
+
+    #[test]
+    fn udp_sample_reflects_icmp_and_replies() {
+        let s = ForwarderStats::with_protocol("a:1->b:2/udp".into(), Protocol::Udp);
+        let fresh = s.udp_sample();
+        assert_eq!(fresh.icmp, None);
+        assert_eq!(fresh.reply_ms, None);
+        assert_eq!(fresh.sent, 0);
+        s.mark_udp_icmp_error(50, IcmpKind::HostUnreachable);
+        s.mark_connect_ok_at(60);
+        s.add_datagrams_sent(3);
+        let got = s.udp_sample();
+        assert_eq!(got.icmp, Some((50, IcmpKind::HostUnreachable)));
+        assert_eq!(got.reply_ms, Some(60));
+        assert_eq!(got.sent, 3);
     }
 }

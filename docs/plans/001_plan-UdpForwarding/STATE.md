@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 2.1 / 1) |
+| ID / attempt | — (last closed: 2.2 / 1) |
 | Status | none |
-| Intent | UDP engine src/udp.rs + manager dispatch (gate D17 still active) |
+| Intent | un-gate D17, passive UDP monitor, fd budget, startup/shutdown, e2e_udp + webhook tests |
 | Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
-| File / unit heading | phase_03.md "2.1" |
+| File / unit heading | 2.2 Sblocco, monitor passivo, avvio/shutdown, e2e UDP |
 | Current step | none |
-| Next eligible plan unit | 2.2 |
-| Unit base | 447101a; branch: main; owned changes: src/udp.rs (NEW), src/forwarder.rs (pub(crate)), src/stats.rs, src/config.rs (knob), src/notify.rs, src/manager.rs, src/main.rs |
-| Repo state | HEAD 447101a |
+| Next eligible plan unit | 2.3 |
+| Unit base | f13caed; branch: main; owned changes: config.rs stats.rs monitor.rs main.rs notify.rs udp.rs Cargo.toml tests/common tests/e2e_lifecycle.rs tests/e2e_udp.rs tests/e2e_webhook.rs |
+| Repo state | HEAD f13caed |
 
-Next action: dispatch 2.2 to agent-2:sonnet (un-gate D17, monitor, main.rs, e2e_udp, webhook tests)
+Next action: dispatch 2.3 to agent-3:haiku (README + forwarders.yml; Dockerfile label wording noted)
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 2.2 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (D17 gate + test removed, about), Cargo.toml (description), stats.rs (UdpSample, IcmpKind as_str/from_u8), monitor.rs (udp_verdict, run_udp_monitor, probe_udp_target, shared record_up/down/report_dns_change/wait_for_tick), notify.rs (DnsChanged UDP text), main.rs ((udp) suffix, ensure_fd_budget, UDP startup probe line, TCP-only drain count), udp.rs (fd budget), tests/common (UDP harness), e2e_lifecycle (-1 gate test), e2e_webhook (+2), e2e_udp (new, 12 + ignored bench) | G-HYG pass; G-U2.2 GATE_EXIT=0: unit 123 incl. 7 new; e2e_udp 12+1 ignored (×5); e2e_webhook 10; e2e_lifecycle 16; git grep exit 1 | unit:2.2:1 |
 | sub-phase | 2.1 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review + D7a fix) | udp.rs (new engine + 14 tests; recv_upstream per D7a), forwarder.rs (pub(crate) guards/consts/cancelled), stats.rs (IcmpKind, ICMP marks, now_ms, datagram adders, mark_connect_ok_at), config.rs (udp_session_timeout knob), notify.rs (UdpSessionLimitReached), manager.rs (udp_limit, Protocol dispatch), main.rs (mod udp) | G-HYG pass; G-U2.1 130 passed incl. udp::tests 14/14 ×6 runs, +4 outside tests; red: worker run hung (combined-interest try_io spin) → rev 2 | unit:2.1:1 |
 | phase-close | P1 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass; review approve | unit:P1:1 |
 | sub-phase | 1.2 / 1 | 1 | agent-3:haiku (impl), agent-1:opus (review) | stats.rs (protocol, datagram counters, with_protocol, register_with_protocol), metrics.rs (UDP-only datagram families, JSON protocol + datagram fields), forwarder.rs (traffic_row), notify.rs (ProbeReport.protocol, Started UDP render), monitor.rs, manager.rs | G-HYG pass; G-U1.2 66 passed incl. 7 new | unit:1.2:1 |
@@ -368,6 +369,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 2.2 post-diff | agent-1:opus | rev 2; working tree on f13caed | udp_verdict vs truth table (D14), gate fully removed, fd budget (unix + non-unix stub), Stopping drain TCP-only, deviations: wait_for_tick extraction, clippy allow for rlim_t casts, test-helper drain; Dockerfile/README wording left to 2.3 | approve |
 | 2.1 post-diff | agent-1:opus | rev 2; working tree on 447101a | I-4 listener path sync, I-6 tasks.wait grace, I-14 raw send, thread-local buf never across await, log levels; worker escalation on R3 verified in tokio source | approve (after D7a fix) |
 | 2.1 pre-dispatch | agent-1:opus | rev 1; 447101a | skeleton vs HEAD: stats.with_protocol/datagram counters pub, elapsed_ms private (now_ms wrapper needed), resolve_targets pub(crate) signature, knobs getters, Notifier::disabled, bind loop of run_forwarder, mod list in main.rs | approve dispatch |
 | P1 phase review | agent-1:opus | rev 1; 6772a41 | I-1, I-7 (UDP refused in CLI/env/YAML), I-13; README unchanged and still accurate (UDP gated, syntax docs describe TCP only) | approve |
@@ -414,7 +416,7 @@ none
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U1.1 pass; review agent-1:opus |
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1.2 pass; review agent-1:opus |
 | 2.1 | phase_03.md | P1 | DONE | 1 | G-U2.1 pass; review agent-1:opus |
-| 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
+| 2.2 | phase_03.md | 2.1 | DONE | 1 | G-U2.2 pass; review agent-1:opus |
 | 2.3 | phase_03.md | 2.2 | TODO | 1 | — |
 | 3.1 | phase_04.md | P2 | TODO | 1 | — |
 | 3.2 | phase_04.md | 3.1 | TODO | 1 | — |
@@ -486,28 +488,28 @@ automatically satisfy dependent units.
 | `config::tests::knobs_expose_the_udp_session_timeout` | 2.1 | G-U2.1 | pass | 2.1/1 |
 | `notify::tests::udp_session_limit_alert_is_rendered_and_throttled` | 2.1 | G-U2.1 | pass | 2.1/1 |
 | `manager::tests::stop_one_releases_the_udp_port` | 2.1 | G-U2.1 | pass | 2.1/1 |
-| `monitor::tests::udp_verdict_truth_table` | 2.2 | G-U2.2 | TODO | — |
-| `monitor::tests::udp_monitor_alerts_on_icmp_and_recovers_on_reply` | 2.2 | G-U2.2 | TODO | — |
-| `monitor::tests::udp_monitor_freezes_without_new_evidence` | 2.2 | G-U2.2 | TODO | — |
-| `monitor::tests::udp_probe_is_dns_only` | 2.2 | G-U2.2 | TODO | — |
-| `stats::tests::udp_sample_reflects_icmp_and_replies` | 2.2 | G-U2.2 | TODO | — |
-| `notify::tests::dns_change_render_mentions_udp_sessions` | 2.2 | G-U2.2 | TODO | — |
-| `udp::tests::fd_budget_math` (unix) | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `udp_round_trip_and_metrics` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `env_udp_forwarder_works` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `yaml_protocol_udp_and_hot_reload_retarget` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `tcp_and_udp_share_a_port_independently` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `duplicate_udp_forwarder_is_rejected` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `idle_session_expires` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `udp_max_sessions_is_enforced_and_counted` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `health_reports_503_while_the_udp_port_is_taken` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `sigterm_exits_fast_with_idle_udp_sessions` (unix) | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `udp_drops_are_rate_limited_in_logs` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `closed_udp_target_is_reported_unreachable` | 2.2 | G-U2.2 | TODO | — |
-| e2e_udp `reference_scenario_tcp_and_udp_side_by_side` | 2.2 | G-U2.2, G-FINAL | TODO | — |
-| e2e_udp `udp_bench` (ignored) | 2.2 | G-UDP-BENCH | TODO | — |
-| e2e_webhook `startup_reports_udp_targets_as_resolved` | 2.2 | G-U2.2 | TODO | — |
-| e2e_webhook `udp_outage_is_alerted_and_recovery_reported` | 2.2 | G-U2.2 | TODO | — |
+| `monitor::tests::udp_verdict_truth_table` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `monitor::tests::udp_monitor_alerts_on_icmp_and_recovers_on_reply` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `monitor::tests::udp_monitor_freezes_without_new_evidence` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `monitor::tests::udp_probe_is_dns_only` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `stats::tests::udp_sample_reflects_icmp_and_replies` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `notify::tests::dns_change_render_mentions_udp_sessions` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| `udp::tests::fd_budget_math` (unix) | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `udp_round_trip_and_metrics` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `env_udp_forwarder_works` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `yaml_protocol_udp_and_hot_reload_retarget` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `tcp_and_udp_share_a_port_independently` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `duplicate_udp_forwarder_is_rejected` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `idle_session_expires` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `udp_max_sessions_is_enforced_and_counted` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `health_reports_503_while_the_udp_port_is_taken` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `sigterm_exits_fast_with_idle_udp_sessions` (unix) | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `udp_drops_are_rate_limited_in_logs` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `closed_udp_target_is_reported_unreachable` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_udp `reference_scenario_tcp_and_udp_side_by_side` | 2.2 | G-U2.2, G-FINAL | pass | 2.2/1 |
+| e2e_udp `udp_bench` (ignored) | 2.2 | G-UDP-BENCH | pass | 2.2/1 |
+| e2e_webhook `startup_reports_udp_targets_as_resolved` | 2.2 | G-U2.2 | pass | 2.2/1 |
+| e2e_webhook `udp_outage_is_alerted_and_recovery_reported` | 2.2 | G-U2.2 | pass | 2.2/1 |
 | `config::tests::shipped_example_config_parses_and_validates` (updated) | 2.3 | G-U2.3 | TODO | — |
 | `udp::tests::offload_gso_send_arrives_coalesced_at_a_gro_socket` | 3.1 | G-U3.1 | TODO | — |
 | `udp::tests::offload_gso_send_is_split_for_a_socket_without_gro` | 3.1 | G-U3.1 | TODO | — |
