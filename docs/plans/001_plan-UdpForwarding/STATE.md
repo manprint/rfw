@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 1.2 / 1) |
+| ID / attempt | — (last closed: P1 / 1) |
 | Status | none |
 | Intent | Plumbing: stats protocol + datagram counters, Prometheus, JSON, traffic report, startup report |
 | Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
 | File / unit heading | phase_02.md "1.2" |
 | Current step | none |
-| Next eligible plan unit | P1 (phase_02.md closure) |
+| Next eligible plan unit | 2.1, phase_03.md |
 | Unit base | 356cfa2; branch: main; owned changes: src/stats.rs, src/metrics.rs, src/forwarder.rs, src/notify.rs, src/monitor.rs, src/manager.rs |
-| Repo state | HEAD 356cfa2 |
+| Repo state | HEAD 6772a41 |
 
-Next action: open P1: G-PHASE + review.
+Next action: open 2.1: agent-1:opus pre-dispatch review, then agent-2:sonnet.
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| phase-close | P1 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass; review approve | unit:P1:1 |
 | sub-phase | 1.2 / 1 | 1 | agent-3:haiku (impl), agent-1:opus (review) | stats.rs (protocol, datagram counters, with_protocol, register_with_protocol), metrics.rs (UDP-only datagram families, JSON protocol + datagram fields), forwarder.rs (traffic_row), notify.rs (ProbeReport.protocol, Started UDP render), monitor.rs, manager.rs | G-HYG pass; G-U1.2 66 passed incl. 7 new | unit:1.2:1 |
 | sub-phase | 1.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (Protocol, label /udp, D1a parsing, (protocol,addr) duplicates, udp_* settings+CLI, D17 gate), test literals in forwarder/manager/monitor, e2e_lifecycle +2 | G-HYG pass; config::tests 47 passed incl. 9 new; e2e_lifecycle 17 passed | unit:1.1:1 |
 | plan | 001 / 1 | 1 | agent-1:opus | overview.md, phase_01–04.md, STATE.md (untracked) | readiness check in §7 | staged with 0.1 (unit:0.1:1) |
@@ -358,6 +359,7 @@ Research checkpoint: N/A (research complete; R1–R7 CONFIRMED).
 | G-BASE | `cargo test --all` | pass | 144 unit; e2e_forward 2, e2e_hot_reload 6, e2e_lifecycle 15, e2e_webhook 8 | c50db1f, clean | 2026-10-18 (planning) |
 | G-PERF-TCP-BASE | block G-PERF-TCP | pass | 2.26s, 2.28s, 2.27s → **median 2.27s** | c50db1f, clean (plan folder untracked) | 2026-10-18 |
 | G-PHASE (P0) | block G-PHASE | pass | HYG exit 0; debug and release: unit 150, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 15, e2e_webhook 8. First debug run: `sigterm_drains_an_in_flight_transfer` failed once (ConnectionRefused right after `wait_port`), 5/5 isolated reruns and full debug rerun pass; test and helpers untouched by 0.1 → pre-existing flake (supervisor: likely loopback self-connect in `wait_port` on an ephemeral-range port) | 003e943 | 2026-10-18 |
+| G-PHASE (P1) | block G-PHASE | pass | HYG 0; debug+release: unit 166, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 17, e2e_webhook 8 | 6772a41 | 2026-10-18 |
 | G-XPLAT (planning dry-run on baseline) | block G-XPLAT | pass | `BUILD_EXIT=0`; `RUN_EXIT=0`: Windows GNU `cargo check --all-targets` and both Darwin `cargo zigbuild --release` finished; `Cargo.lock` untouched; only the gitignored `.intentionally-empty-file.o` was created. Re-run with the block copied verbatim from this file: `BUILD_EXIT=0`, `RUN_EXIT=0` | c50db1f, clean | 2026-10-18 12:51 and 12:56 (planning) |
 
 Results: pass, fail, blocked, not-run, not-applicable-yet. Only pass satisfies a required active gate. Keep the
@@ -365,6 +367,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| P1 phase review | agent-1:opus | rev 1; 6772a41 | I-1, I-7 (UDP refused in CLI/env/YAML), I-13; README unchanged and still accurate (UDP gated, syntax docs describe TCP only) | approve |
 | 1.2 post-diff | agent-1:opus | rev 1; 356cfa2 + 1.2 diff | I-13 TCP exposition/JSON/report unchanged except added "protocol"; datagram families UDP-only; HELP texts | approve |
 | 1.1 post-diff | agent-1:opus | rev 1; dedf948 + 1.1 diff | I-1 TCP label byte-identical; D1a strings; D4 dup key; D12 validate/clamp; D17 gate in both load paths | approve |
 | P0 phase review | agent-1:opus | rev 1; 003e943 | D20 behavior, 6 unit + 2 e2e tests, README point 5/pinned accurate vs log texts, no TCP data-path change | approve |
@@ -424,7 +427,7 @@ README obligation per phase:
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
-| 1 | phase_02.md | P1 | IN_PROGRESS | — |
+| 1 | phase_02.md | P1 | DONE | review agent-1:opus; unit:P1:1 |
 | 2 | phase_03.md | P2 | TODO | — |
 | 3 | phase_04.md | P3 | TODO | — |
 
@@ -529,7 +532,7 @@ automatically satisfy dependent units.
 | `forwarders.yml`: UDP example, `udp_*` settings, CLI list | 2.3 | TODO | — |
 | README: UDP GRO/GSO subsection, `--udp-gro-gso`, `udp_gro_gso`, hot-reload list, Test (GSO bench) | 3.2 | TODO | — |
 | `forwarders.yml`: `udp_gro_gso` | 3.2 | TODO | — |
-| README accuracy check against HEAD | P1, P2, P3 | TODO | — |
+| README accuracy check against HEAD | P1, P2, P3 | P1 DONE (unchanged, accurate) | P1/1 |
 
 ### Audits
 | Report | Verdict | Current unresolved findings | Evidence |
