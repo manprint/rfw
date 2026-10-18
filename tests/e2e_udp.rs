@@ -317,9 +317,12 @@ async fn udp_max_sessions_is_enforced_and_counted() {
 #[tokio::test]
 async fn health_reports_503_while_the_udp_port_is_taken() {
     let echo = spawn_udp_echo().await;
-    let (p, m) = (free_udp_port(), free_port());
+    // Occupy an ephemeral port directly: reserving a free port and binding it
+    // later races with the client sockets of tests running in parallel.
+    let occupant = std::net::UdpSocket::bind("127.0.0.1:0").expect("occupy a port");
+    let p = occupant.local_addr().unwrap().port();
+    let m = free_port();
     let label = udp_label(p, echo);
-    let occupant = std::net::UdpSocket::bind(("127.0.0.1", p)).expect("occupy the port");
     let fwd = format!("127.0.0.1:{p}:127.0.0.1:{echo}/udp");
     let metrics_addr = format!("127.0.0.1:{m}");
     let _rfw = spawn_rfw(&["--metrics-addr", &metrics_addr, &fwd]);

@@ -439,6 +439,10 @@ trigger the same graceful shutdown:
 2. Drain in-flight connections, up to a 10-second grace window.
 3. Flush logs and exit.
 
+UDP forwarders have no in-flight connections to drain: their sessions are
+closed at once (each forwarder releases its port within 2 seconds), and the
+in-flight count in the shutdown alert covers TCP connections only.
+
 Give the container at least that long to stop:
 
 ```yaml

@@ -20,7 +20,7 @@ RUN cargo build --release && \
 FROM gcr.io/distroless/cc-debian12:latest
 
 LABEL org.opencontainers.image.title="rfw"
-LABEL org.opencontainers.image.description="Rust Forwarder — TCP port forwarder"
+LABEL org.opencontainers.image.description="Rust Forwarder — TCP/UDP port forwarder"
 LABEL org.opencontainers.image.source="https://github.com/manprint/rfw"
 LABEL org.opencontainers.image.licenses="MIT"
 

@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 2.3 / 1) |
+| ID / attempt | — (last closed: P2 / 1) |
 | Status | none |
 | Intent | UDP documentation: README, forwarders.yml, example-config test |
 | Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
 | File / unit heading | 2.3 Documentazione UDP (README, forwarders.yml) |
 | Current step | none |
-| Next eligible plan unit | P2 |
+| Next eligible plan unit | 3.1 |
 | Unit base | 165788d; branch: main; owned changes: README.md forwarders.yml src/config.rs (test only) |
-| Repo state | HEAD 165788d |
+| Repo state | HEAD a483a58 |
 
-Next action: P2: Dockerfile label (supervisor), G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH, README accuracy, review
+Next action: open 3.1: agent-1:opus pre-dispatch check of phase_04 skeletons (D7a applied to skeleton B), then agent-2:sonnet
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| phase-close | P2 / 1 | 2 | agent-1:opus | STATE.md, tests/e2e_udp.rs (port race), README (Signals), Dockerfile (label) | G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH pass; review approve | unit:P2:1 |
 | sub-phase | 2.3 / 1 | 2 | agent-3:haiku (impl), agent-1:opus (review) | README (intro, features, syntax, YAML, env, CLI ref, hot-reload, How it works/UDP, UDP tuning, logging, traffic report, metrics, alerting, tests, structure), forwarders.yml (UDP entry + commented udp_* settings), config.rs (example test 4 forwarders, 1 UDP) | G-U2.3 1 passed; fmt + clippy exit 0 | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (D17 gate + test removed, about), Cargo.toml (description), stats.rs (UdpSample, IcmpKind as_str/from_u8), monitor.rs (udp_verdict, run_udp_monitor, probe_udp_target, shared record_up/down/report_dns_change/wait_for_tick), notify.rs (DnsChanged UDP text), main.rs ((udp) suffix, ensure_fd_budget, UDP startup probe line, TCP-only drain count), udp.rs (fd budget), tests/common (UDP harness), e2e_lifecycle (-1 gate test), e2e_webhook (+2), e2e_udp (new, 12 + ignored bench) | G-HYG pass; G-U2.2 GATE_EXIT=0: unit 123 incl. 7 new; e2e_udp 12+1 ignored (×5); e2e_webhook 10; e2e_lifecycle 16; git grep exit 1 | unit:2.2:1 |
 | sub-phase | 2.1 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review + D7a fix) | udp.rs (new engine + 14 tests; recv_upstream per D7a), forwarder.rs (pub(crate) guards/consts/cancelled), stats.rs (IcmpKind, ICMP marks, now_ms, datagram adders, mark_connect_ok_at), config.rs (udp_session_timeout knob), notify.rs (UdpSessionLimitReached), manager.rs (udp_limit, Protocol dispatch), main.rs (mod udp) | G-HYG pass; G-U2.1 130 passed incl. udp::tests 14/14 ×6 runs, +4 outside tests; red: worker run hung (combined-interest try_io spin) → rev 2 | unit:2.1:1 |
@@ -363,6 +364,10 @@ Research checkpoint: N/A (research complete; R1–R7 CONFIRMED).
 | G-PERF-TCP-BASE | block G-PERF-TCP | pass | 2.26s, 2.28s, 2.27s → **median 2.27s** | c50db1f, clean (plan folder untracked) | 2026-10-18 |
 | G-PHASE (P0) | block G-PHASE | pass | HYG exit 0; debug and release: unit 150, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 15, e2e_webhook 8. First debug run: `sigterm_drains_an_in_flight_transfer` failed once (ConnectionRefused right after `wait_port`), 5/5 isolated reruns and full debug rerun pass; test and helpers untouched by 0.1 → pre-existing flake (supervisor: likely loopback self-connect in `wait_port` on an ephemeral-range port) | 003e943 | 2026-10-18 |
 | G-PHASE (P1) | block G-PHASE | pass | HYG 0; debug+release: unit 166, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 17, e2e_webhook 8 | 6772a41 | 2026-10-18 |
+| G-PHASE (P2) | block G-PHASE | pass | HYG 0; debug+release: unit 190, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 16, e2e_udp 12 + 1 ignored, e2e_webhook 10. First debug run: `e2e_udp::health_reports_503_while_the_udp_port_is_taken` failed (AddrInUse: reserved port grabbed by a parallel test's client socket) → test fixed to occupy `:0` directly; e2e_udp 3/3, then full rerun green | a483a58 + P2 diff (test fix, README Signals, Dockerfile label) | 2026-10-18 |
+| G-XPLAT (P2) | block G-XPLAT | pass | BUILD_EXIT=0; RUN_EXIT=0; Cargo.lock untouched | same as G-PHASE (P2) | 2026-10-18 |
+| G-PERF-TCP (P2) | block G-PERF-TCP | pass | 2.32s, 2.31s, 2.33s → median 2.32s ≤ 2.61s (1.15 × 2.27s) | same | 2026-10-18 |
+| G-UDP-BENCH (P2) | block G-UDP-BENCH | pass | `UDP_BENCH latency direct_p50_us=15 direct_p99_us=19 rfw_p50_us=15 rfw_p99_us=37 p50_overhead_us=0`; `UDP_BENCH windowed pps=258129 mbit_s=2478.0 windowed_loss=0`; `UDP_BENCH blast sent=200000 echoed=36423 loss_pct=81.79` (informational) | same | 2026-10-18 |
 | G-XPLAT (planning dry-run on baseline) | block G-XPLAT | pass | `BUILD_EXIT=0`; `RUN_EXIT=0`: Windows GNU `cargo check --all-targets` and both Darwin `cargo zigbuild --release` finished; `Cargo.lock` untouched; only the gitignored `.intentionally-empty-file.o` was created. Re-run with the block copied verbatim from this file: `BUILD_EXIT=0`, `RUN_EXIT=0` | c50db1f, clean | 2026-10-18 12:51 and 12:56 (planning) |
 
 Results: pass, fail, blocked, not-run, not-applicable-yet. Only pass satisfies a required active gate. Keep the
@@ -374,6 +379,7 @@ relevant failing output or evidence references.
 | 2.2 post-diff | agent-1:opus | rev 2; working tree on f13caed | udp_verdict vs truth table (D14), gate fully removed, fd budget (unix + non-unix stub), Stopping drain TCP-only, deviations: wait_for_tick extraction, clippy allow for rlim_t casts, test-helper drain; Dockerfile/README wording left to 2.3 | approve |
 | 2.1 post-diff | agent-1:opus | rev 2; working tree on 447101a | I-4 listener path sync, I-6 tasks.wait grace, I-14 raw send, thread-local buf never across await, log levels; worker escalation on R3 verified in tokio source | approve (after D7a fix) |
 | 2.1 pre-dispatch | agent-1:opus | rev 1; 447101a | skeleton vs HEAD: stats.with_protocol/datagram counters pub, elapsed_ms private (now_ms wrapper needed), resolve_targets pub(crate) signature, knobs getters, Notifier::disabled, bind loop of run_forwarder, mod list in main.rs | approve dispatch |
+| P2 phase review | agent-1:opus | rev 2; a483a58 + P2 diff | I-4/I-6/I-14 held through 2.2; D17 gone; README UDP sections vs code constants/log strings; Signals section lacked UDP → fixed; Dockerfile label TCP/UDP; test port race fixed | approve |
 | P1 phase review | agent-1:opus | rev 1; 6772a41 | I-1, I-7 (UDP refused in CLI/env/YAML), I-13; README unchanged and still accurate (UDP gated, syntax docs describe TCP only) | approve |
 | 1.2 post-diff | agent-1:opus | rev 1; 356cfa2 + 1.2 diff | I-13 TCP exposition/JSON/report unchanged except added "protocol"; datagram families UDP-only; HELP texts | approve |
 | 1.1 post-diff | agent-1:opus | rev 1; dedf948 + 1.1 diff | I-1 TCP label byte-identical; D1a strings; D4 dup key; D12 validate/clamp; D17 gate in both load paths | approve |
@@ -401,6 +407,8 @@ Readiness notes:
 none
 
 ## 10. Do-not-repeat
+- In UDP tests, never reserve a port with `free_udp_port()` and bind it yourself later: parallel tests' `127.0.0.1:0`
+  client sockets can take it (AddrInUse, P2). Bind `:0` and read the port, or let rfw bind (it retries).
 - Pre-existing flake (not plan-caused): `e2e_lifecycle::sigterm_drains_an_in_flight_transfer` can fail with ConnectionRefused after `wait_port` (1/7 runs at P0). Rerun once to confirm before treating as a regression; do not "fix" it inside an unrelated unit.
 - Local cross-compile for Windows GNU/Darwin without Docker fails (no mingw `x86_64-w64-mingw32-gcc` for ring, no
   macOS SDK). Use G-XPLAT in Docker. Do not install toolchains on the host.
@@ -437,7 +445,7 @@ README obligation per phase:
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | DONE | review agent-1:opus; unit:P1:1 |
-| 2 | phase_03.md | P2 | IN_PROGRESS | — |
+| 2 | phase_03.md | P2 | DONE | review agent-1:opus; unit:P2:1 |
 | 3 | phase_04.md | P3 | TODO | — |
 
 Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED. SKIPPED keeps a reason and does not
@@ -537,11 +545,11 @@ automatically satisfy dependent units.
 | Document/sections | Owning unit | Status | Evidence |
 |-------------------|-------------|--------|----------|
 | README: "Configuration override behavior" point 5, Hot-reload note, "Pinned forwarders" bullet, precedence wording | 0.1 | DONE | 0.1/1 diff |
-| README: all UDP sections (Features, Forwarder syntax, YAML, Env, CLI reference, Hot-reload, How it works, Performance & tuning, Logging, Traffic report, Metrics, Alerting, Signals, Test, Project structure) | 2.3 | TODO | — |
-| `forwarders.yml`: UDP example, `udp_*` settings, CLI list | 2.3 | TODO | — |
+| README: all UDP sections (Features, Forwarder syntax, YAML, Env, CLI reference, Hot-reload, How it works, Performance & tuning, Logging, Traffic report, Metrics, Alerting, Signals, Test, Project structure) | 2.3 | DONE (Signals added at P2) | 2.3/1, P2/1 |
+| `forwarders.yml`: UDP example, `udp_*` settings, CLI list | 2.3 | DONE | 2.3/1 |
 | README: UDP GRO/GSO subsection, `--udp-gro-gso`, `udp_gro_gso`, hot-reload list, Test (GSO bench) | 3.2 | TODO | — |
 | `forwarders.yml`: `udp_gro_gso` | 3.2 | TODO | — |
-| README accuracy check against HEAD | P1, P2, P3 | P1 DONE (unchanged, accurate) | P1/1 |
+| README accuracy check against HEAD | P1, P2, P3 | P1 DONE (unchanged, accurate); P2 DONE (Signals fix) | P1/1, P2/1 |
 
 ### Audits
 | Report | Verdict | Current unresolved findings | Evidence |
