@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 0.1 / 1) |
+| ID / attempt | — (last closed: P0 / 1) |
 | Status | none |
 | Intent | CLI overrides re-applied on reload; env/CLI forwarders pinned (B1) |
 | Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
 | File / unit heading | phase_01.md "0.1 Reload: override CLI riapplicati e forwarder env/CLI pinned" |
 | Current step | none |
-| Next eligible plan unit | P0 (phase_01.md closure) |
+| Next eligible plan unit | 1.1, phase_02.md |
 | Unit base | c50db1f; branch: main; owned changes: src/config.rs, src/manager.rs, src/main.rs, tests/common/mod.rs, tests/e2e_hot_reload.rs, README.md |
 | Repo state | HEAD c50db1f; untracked `docs/plans/001_plan-UdpForwarding/` only |
 
-Next action: open P0: G-PHASE + agent-1:opus phase review.
+Next action: open 1.1 (agent-2:sonnet).
 
 ## 2. Feature context and readiness
 
@@ -313,6 +313,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 001 / 1 | 1 | agent-1:opus | overview.md, phase_01–04.md, STATE.md (untracked) | readiness check in §7 | staged with 0.1 (unit:0.1:1) |
+| phase-close | P0 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass (see §7); review approve | unit:P0:1 |
 | sub-phase | 0.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (ForwarderSource, load_forwarders_with_source, apply_cli_overrides), manager.rs (ReloadPolicy, reload re-applies CLI, pinned sync), main.rs, tests/common (LogTail, spawn_rfw_logged), e2e_hot_reload (+2), README (override point 5, pinned) | G-HYG pass; G-U0.1 unit 60 passed incl. 6 new; e2e_hot_reload 8 passed; red: 2 e2e failed before fix | unit:0.1:1 |
 
 Commit references match the trailers PEV-Plan, PEV-Unit, PEV-Attempt and PEV-Result.
@@ -354,6 +355,7 @@ Research checkpoint: N/A (research complete; R1–R7 CONFIRMED).
 |-----------|---------|--------|--------------------------|---------------------|------|
 | G-BASE | `cargo test --all` | pass | 144 unit; e2e_forward 2, e2e_hot_reload 6, e2e_lifecycle 15, e2e_webhook 8 | c50db1f, clean | 2026-10-18 (planning) |
 | G-PERF-TCP-BASE | block G-PERF-TCP | pass | 2.26s, 2.28s, 2.27s → **median 2.27s** | c50db1f, clean (plan folder untracked) | 2026-10-18 |
+| G-PHASE (P0) | block G-PHASE | pass | HYG exit 0; debug and release: unit 150, e2e_forward 2, e2e_hot_reload 8, e2e_lifecycle 15, e2e_webhook 8. First debug run: `sigterm_drains_an_in_flight_transfer` failed once (ConnectionRefused right after `wait_port`), 5/5 isolated reruns and full debug rerun pass; test and helpers untouched by 0.1 → pre-existing flake (supervisor: likely loopback self-connect in `wait_port` on an ephemeral-range port) | 003e943 | 2026-10-18 |
 | G-XPLAT (planning dry-run on baseline) | block G-XPLAT | pass | `BUILD_EXIT=0`; `RUN_EXIT=0`: Windows GNU `cargo check --all-targets` and both Darwin `cargo zigbuild --release` finished; `Cargo.lock` untouched; only the gitignored `.intentionally-empty-file.o` was created. Re-run with the block copied verbatim from this file: `BUILD_EXIT=0`, `RUN_EXIT=0` | c50db1f, clean | 2026-10-18 12:51 and 12:56 (planning) |
 
 Results: pass, fail, blocked, not-run, not-applicable-yet. Only pass satisfies a required active gate. Keep the
@@ -361,6 +363,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| P0 phase review | agent-1:opus | rev 1; 003e943 | D20 behavior, 6 unit + 2 e2e tests, README point 5/pinned accurate vs log texts, no TCP data-path change | approve |
 | 0.1 post-diff | agent-1:opus | rev 1; base c50db1f + 0.1 working diff | D20 reload: settings + apply_cli_overrides then update_knobs; sync only when source File; pinned log text; startup log; no `{:?}` of CliArgs/ReloadPolicy in logs; README matches | approve |
 | Plan readiness (quality checklist) | agent-1:opus | rev 1, all plan files | checklist "Plan readiness"; see the readiness notes below | READY |
 | Cold read of 2.1 (most complex unit) | agent-1:opus (self, **not blind**) | phase_03.md 2.1 + STATE.md | first edit, expected result, oracle, reviewer, commit behavior, next step | no missing decision found |
@@ -384,6 +387,7 @@ Readiness notes:
 none
 
 ## 10. Do-not-repeat
+- Pre-existing flake (not plan-caused): `e2e_lifecycle::sigterm_drains_an_in_flight_transfer` can fail with ConnectionRefused after `wait_port` (1/7 runs at P0). Rerun once to confirm before treating as a regression; do not "fix" it inside an unrelated unit.
 - Local cross-compile for Windows GNU/Darwin without Docker fails (no mingw `x86_64-w64-mingw32-gcc` for ring, no
   macOS SDK). Use G-XPLAT in Docker. Do not install toolchains on the host.
 - `upstream.try_recv()`/`try_send()` on a fresh session socket loses the first datagram, and READABLE-only
@@ -415,7 +419,7 @@ README obligation per phase:
 ### Phases
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
-| 0 | phase_01.md | P0 | IN_PROGRESS | — |
+| 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | TODO | — |
 | 2 | phase_03.md | P2 | TODO | — |
 | 3 | phase_04.md | P3 | TODO | — |
