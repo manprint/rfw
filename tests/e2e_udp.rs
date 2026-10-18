@@ -535,6 +535,8 @@ async fn reference_scenario(extra_args: &[&str]) {
         metrics_addr.as_str(),
     ];
     args.extend_from_slice(extra_args);
+    // only the unix SIGTERM step below uses it
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
     let mut rfw = spawn_rfw(&args);
     wait_port(p).await;
     wait_port(m).await;
@@ -875,6 +877,7 @@ async fn udp_gro_gso_flag_preserves_datagrams_byte_exact() {
     .await;
 }
 
+#[cfg(target_os = "linux")]
 fn gro_yaml(local: u16, remote: u16, gro: bool) -> String {
     format!(
         "forwarders:\n  - {{local_host: \"127.0.0.1\", local_port: {local}, remote_host: \"127.0.0.1\", remote_port: {remote}, protocol: udp}}\nsettings:\n  udp_gro_gso: {gro}\n"

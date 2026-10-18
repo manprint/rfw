@@ -1633,8 +1633,10 @@ mod offload {
 mod tests {
     use super::*;
     use crate::config::{Protocol, Settings};
+    #[cfg(target_os = "linux")]
     use crate::testutil::{resolver_for, spawn_fake_dns};
     use std::collections::HashSet;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicU32, AtomicUsize};
     use std::sync::Mutex;
 
@@ -1762,6 +1764,7 @@ mod tests {
     }
 
     /// Backend answering `tag + payload`.
+    #[cfg(target_os = "linux")]
     fn spawn_udp_tagged_on(addr: SocketAddr, tag: &'static [u8]) -> io::Result<()> {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
