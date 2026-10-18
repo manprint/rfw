@@ -51,7 +51,7 @@ Download from the [releases page](https://github.com/manprint/rfw/releases).
 ### Docker
 
 ```bash
-docker pull ghcr.io/manprint/rfw:v1.0.6
+docker pull ghcr.io/manprint/rfw:v1.1.0
 docker compose up -d
 ```
 
@@ -60,7 +60,7 @@ Or run manually:
 ```bash
 docker run --rm -p 8080:8080 \
   -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
-  ghcr.io/manprint/rfw:v1.0.6 --log-dir ""
+  ghcr.io/manprint/rfw:v1.1.0 --log-dir ""
 ```
 
 For the "database behind a cloud DNS name on the host network" deployment, see
@@ -781,7 +781,7 @@ docker run --rm -p 8080:8080 \
 docker compose up -d
 ```
 
-In production pin a release tag (`ghcr.io/manprint/rfw:v1.0.6`) rather than
+In production pin a release tag (`ghcr.io/manprint/rfw:v1.1.0`) rather than
 `latest`, which moves on every release. Edit `docker-compose.yml` to configure
 your forwarders via env vars.
 
@@ -828,7 +828,7 @@ docker run -d \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RFW_INSTANCE_NAME=db-proxy-prod \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.0.6 \
+  ghcr.io/manprint/rfw:v1.1.0 \
     --log-dir "" \
     --max-connections 1000 \
     --metrics-addr 127.0.0.1:9090 \
@@ -863,7 +863,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.0.6
+    image: ghcr.io/manprint/rfw:v1.1.0
     container_name: rfw-db
     restart: always
     network_mode: host          # 0.0.0.0:5432 on the host, host DNS
@@ -950,7 +950,7 @@ docker run -d \
   -v /opt/rfw:/etc/rfw:ro \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.0.6 \
+  ghcr.io/manprint/rfw:v1.1.0 \
     -f /etc/rfw/forwarders.yml \
     --log-dir ""
 ```
@@ -958,7 +958,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.0.6
+    image: ghcr.io/manprint/rfw:v1.1.0
     container_name: rfw-db
     restart: always
     network_mode: host
