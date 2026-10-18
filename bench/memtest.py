@@ -17,6 +17,7 @@ honestly. Kernel + socket memory is reported separately where it is visible.
 import argparse
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -129,6 +130,7 @@ def t_ports(ctx, vcls, n):
 
 
 def hold(ctx, v, kind, n, hold_s, burst=0):
+    H.ct_wait()
     h, p = v.ep(ECHO_BASE, "udp" if kind == "udp" else "tcp")
     cmd = ["taskset", "-c", ctx.cpus_client, ctx.bench_bin, "udphold" if kind == "udp" else "hold", "--host", h, "--base", str(p),
            "--ports", str(ECHO_PORTS), "--flows" if kind == "udp" else "--conns", str(n), "--hold", str(hold_s)]
@@ -137,7 +139,9 @@ def hold(ctx, v, kind, n, hold_s, burst=0):
     pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
     ready = None
     t0 = time.time()
-    while time.time() - t0 < 300:
+    while time.time() - t0 < 120:
+        if not select.select([pr.stdout], [], [], 5)[0]:
+            continue
         line = pr.stdout.readline()
         if not line:
             break
@@ -159,7 +163,7 @@ def t_hold(ctx, vcls, kind, n, burst=0):
         pr, ready = hold(ctx, v, kind, n, 14, burst)
         if not ready:
             pr.kill()
-            raise RuntimeError("client never became ready")
+            raise RuntimeError(f"client never became ready within 120 s (forwarder stalled at N={n})")
         time.sleep(4)
         m1 = v.mem()
         info = proc_info(v)
@@ -196,10 +200,10 @@ def t_soak(ctx, vcls, seconds):
         errors = 0
         i = 0
         while time.time() - t0 < seconds:
-            r1 = R.bench(ctx, ["cps", "--host", h, "--base", p, "--ports", ECHO_PORTS, "--conns", 32, "--total", 8000])
+            r1 = R.bench(ctx, ["cps", "--host", h, "--base", p, "--ports", ECHO_PORTS, "--conns", 32, "--total", H.ct_clamp(8000)])
             r3 = R.bench(ctx, ["integrity", "--host", h, "--port", p, "--bytes", 32 << 20, "--conns", 2], timeout=120)
             errors += r1.get("errors", 0) + (0 if r3.get("ok") else 1)
-            time.sleep(1.0)  # TIME_WAIT bound: 8000 conns per ~2s spread over 32 ports
+            # conntrack/TIME_WAIT bound: R.bench waits for the table to drain (see harness ct_wait)
             m = v.mem()
             series.append({"t": round(time.time() - t0, 1), "anon_kb": m.get("anon_kb"), **proc_info(v)})
             i += 1

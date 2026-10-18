@@ -8,7 +8,7 @@ import argparse
 import json
 import os
 
-ORDER = ["rfw", "rfw-splice", "rfw-d-host", "rfw-d-mem128", "socat", "docker-proxy"]
+ORDER = ["rfw", "rfw-splice", "rfw-d-host", "rfw-d-compose", "socat", "docker-proxy"]
 
 
 def load(p):

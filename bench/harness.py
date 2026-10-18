@@ -45,6 +45,60 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
+# ------------------------------------------------------------ conntrack guard
+# Loopback and bridge connections are tracked by the host's netfilter. Every
+# closed connection lingers in TIME_WAIT for 120 s, so connection-churn tests can
+# fill the (host-wide) table, at which point the kernel drops *all* new flows,
+# including the workstation's own internet traffic. The harness therefore never
+# lets the table go above a small fraction of its size.
+CT_COUNT = "/proc/sys/net/netfilter/nf_conntrack_count"
+CT_MAX = "/proc/sys/net/netfilter/nf_conntrack_max"
+CT_IDLE_FRAC = 0.08   # start a scenario only when the table is below this fraction
+CT_BUDGET_FRAC = 0.12  # one scenario may add at most this fraction (entries = 2 per connection)
+
+
+def ct_max():
+    try:
+        return int(open(CT_MAX).read())
+    except (OSError, ValueError):
+        return None
+
+
+def ct_count():
+    try:
+        return int(open(CT_COUNT).read())
+    except (OSError, ValueError):
+        return None
+
+
+def ct_connections_budget():
+    """Most connections one churn scenario may open (two tracked legs each)."""
+    m = ct_max()
+    return None if m is None else int(m * CT_BUDGET_FRAC / 2)
+
+
+def ct_clamp(total):
+    b = ct_connections_budget()
+    return total if b is None else min(int(total), b)
+
+
+def ct_wait(frac=CT_IDLE_FRAC, timeout=240):
+    """Block until the conntrack table drained below `frac` of its size."""
+    m, t0, said = ct_max(), time.time(), False
+    if m is None:
+        return
+    while True:
+        c = ct_count()
+        if c is None or c <= m * frac:
+            return
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"conntrack table not draining ({c}/{m}); refusing to continue")
+        if not said:
+            print(f"   conntrack {c}/{m}: waiting for TIME_WAIT entries to expire", flush=True)
+            said = True
+        time.sleep(3)
+
+
 def sh(cmd, check=True, timeout=None, input=None, env=None):
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
@@ -667,6 +721,13 @@ class RfwDockerDefaultUlimit(RfwDocker):
     ulimit = None
 
 
+class RfwDockerCompose(RfwDocker):
+    name = "rfw-d-compose"
+    desc = "rfw image with the docker-compose.yml budget: 128 MiB memory limit, --max-connections 512"
+    docker_flags = ["--memory", "128m", "--memory-swap", "128m"]
+    extra = ["--max-connections", "512"]
+
+
 class RfwDockerReleased(RfwDocker):
     name = "rfw-d-v1.1.0"
     desc = "published ghcr.io/manprint/rfw:v1.1.0 image, host network"
@@ -681,7 +742,7 @@ class RfwDockerReleasedSplice(RfwDockerReleased):
 
 ALL_VARIANTS = [Direct, DockerNat, DockerProxy, Socat, SocatTuned, RfwNative, RfwSplice, RfwWorkers1, RfwWorkers4, RfwGro, RfwDocker,
                 RfwDockerSplice, RfwDockerUnconfined, RfwDockerPrivileged, RfwDockerSysRes, RfwDockerBridge,
-                RfwDockerDefaultUlimit, RfwDockerReleased, RfwDockerReleasedSplice]
+                RfwDockerDefaultUlimit, RfwDockerCompose, RfwDockerReleased, RfwDockerReleasedSplice]
 VARIANTS = {v.name: v for v in ALL_VARIANTS}
 
 

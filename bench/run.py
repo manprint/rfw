@@ -51,6 +51,7 @@ class Ctx:
 # ----------------------------------------------------------------- runners
 
 def bench(ctx, argv, timeout=300):
+    ct_wait()
     cmd = ["taskset", "-c", ctx.cpus_client, ctx.bench_bin, *[str(a) for a in argv]]
     r = sh(cmd, check=False, timeout=timeout)
     j = last_json(r.stdout)
@@ -62,6 +63,7 @@ def bench(ctx, argv, timeout=300):
 
 
 def dclient(ctx, image, args, entrypoint=None, env=None, timeout=300):
+    ct_wait()
     cmd = ["docker", "run", "--rm", "--network", "host", "--label", LABEL, "--cpuset-cpus", ctx.cpus_client]
     for k, v in (env or {}).items():
         cmd += ["-e", f"{k}={v}"]
@@ -125,7 +127,7 @@ def sc_cps(conns):
     def f(ctx, v, P):
         h, p = ep(v, ECHO_BASE)
         return bench(ctx, ["cps", "--host", h, "--base", p, "--ports", ECHO_PORTS, "--conns", conns,
-                           "--total", P["cps_total"]])
+                           "--total", ct_clamp(P["cps_total"])])
     return f
 
 
