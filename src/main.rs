@@ -138,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
     if forwarders.iter().any(|f| f.protocol == Protocol::Udp) {
         udp::ensure_fd_budget(settings.udp_max_sessions);
     }
+    #[cfg(not(target_os = "linux"))]
+    if settings.udp_gro_gso {
+        warn!("udp_gro_gso is only supported on Linux; ignored");
+    }
 
     // Create manager and start all forwarders
     let manager = Arc::new(manager::ForwarderManager::new(&settings, notifier.clone())?);

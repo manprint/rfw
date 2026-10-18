@@ -183,6 +183,11 @@ impl ForwarderStats {
         self.rejected_connections.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count `n` rejected connections (a rejected GRO burst carries `n` datagrams).
+    pub fn add_rejected(&self, n: u64) {
+        self.rejected_connections.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Record the address set the remote hostname currently resolves to.
     ///
     /// Order-insensitive. Returns the *previous* set when one existed and it

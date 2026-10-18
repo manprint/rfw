@@ -1,7 +1,7 @@
 # UDP Forwarding — Implementation state
 
 Read first at every session. Updated 2026-10-18 by agent-1:opus (planning session).
-Plan ID: 001_plan-UdpForwarding. Revision: 2. Repo root: /mnt/fabio/dati/Git/Github-manprint/rfw.
+Plan ID: 001_plan-UdpForwarding. Revision: 3. Repo root: /mnt/fabio/dati/Git/Github-manprint/rfw.
 Plan baseline: c50db1f (branch main).
 
 Pre-existing changes at baseline:
@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: P2 / 1) |
+| ID / attempt | — (last closed: 3.1 / 1) |
 | Status | none |
-| Intent | UDP documentation: README, forwarders.yml, example-config test |
-| Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
-| File / unit heading | 2.3 Documentazione UDP (README, forwarders.yml) |
+| Intent | offload module (GRO/GSO), engine wiring, udp_gro_gso setting/CLI/knob |
+| Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
+| File / unit heading | 3.1 Modulo offload, wiring nel motore, setting/knob/CLI |
 | Current step | none |
-| Next eligible plan unit | 3.1 |
-| Unit base | 165788d; branch: main; owned changes: README.md forwarders.yml src/config.rs (test only) |
-| Repo state | HEAD a483a58 |
+| Next eligible plan unit | 3.2 |
+| Unit base | 51e0bbb; branch: main; owned changes: src/udp.rs src/config.rs src/stats.rs src/main.rs |
+| Repo state | HEAD 51e0bbb |
 
-Next action: open 3.1: agent-1:opus pre-dispatch check of phase_04 skeletons (D7a applied to skeleton B), then agent-2:sonnet
+Next action: dispatch 3.2 to agent-2:sonnet (e2e GRO/GSO, udp_gso_bench, README per D32a)
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 3.1 / 1 | 3 | agent-2:sonnet (impl), agent-1:opus (review + D32a decision) | udp.rs (mod offload: set_gro/recv/send/send_chunks; ListenerOffload, apply_gro_knob, drain_listener_gro, on_client_buffer, forward_upstream_coalesced, drain_upstream_gro, reply_coalesced, Pending; 10 tests), config.rs (udp_gro_gso setting/CLI/knob + test), stats.rs (add_rejected), main.rs (non-Linux warn) | G-HYG pass; G-U3.1 73 passed incl. 10 new udp + config test; udp::tests 25 (15 pre-existing unchanged); new tests ×4; e2e_udp 12+1 ignored; red: gro_aware_receive_is_exact_after_gro_is_disabled failed on kernel 7.0 → rev 3 | unit:3.1:1 |
 | phase-close | P2 / 1 | 2 | agent-1:opus | STATE.md, tests/e2e_udp.rs (port race), README (Signals), Dockerfile (label) | G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH pass; review approve | unit:P2:1 |
 | sub-phase | 2.3 / 1 | 2 | agent-3:haiku (impl), agent-1:opus (review) | README (intro, features, syntax, YAML, env, CLI ref, hot-reload, How it works/UDP, UDP tuning, logging, traffic report, metrics, alerting, tests, structure), forwarders.yml (UDP entry + commented udp_* settings), config.rs (example test 4 forwarders, 1 UDP) | G-U2.3 1 passed; fmt + clippy exit 0 | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (D17 gate + test removed, about), Cargo.toml (description), stats.rs (UdpSample, IcmpKind as_str/from_u8), monitor.rs (udp_verdict, run_udp_monitor, probe_udp_target, shared record_up/down/report_dns_change/wait_for_tick), notify.rs (DnsChanged UDP text), main.rs ((udp) suffix, ensure_fd_budget, UDP startup probe line, TCP-only drain count), udp.rs (fd budget), tests/common (UDP harness), e2e_lifecycle (-1 gate test), e2e_webhook (+2), e2e_udp (new, 12 + ignored bench) | G-HYG pass; G-U2.2 GATE_EXIT=0: unit 123 incl. 7 new; e2e_udp 12+1 ignored (×5); e2e_webhook 10; e2e_lifecycle 16; git grep exit 1 | unit:2.2:1 |
@@ -375,6 +376,8 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 3.1 post-diff | agent-1:opus | rev 3; working tree on 51e0bbb | 9 unsafe blocks (cmsg CMSG_SPACE/CMSG_LEN(2) u16, int GRO read unaligned, aligned CmsgBuf, try_init storage, live local pointers); D32a: no production set_gro(false); D7a single-flag try_io; I-4 listener sync; default path dispatch on gro_aware/gro only | approve |
+| 3.1 pre-dispatch | agent-1:opus | rev 2; 51e0bbb | skeleton B vs HEAD udp.rs: REPLY_BUF, Gates, open_session, forward_upstream, drain_upstream, SessionDrain::Blocked(Vec<u8>), inc_rejected; D7a already in drain_upstream_gro; offload::recv(.., want_from) | approve dispatch |
 | 2.3 post-diff | agent-1:opus | rev 2; working tree on 165788d | README claims vs udp.rs constants (batch 64, sweep/DNS 1 s, grace 2 s, fd headroom 256, rmem_max warn), notify THROTTLE_LIMIT 5 min (correct vs D16 local 60 s spacing), ICMP quiet 3 s | approve |
 | 2.2 post-diff | agent-1:opus | rev 2; working tree on f13caed | udp_verdict vs truth table (D14), gate fully removed, fd budget (unix + non-unix stub), Stopping drain TCP-only, deviations: wait_for_tick extraction, clippy allow for rlim_t casts, test-helper drain; Dockerfile/README wording left to 2.3 | approve |
 | 2.1 post-diff | agent-1:opus | rev 2; working tree on 447101a | I-4 listener path sync, I-6 tasks.wait grace, I-14 raw send, thread-local buf never across await, log levels; worker escalation on R3 verified in tokio source | approve (after D7a fix) |
@@ -402,6 +405,7 @@ Readiness notes:
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
 | 2 | D7 / R3: session read via `try_io(READABLE \| ERROR, raw read)` | D7a: `recv_upstream` = `try_io(READABLE)` then, on WouldBlock, `try_io(ERROR)`. tokio 1.53.1 `Interest::mask()` maps combined interests to `Ready::EMPTY`, so the combined try_io never ran its closure and the session task spun at 100 % CPU (found by agent-2 in 2.1, confirmed in tokio source). | agent-1:opus | 2.1 code fixed by supervisor, G-U2.1 green ×6; phase_04 skeleton B line updated (3.1); overview D7a/R3, phase_03 D7/R3/troubleshooting updated |
+| 3 | D32: on knob off, `set_gro(false)` on the listener with GRO-aware receives kept | D32a: never clear UDP_GRO once set; knob off only stops UDP_GRO on new sessions; listener keeps it until restart (log text keeps the prefix `UDP GRO/GSO disabled on the listener`); non-ENOPROTOOPT set_gro error latches with one warn. Kernel 7.0 attaches the UDP_GRO cmsg at read time, so a burst queued before `set_gro(false)` is delivered merged with segment 0 (agent-2 evidence in 3.1). | agent-1:opus | 3.1 skeleton B apply_gro_knob/ListenerOffload/open_session gro, test `gro_aware_receive_is_exact_after_gro_is_disabled` → `disabling_udp_gro_leaves_queued_bursts_merged`; 3.2 tests unchanged (`gro_toggle_never_merges_datagrams` must still hold); README in 3.2 must state that disabling takes full effect on the listener at restart |
 
 ## 9. Blockers
 none
@@ -428,7 +432,7 @@ none
 | 2.1 | phase_03.md | P1 | DONE | 1 | G-U2.1 pass; review agent-1:opus |
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | G-U2.2 pass; review agent-1:opus |
 | 2.3 | phase_03.md | 2.2 | DONE | 1 | G-U2.3 pass; review agent-1:opus |
-| 3.1 | phase_04.md | P2 | TODO | 1 | — |
+| 3.1 | phase_04.md | P2 | DONE | 1 | G-U3.1 pass; review agent-1:opus |
 | 3.2 | phase_04.md | 3.1 | TODO | 1 | — |
 
 README obligation per phase:
@@ -446,7 +450,7 @@ README obligation per phase:
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | DONE | review agent-1:opus; unit:P1:1 |
 | 2 | phase_03.md | P2 | DONE | review agent-1:opus; unit:P2:1 |
-| 3 | phase_04.md | P3 | TODO | — |
+| 3 | phase_04.md | P3 | IN_PROGRESS | — |
 
 Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED. SKIPPED keeps a reason and does not
 automatically satisfy dependent units.
@@ -521,17 +525,17 @@ automatically satisfy dependent units.
 | e2e_webhook `startup_reports_udp_targets_as_resolved` | 2.2 | G-U2.2 | pass | 2.2/1 |
 | e2e_webhook `udp_outage_is_alerted_and_recovery_reported` | 2.2 | G-U2.2 | pass | 2.2/1 |
 | `config::tests::shipped_example_config_parses_and_validates` (updated) | 2.3 | G-U2.3 | pass | 2.3/1 |
-| `udp::tests::offload_gso_send_arrives_coalesced_at_a_gro_socket` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_gso_send_is_split_for_a_socket_without_gro` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_tail_segment_is_kept` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_zero_length_datagram_round_trips` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_segments_and_chunk_bytes_math` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_send_chunks_stops_at_the_first_error_with_its_offset` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::offload_gso_rejection_is_a_fallback_error` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::gro_aware_receive_is_exact_after_gro_is_disabled` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::reply_coalesced_falls_back_once_and_delivers_everything` | 3.1 | G-U3.1 | TODO | — |
-| `udp::tests::forward_upstream_coalesced_falls_back_and_counts` | 3.1 | G-U3.1 | TODO | — |
-| `config::tests::udp_gro_gso_setting_cli_and_knob` | 3.1 | G-U3.1 | TODO | — |
+| `udp::tests::offload_gso_send_arrives_coalesced_at_a_gro_socket` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_gso_send_is_split_for_a_socket_without_gro` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_tail_segment_is_kept` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_zero_length_datagram_round_trips` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_segments_and_chunk_bytes_math` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_send_chunks_stops_at_the_first_error_with_its_offset` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::offload_gso_rejection_is_a_fallback_error` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::disabling_udp_gro_leaves_queued_bursts_merged` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::reply_coalesced_falls_back_once_and_delivers_everything` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `udp::tests::forward_upstream_coalesced_falls_back_and_counts` | 3.1 | G-U3.1 | pass | 3.1/1 |
+| `config::tests::udp_gro_gso_setting_cli_and_knob` | 3.1 | G-U3.1 | pass | 3.1/1 |
 | `udp::tests::gro_gso_path_preserves_datagram_boundaries` | 3.2 | G-U3.2 | TODO | — |
 | `udp::tests::gro_toggle_never_merges_datagrams` | 3.2 | G-U3.2 | TODO | — |
 | `udp::tests::coalesced_burst_from_a_refused_client_counts_every_datagram` | 3.2 | G-U3.2 | TODO | — |

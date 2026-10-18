@@ -11,6 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +55,19 @@ thread_local! {
     /// Per-worker-thread reply buffer: sessions share it instead of each
     /// holding 64 KiB. Never borrowed across an `.await`.
     static REPLY_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0_u8; UDP_BUF_BYTES]);
+}
+
+/// Listener receive buffer: room for a GRO-coalesced burst on Linux.
+#[cfg(target_os = "linux")]
+const LISTENER_BUF_BYTES: usize = offload::GRO_BUF_BYTES;
+#[cfg(not(target_os = "linux"))]
+const LISTENER_BUF_BYTES: usize = UDP_BUF_BYTES;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Reply buffer for sessions whose upstream socket has UDP_GRO (lazily
+    /// allocated on first use by each worker thread).
+    static GRO_REPLY_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0_u8; offload::GRO_BUF_BYTES]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +117,10 @@ struct Gates {
     no_target: LogGate,
     open_failed: LogGate,
     recv_failed: LogGate,
+    #[cfg(target_os = "linux")]
+    gso_fallback: LogGate,
+    #[cfg(target_os = "linux")]
+    gro_trunc: LogGate,
 }
 
 /// Counters accumulated over one batch, flushed with one atomic add each.
@@ -127,6 +146,12 @@ struct SessionShared {
     /// as long as the upstream socket exists.
     _guard: ConnGuard,
     _permit: OwnedSemaphorePermit,
+    /// UDP_GRO is set on `upstream`: every receive must parse cmsgs (D32).
+    #[cfg(target_os = "linux")]
+    gro: bool,
+    /// Shared with the listener: replies may still use GSO (D35).
+    #[cfg(target_os = "linux")]
+    listener_gso: Arc<AtomicBool>,
 }
 
 impl SessionShared {
@@ -145,6 +170,9 @@ struct SessionEntry {
     opened: Instant,
     /// Client -> target datagrams forwarded (close log only).
     tx_datagrams: u64,
+    /// Client -> target sends may still use GSO on this session (D35).
+    #[cfg(target_os = "linux")]
+    gso_ok: bool,
 }
 
 fn close_entry(label: &str, e: &SessionEntry, reason: &'static str) {
@@ -315,8 +343,16 @@ pub async fn run_udp_forwarder(
         sessions: HashMap::new(),
         gates: Gates::default(),
         last_limit_alert: None,
+        #[cfg(target_os = "linux")]
+        off: ListenerOffload {
+            gro_set: false,
+            enabled: false,
+            gro_aware: false,
+            unsupported: false,
+            gso_ok: Arc::new(AtomicBool::new(true)),
+        },
     };
-    let mut buf = vec![0_u8; UDP_BUF_BYTES];
+    let mut buf = vec![0_u8; LISTENER_BUF_BYTES];
     engine.run(&mut buf).await;
     engine.close_all("shutdown");
     drop(engine);
@@ -340,6 +376,20 @@ enum ListenerDrain {
     Failed,
 }
 
+#[cfg(target_os = "linux")]
+struct ListenerOffload {
+    /// UDP_GRO is set on the listener socket. Only ever goes true (D32a).
+    gro_set: bool,
+    /// The knob state last applied (new sessions get UDP_GRO only while true).
+    enabled: bool,
+    /// Receives parse GRO cmsgs. Sticky (D32).
+    gro_aware: bool,
+    /// The kernel refused UDP_GRO (D37).
+    unsupported: bool,
+    /// Replies may use GSO; cleared for good on the first rejection.
+    gso_ok: Arc<AtomicBool>,
+}
+
 struct Engine {
     label: Arc<str>,
     socket: Arc<UdpSocket>,
@@ -354,6 +404,8 @@ struct Engine {
     sessions: HashMap<SocketAddr, SessionEntry>,
     gates: Gates,
     last_limit_alert: Option<Instant>,
+    #[cfg(target_os = "linux")]
+    off: ListenerOffload,
 }
 
 impl Engine {
@@ -361,25 +413,41 @@ impl Engine {
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         sweep.tick().await; // the first tick is immediate
+        #[cfg(target_os = "linux")]
+        self.apply_gro_knob();
         loop {
             // `select!` drops every branch future before running the chosen
             // handler, so handlers may borrow `self` mutably.
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return,
-                _ = sweep.tick() => self.sweep(),
+                _ = sweep.tick() => {
+                    self.sweep();
+                    #[cfg(target_os = "linux")]
+                    self.apply_gro_knob();
+                }
                 changed = self.targets.changed(), if self.dns_watch => match changed {
                     Ok(()) => self.on_targets_changed(),
                     Err(_) => self.dns_watch = false, // refresher gone (shutdown)
                 },
                 ready = self.socket.readable() => match ready {
-                    Ok(()) => match self.drain_listener(buf) {
-                        ListenerDrain::Idle => {}
-                        ListenerDrain::Full => tokio::task::yield_now().await,
-                        ListenerDrain::Failed => {
-                            if cancelled(&self.cancel, RECV_ERROR_BACKOFF).await { return; }
+                    Ok(()) => {
+                        #[cfg(target_os = "linux")]
+                        let drained = if self.off.gro_aware {
+                            self.drain_listener_gro(buf)
+                        } else {
+                            self.drain_listener(buf)
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let drained = self.drain_listener(buf);
+                        match drained {
+                            ListenerDrain::Idle => {}
+                            ListenerDrain::Full => tokio::task::yield_now().await,
+                            ListenerDrain::Failed => {
+                                if cancelled(&self.cancel, RECV_ERROR_BACKOFF).await { return; }
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         if let Some(s) = self.gates.recv_failed.check(DROP_LOG_SPACING) {
                             warn!(forwarder = %self.label, error = %e, suppressed = s, "UDP listener readiness failed");
@@ -448,7 +516,7 @@ impl Engine {
         if let Some(dead) = self.sessions.remove(&client) {
             close_entry(&self.label, &dead, "upstream error");
         }
-        if let Some(entry) = self.open_session(client, now_ms, batch) {
+        if let Some(entry) = self.open_session(client, now_ms, batch, 1) {
             let entry = self.sessions.entry(client).or_insert(entry);
             forward_upstream(
                 entry,
@@ -468,11 +536,12 @@ impl Engine {
         client: SocketAddr,
         now_ms: u64,
         batch: &mut Batch,
+        datagrams: u64,
     ) -> Option<SessionEntry> {
         // Separate statement: the watch read guard drops here, not after the else block.
         let first = self.targets.borrow().first().copied();
         let Some(remote) = first else {
-            batch.dropped += 1;
+            batch.dropped += datagrams;
             self.stats.mark_connect_failed();
             if let Some(s) = self.gates.no_target.check(DROP_LOG_SPACING) {
                 warn!(forwarder = %self.label, suppressed = s, "UDP target not resolved yet; datagram dropped");
@@ -482,8 +551,8 @@ impl Engine {
         let permit = match self.udp_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                batch.dropped += 1;
-                self.stats.inc_rejected();
+                batch.dropped += datagrams;
+                self.stats.add_rejected(datagrams);
                 debug!(forwarder = %self.label, client = %client, "UDP session rejected: udp_max_sessions reached");
                 if self
                     .last_limit_alert
@@ -502,7 +571,7 @@ impl Engine {
         let upstream = match connect_upstream(remote, self.knobs.socket_buffer_bytes()) {
             Ok(s) => s,
             Err(e) => {
-                batch.dropped += 1;
+                batch.dropped += datagrams;
                 self.stats.mark_connect_failed();
                 if let Some(s) = self.gates.open_failed.check(DROP_LOG_SPACING) {
                     if is_fd_exhaustion(&e) {
@@ -516,6 +585,17 @@ impl Engine {
                 return None; // `permit` drops here: the slot is released
             }
         };
+        #[cfg(target_os = "linux")]
+        let gro = self.off.enabled
+            && match offload::set_gro(upstream.as_raw_fd(), true) {
+                Ok(()) => true,
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::ENOPROTOOPT) {
+                        self.mark_gro_unsupported();
+                    }
+                    false
+                }
+            };
         let local = upstream.local_addr().ok();
         let shared = Arc::new(SessionShared {
             client,
@@ -526,6 +606,10 @@ impl Engine {
             rx_datagrams: AtomicU64::new(0),
             _guard: ConnGuard::new(self.stats.clone()),
             _permit: permit,
+            #[cfg(target_os = "linux")]
+            gro,
+            #[cfg(target_os = "linux")]
+            listener_gso: self.off.gso_ok.clone(),
         });
         let cancel = self.cancel.child_token();
         self.tasks.spawn(run_session(
@@ -541,6 +625,8 @@ impl Engine {
             cancel,
             opened: Instant::now(),
             tx_datagrams: 0,
+            #[cfg(target_os = "linux")]
+            gso_ok: true,
         })
     }
 
@@ -597,6 +683,142 @@ impl Engine {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Engine {
+    // D32a: UDP_GRO is never cleared from a socket. `enabled` is the knob state
+    // last applied; `gro_set` is the socket state and only goes true.
+    fn apply_gro_knob(&mut self) {
+        let want = self.knobs.udp_gro_gso() && !self.off.unsupported;
+        if want == self.off.enabled {
+            return;
+        }
+        if !want {
+            self.off.enabled = false;
+            info!(forwarder = %self.label, "UDP GRO/GSO disabled on the listener for new sessions (UDP_GRO stays set on the listener socket until restart)");
+            return;
+        }
+        if !self.off.gro_set {
+            self.off.gro_aware = true; // before the sockopt: never read a burst with a plain recv
+            match offload::set_gro(self.socket.as_raw_fd(), true) {
+                Ok(()) => self.off.gro_set = true,
+                Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+                    return self.mark_gro_unsupported();
+                }
+                Err(e) => {
+                    // latch: one warn, no retry every sweep
+                    self.off.unsupported = true;
+                    warn!(forwarder = %self.label, error = %e, "Setting UDP_GRO on the listener failed; udp_gro_gso has no effect on this forwarder until restart");
+                    return;
+                }
+            }
+        }
+        self.off.enabled = true;
+        info!(forwarder = %self.label, "UDP GRO/GSO enabled on the listener");
+    }
+
+    fn mark_gro_unsupported(&mut self) {
+        if !self.off.unsupported {
+            self.off.unsupported = true;
+            warn!(forwarder = %self.label, "UDP GRO is not supported by this kernel (Linux 5.0+ required); udp_gro_gso has no effect");
+        }
+    }
+
+    /// `drain_listener` with GRO-aware receives (D32).
+    fn drain_listener_gro(&mut self, buf: &mut [u8]) -> ListenerDrain {
+        let now_ms = self.stats.now_ms();
+        let fd = self.socket.as_raw_fd();
+        let mut batch = Batch::default();
+        let mut outcome = ListenerDrain::Full;
+        for _ in 0..LISTENER_BATCH {
+            match self
+                .socket
+                .try_io(Interest::READABLE, || offload::recv(fd, buf, true))
+            {
+                Ok(r) => {
+                    let Some(client) = r.from else { continue };
+                    if r.truncated {
+                        batch.dropped += offload::segments(r.len, r.segment);
+                        if let Some(s) = self.gates.gro_trunc.check(DROP_LOG_SPACING) {
+                            warn!(forwarder = %self.label, client = %client, suppressed = s,
+                                "UDP GRO burst larger than the receive buffer; datagrams dropped");
+                        }
+                        continue;
+                    }
+                    self.on_client_buffer(client, &buf[..r.len], r.segment, now_ms, &mut batch);
+                }
+                Err(e) => match classify_udp_err(&e) {
+                    UdpErr::WouldBlock => {
+                        outcome = ListenerDrain::Idle;
+                        break;
+                    }
+                    UdpErr::Transient | UdpErr::Icmp(_) => {}
+                    UdpErr::Fatal => {
+                        if let Some(s) = self.gates.recv_failed.check(DROP_LOG_SPACING) {
+                            warn!(forwarder = %self.label, error = %e, suppressed = s, "UDP listener receive failed");
+                        }
+                        outcome = ListenerDrain::Failed;
+                        break;
+                    }
+                },
+            }
+        }
+        if batch.datagrams > 0 {
+            self.stats.add_sent(batch.bytes);
+            self.stats.add_datagrams_sent(batch.datagrams);
+        }
+        if batch.dropped > 0 {
+            self.stats.add_datagrams_dropped(batch.dropped);
+        }
+        outcome
+    }
+
+    /// `on_client_datagram` for a buffer that may be a GRO burst.
+    fn on_client_buffer(
+        &mut self,
+        client: SocketAddr,
+        data: &[u8],
+        segment: usize,
+        now_ms: u64,
+        batch: &mut Batch,
+    ) {
+        if !offload::is_coalesced(data.len(), segment) {
+            return self.on_client_datagram(client, data, now_ms, batch);
+        }
+        if let Some(entry) = self.sessions.get_mut(&client) {
+            if !entry.shared.dead.load(Ordering::Relaxed) {
+                forward_upstream_coalesced(
+                    entry,
+                    data,
+                    segment,
+                    now_ms,
+                    batch,
+                    &self.stats,
+                    &mut self.gates,
+                    &self.label,
+                );
+                return;
+            }
+        }
+        if let Some(dead) = self.sessions.remove(&client) {
+            close_entry(&self.label, &dead, "upstream error");
+        }
+        let n = offload::segments(data.len(), segment);
+        if let Some(entry) = self.open_session(client, now_ms, batch, n) {
+            let entry = self.sessions.entry(client).or_insert(entry);
+            forward_upstream_coalesced(
+                entry,
+                data,
+                segment,
+                now_ms,
+                batch,
+                &self.stats,
+                &mut self.gates,
+                &self.label,
+            );
+        }
+    }
+}
+
 /// Client -> target for one datagram. Never awaits (I-4); the raw send also
 /// works on a socket registered a moment ago (I-14).
 fn forward_upstream(
@@ -618,31 +840,118 @@ fn forward_upstream(
         }
         Err(e) => {
             batch.dropped += 1;
-            match classify_udp_err(&e) {
-                UdpErr::WouldBlock => {
-                    if let Some(s) = gate.check(DROP_LOG_SPACING) {
-                        warn!(forwarder = %label, client = %shared.client, suppressed = s,
-                            "UDP upstream send buffer full; datagram dropped (consider socket_buffer_bytes)");
-                    }
+            note_upstream_send_error(&e, shared, now_ms, stats, gate, label);
+        }
+    }
+}
+
+/// Log and account for a failed upstream send (the caller counts the drop).
+fn note_upstream_send_error(
+    e: &io::Error,
+    shared: &SessionShared,
+    now_ms: u64,
+    stats: &ForwarderStats,
+    gate: &mut LogGate,
+    label: &str,
+) {
+    match classify_udp_err(e) {
+        UdpErr::WouldBlock => {
+            if let Some(s) = gate.check(DROP_LOG_SPACING) {
+                warn!(forwarder = %label, client = %shared.client, suppressed = s,
+                    "UDP upstream send buffer full; datagram dropped (consider socket_buffer_bytes)");
+            }
+        }
+        UdpErr::Icmp(kind) => {
+            stats.mark_udp_icmp_error(now_ms, kind);
+            debug!(forwarder = %label, client = %shared.client, remote = %shared.remote, error = %e,
+                "UDP send reported an ICMP error from the target; datagram dropped");
+        }
+        UdpErr::Transient | UdpErr::Fatal => {
+            debug!(forwarder = %label, client = %shared.client, error = %e,
+                "UDP upstream send failed; datagram dropped");
+        }
+    }
+}
+
+/// Client -> target for a GRO burst. Synchronous (I-4); raw sends (I-14).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn forward_upstream_coalesced(
+    entry: &mut SessionEntry,
+    data: &[u8],
+    segment: usize,
+    now_ms: u64,
+    batch: &mut Batch,
+    stats: &ForwarderStats,
+    gates: &mut Gates,
+    label: &str,
+) {
+    let total = offload::segments(data.len(), segment);
+    let mut from = 0;
+    if entry.gso_ok {
+        let fd = entry.shared.upstream.as_raw_fd();
+        match offload::send_chunks(data, segment, |chunk, seg| {
+            offload::send(fd, chunk, seg, None)
+        }) {
+            offload::GsoSend::Sent => {
+                entry.tx_datagrams += total;
+                batch.datagrams += total;
+                batch.bytes += data.len() as u64;
+                entry.shared.touch(now_ms);
+                return;
+            }
+            offload::GsoSend::Stopped { from: f, error } => {
+                let sent = (f / segment) as u64;
+                entry.tx_datagrams += sent;
+                batch.datagrams += sent;
+                batch.bytes += f as u64;
+                if sent > 0 {
+                    entry.shared.touch(now_ms);
                 }
-                UdpErr::Icmp(kind) => {
-                    stats.mark_udp_icmp_error(now_ms, kind);
-                    debug!(forwarder = %label, client = %shared.client, remote = %shared.remote, error = %e,
-                        "UDP send reported an ICMP error from the target; datagram dropped");
+                if !offload::is_fallback_error(&error) {
+                    batch.dropped += total - sent;
+                    note_upstream_send_error(
+                        &error,
+                        &entry.shared,
+                        now_ms,
+                        stats,
+                        &mut gates.send_full,
+                        label,
+                    );
+                    return;
                 }
-                UdpErr::Transient | UdpErr::Fatal => {
-                    debug!(forwarder = %label, client = %shared.client, error = %e,
-                        "UDP upstream send failed; datagram dropped");
+                entry.gso_ok = false;
+                if let Some(s) = gates.gso_fallback.check(DROP_LOG_SPACING) {
+                    warn!(forwarder = %label, client = %entry.shared.client, error = %error, suppressed = s,
+                        "UDP GSO rejected by the kernel for a session; it now sends one datagram at a time");
                 }
+                from = f;
             }
         }
     }
+    for piece in data[from..].chunks(segment) {
+        forward_upstream(
+            entry,
+            piece,
+            now_ms,
+            batch,
+            stats,
+            &mut gates.send_full,
+            label,
+        );
+    }
+}
+
+/// A reply the listener could not take yet. `segment > 0` = coalesced (D31).
+struct Pending {
+    data: Vec<u8>,
+    segment: usize,
 }
 
 enum SessionDrain {
     Idle,
     Full,
-    Blocked(Vec<u8>),
+    Blocked(Pending),
     Dead,
 }
 
@@ -664,25 +973,40 @@ async fn run_session(
             debug!(forwarder = %label, client = %shared.client, error = %e, "UDP session readiness failed; session marked dead");
             return;
         }
-        match drain_upstream(&shared, &listener, &stats, &label) {
+        #[cfg(target_os = "linux")]
+        let drained = if shared.gro {
+            drain_upstream_gro(&shared, &listener, &stats, &label)
+        } else {
+            drain_upstream(&shared, &listener, &stats, &label)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let drained = drain_upstream(&shared, &listener, &stats, &label);
+        match drained {
             SessionDrain::Idle => {}
             SessionDrain::Full => tokio::task::yield_now().await,
             SessionDrain::Dead => return,
-            SessionDrain::Blocked(pending) => {
-                let sent = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    r = listener.send_to(&pending, shared.client) => r,
+            SessionDrain::Blocked(p) => {
+                let pieces: Vec<&[u8]> = if p.segment > 0 && p.segment < p.data.len() {
+                    p.data.chunks(p.segment).collect()
+                } else {
+                    vec![&p.data[..]]
                 };
-                match sent {
-                    Ok(_) => {
-                        shared.rx_datagrams.fetch_add(1, Ordering::Relaxed);
-                        stats.add_received(pending.len() as u64);
-                        stats.add_datagrams_received(1);
-                    }
-                    Err(e) => {
-                        stats.add_datagrams_dropped(1);
-                        debug!(forwarder = %label, client = %shared.client, error = %e, "UDP reply send failed; datagram dropped");
+                for piece in pieces {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        r = listener.send_to(piece, shared.client) => r,
+                    };
+                    match sent {
+                        Ok(_) => {
+                            shared.rx_datagrams.fetch_add(1, Ordering::Relaxed);
+                            stats.add_received(piece.len() as u64);
+                            stats.add_datagrams_received(1);
+                        }
+                        Err(e) => {
+                            stats.add_datagrams_dropped(1);
+                            debug!(forwarder = %label, client = %shared.client, error = %e, "UDP reply send failed; datagram dropped");
+                        }
                     }
                 }
             }
@@ -731,7 +1055,10 @@ fn drain_upstream(
                     match listener.try_send_to(&buf[..n], shared.client) {
                         Ok(_) => { batch.datagrams += 1; batch.bytes += n as u64; }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            outcome = SessionDrain::Blocked(buf[..n].to_vec());
+                            outcome = SessionDrain::Blocked(Pending {
+                                data: buf[..n].to_vec(),
+                                segment: 0,
+                            });
                             break;
                         }
                         Err(e) => {
@@ -772,6 +1099,188 @@ fn drain_upstream(
         }
         outcome
     })
+}
+
+/// `drain_upstream` for a session whose upstream socket has UDP_GRO (D32).
+#[cfg(target_os = "linux")]
+fn drain_upstream_gro(
+    shared: &SessionShared,
+    listener: &UdpSocket,
+    stats: &ForwarderStats,
+    label: &str,
+) -> SessionDrain {
+    GRO_REPLY_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let now_ms = stats.now_ms();
+        let fd = shared.upstream.as_raw_fd();
+        let to = socket2::SockAddr::from(shared.client);
+        let mut batch = Batch::default();
+        let mut replied = false;
+        let mut outcome = SessionDrain::Full;
+        for _ in 0..SESSION_BATCH {
+            // D7a: single-flag interests only; READABLE first, ERROR on WouldBlock.
+            let res = match shared
+                .upstream
+                .try_io(Interest::READABLE, || offload::recv(fd, &mut buf[..], false))
+            {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => shared
+                    .upstream
+                    .try_io(Interest::ERROR, || offload::recv(fd, &mut buf[..], false)),
+                res => res,
+            };
+            match res {
+                Ok(r) => {
+                    replied = true;
+                    if r.truncated {
+                        batch.dropped += offload::segments(r.len, r.segment);
+                        debug!(forwarder = %label, client = %shared.client, "UDP GRO reply larger than the buffer; datagrams dropped");
+                        continue;
+                    }
+                    let data = &buf[..r.len];
+                    if !offload::is_coalesced(r.len, r.segment) {
+                        match listener.try_send_to(data, shared.client) {
+                            Ok(_) => {
+                                batch.datagrams += 1;
+                                batch.bytes += r.len as u64;
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                outcome = SessionDrain::Blocked(Pending {
+                                    data: data.to_vec(),
+                                    segment: 0,
+                                });
+                                break;
+                            }
+                            Err(e) => {
+                                batch.dropped += 1;
+                                debug!(forwarder = %label, client = %shared.client, error = %e, "UDP reply send failed; datagram dropped");
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(p) = reply_coalesced(
+                        listener,
+                        &to,
+                        shared.client,
+                        data,
+                        r.segment,
+                        &shared.listener_gso,
+                        &mut batch,
+                        label,
+                    ) {
+                        outcome = SessionDrain::Blocked(p);
+                        break;
+                    }
+                }
+                Err(e) => match classify_udp_err(&e) {
+                    UdpErr::WouldBlock => {
+                        outcome = SessionDrain::Idle;
+                        break;
+                    }
+                    UdpErr::Transient => {}
+                    UdpErr::Icmp(kind) => {
+                        stats.mark_udp_icmp_error(now_ms, kind);
+                        debug!(forwarder = %label, client = %shared.client, remote = %shared.remote, error = %e,
+                            "UDP target answered with an ICMP error");
+                    }
+                    UdpErr::Fatal => {
+                        shared.dead.store(true, Ordering::Relaxed);
+                        debug!(forwarder = %label, client = %shared.client, error = %e,
+                            "UDP upstream receive failed; session marked dead");
+                        outcome = SessionDrain::Dead;
+                        break;
+                    }
+                },
+            }
+        }
+        if replied {
+            shared.touch(now_ms);
+            stats.mark_connect_ok_at(now_ms);
+        }
+        if batch.datagrams > 0 {
+            shared.rx_datagrams.fetch_add(batch.datagrams, Ordering::Relaxed);
+            stats.add_received(batch.bytes);
+            stats.add_datagrams_received(batch.datagrams);
+        }
+        if batch.dropped > 0 {
+            stats.add_datagrams_dropped(batch.dropped);
+        }
+        outcome
+    })
+}
+
+/// Target -> client for a GRO burst: GSO through the listener, or one
+/// datagram at a time once the listener's GSO was rejected. Returns the
+/// unsent tail when the listener's send buffer is full.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn reply_coalesced(
+    listener: &UdpSocket,
+    to: &socket2::SockAddr,
+    client: SocketAddr,
+    data: &[u8],
+    segment: usize,
+    gso_ok: &AtomicBool,
+    batch: &mut Batch,
+    label: &str,
+) -> Option<Pending> {
+    let mut from = 0;
+    if gso_ok.load(Ordering::Relaxed) {
+        let fd = listener.as_raw_fd();
+        let r = offload::send_chunks(data, segment, |chunk, seg| {
+            listener.try_io(Interest::WRITABLE, || {
+                offload::send(fd, chunk, seg, Some(to))
+            })
+        });
+        match r {
+            offload::GsoSend::Sent => {
+                batch.datagrams += offload::segments(data.len(), segment);
+                batch.bytes += data.len() as u64;
+                return None;
+            }
+            offload::GsoSend::Stopped { from: f, error } => {
+                batch.datagrams += (f / segment) as u64;
+                batch.bytes += f as u64;
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Some(Pending {
+                        data: data[f..].to_vec(),
+                        segment,
+                    });
+                }
+                if !offload::is_fallback_error(&error) {
+                    batch.dropped += offload::segments(data.len() - f, segment);
+                    debug!(forwarder = %label, client = %client, error = %error, "UDP reply send failed; datagrams dropped");
+                    return None;
+                }
+                if gso_ok.swap(false, Ordering::Relaxed) {
+                    warn!(forwarder = %label, error = %error,
+                        "UDP GSO rejected by the kernel on the listener; replies now go one datagram at a time");
+                }
+                from = f;
+            }
+        }
+    }
+    let rest = &data[from..];
+    let mut off = 0;
+    for piece in rest.chunks(segment) {
+        match listener.try_send_to(piece, client) {
+            Ok(_) => {
+                batch.datagrams += 1;
+                batch.bytes += piece.len() as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Some(Pending {
+                    data: rest[off..].to_vec(),
+                    segment,
+                });
+            }
+            Err(e) => {
+                batch.dropped += 1;
+                debug!(forwarder = %label, client = %client, error = %e, "UDP reply send failed; datagram dropped");
+            }
+        }
+        off += piece.len();
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -902,6 +1411,223 @@ pub(crate) fn ensure_fd_budget(udp_max_sessions: usize) {
 
 #[cfg(not(unix))]
 pub(crate) fn ensure_fd_budget(_udp_max_sessions: usize) {}
+
+/// Linux UDP segmentation offload: GRO on receive, GSO on send.
+#[cfg(target_os = "linux")]
+mod offload {
+    use std::io;
+    use std::mem;
+    use std::net::SocketAddr;
+    use std::os::fd::RawFd;
+    use std::ptr;
+
+    /// Most segments per GSO send (64 on older kernels, 128 on newer ones).
+    pub(super) const MAX_GSO_SEGMENTS: usize = 64;
+    /// Largest UDP payload one send may carry (the IPv4 bound; IPv6 allows 65527).
+    pub(super) const GSO_MAX_PAYLOAD: usize = 65_507;
+    /// Receive buffer when GRO may coalesce (64 x 1472 = 94 208, plus headroom).
+    pub(super) const GRO_BUF_BYTES: usize = 128 * 1024;
+
+    /// Control-message buffer, aligned for `cmsghdr`.
+    #[repr(C, align(8))]
+    struct CmsgBuf([u8; 64]);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Recv {
+        pub len: usize,
+        /// gso_size from the UDP_GRO cmsg; 0 when absent.
+        pub segment: usize,
+        /// Source address (only when asked for).
+        pub from: Option<SocketAddr>,
+        /// The kernel cut the buffer short (MSG_TRUNC): its tail is lost.
+        pub truncated: bool,
+    }
+
+    /// A buffer of `len` bytes is a GRO burst only when `0 < segment < len`.
+    pub(super) fn is_coalesced(len: usize, segment: usize) -> bool {
+        segment > 0 && segment < len
+    }
+
+    /// Datagrams carried by a buffer (a non-coalesced buffer, even empty, is one).
+    pub(super) fn segments(len: usize, segment: usize) -> u64 {
+        if is_coalesced(len, segment) {
+            len.div_ceil(segment) as u64
+        } else {
+            1
+        }
+    }
+
+    /// Bytes per GSO send: whole segments, at most MAX_GSO_SEGMENTS and GSO_MAX_PAYLOAD.
+    pub(super) fn chunk_bytes(segment: usize) -> usize {
+        segment * (GSO_MAX_PAYLOAD / segment).clamp(1, MAX_GSO_SEGMENTS)
+    }
+
+    /// EINVAL / EIO / EMSGSIZE from a segmented send: GSO is unusable on this
+    /// socket or route; send one datagram at a time from now on.
+    pub(super) fn is_fallback_error(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::EIO) | Some(libc::EMSGSIZE)
+        )
+    }
+
+    pub(super) fn set_gro(fd: RawFd, on: bool) -> io::Result<()> {
+        let v: libc::c_int = on.into();
+        // SAFETY: `v` outlives the call and the length matches its type.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                (&v as *const libc::c_int).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// One `recvmsg`, parsing the UDP_GRO cmsg. Non-blocking sockets only;
+    /// call it inside `try_io` so tokio clears readiness on WouldBlock.
+    pub(super) fn recv(fd: RawFd, buf: &mut [u8], want_from: bool) -> io::Result<Recv> {
+        let mut cmsg = CmsgBuf([0; 64]);
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: `msghdr` is plain old data; all-zero is a valid empty header.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg.0.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg.0.len() as _;
+        let (len, from) = if want_from {
+            // SAFETY: `try_init` passes zeroed storage and its size; the kernel
+            // writes at most `msg_namelen` bytes there and reports the length.
+            let (n, addr) = unsafe {
+                socket2::SockAddr::try_init(|storage, len| {
+                    msg.msg_name = storage.cast();
+                    msg.msg_namelen = *len;
+                    let n = libc::recvmsg(fd, &mut msg, 0);
+                    if n < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    *len = msg.msg_namelen;
+                    Ok(n as usize)
+                })
+            }?;
+            (n, addr.as_socket())
+        } else {
+            // SAFETY: every pointer in `msg` refers to a live local buffer.
+            let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            (n as usize, None)
+        };
+        let mut segment = 0;
+        // SAFETY: the CMSG_* walk stays within `msg_control`/`msg_controllen`
+        // as updated by the kernel; the payload is read unaligned.
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_UDP && (*c).cmsg_type == libc::UDP_GRO {
+                    let v = ptr::read_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>());
+                    segment = usize::try_from(v).unwrap_or(0);
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        Ok(Recv {
+            len,
+            segment,
+            from,
+            truncated: msg.msg_flags & libc::MSG_TRUNC != 0,
+        })
+    }
+
+    /// One `sendmsg`. `segment > 0` adds a UDP_SEGMENT cmsg (GSO); `to` is
+    /// `None` on a connected socket.
+    pub(super) fn send(
+        fd: RawFd,
+        buf: &[u8],
+        segment: u16,
+        to: Option<&socket2::SockAddr>,
+    ) -> io::Result<usize> {
+        let mut cmsg = CmsgBuf([0; 64]);
+        let mut iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        // SAFETY: see `recv`.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        if let Some(addr) = to {
+            msg.msg_name = addr.as_ptr() as *mut libc::c_void;
+            msg.msg_namelen = addr.len();
+        }
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if segment > 0 {
+            // SAFETY: 64 aligned bytes hold CMSG_SPACE(2); the header pointer
+            // comes from CMSG_FIRSTHDR on that buffer.
+            unsafe {
+                msg.msg_control = cmsg.0.as_mut_ptr().cast();
+                msg.msg_controllen = libc::CMSG_SPACE(mem::size_of::<u16>() as u32) as _;
+                let c = libc::CMSG_FIRSTHDR(&msg);
+                (*c).cmsg_level = libc::SOL_UDP;
+                (*c).cmsg_type = libc::UDP_SEGMENT;
+                (*c).cmsg_len = libc::CMSG_LEN(mem::size_of::<u16>() as u32) as _;
+                ptr::write_unaligned(libc::CMSG_DATA(c).cast::<u16>(), segment);
+            }
+        }
+        // SAFETY: every pointer in `msg` refers to a live local buffer.
+        let n = unsafe { libc::sendmsg(fd, &msg, 0) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    pub(super) enum GsoSend {
+        Sent,
+        /// `from` = offset of the first unsent byte: always a segment boundary.
+        Stopped {
+            from: usize,
+            error: io::Error,
+        },
+    }
+
+    /// Send a coalesced buffer in as few GSO sends as D34 allows, stopping at
+    /// the first error. `send_one(chunk, seg)` performs one send (seg 0 = plain).
+    pub(super) fn send_chunks(
+        buf: &[u8],
+        segment: usize,
+        mut send_one: impl FnMut(&[u8], u16) -> io::Result<usize>,
+    ) -> GsoSend {
+        let Ok(seg16) = u16::try_from(segment) else {
+            return GsoSend::Stopped {
+                from: 0,
+                error: io::Error::from_raw_os_error(libc::EINVAL),
+            };
+        };
+        let step = chunk_bytes(segment);
+        let mut off = 0;
+        while off < buf.len() {
+            let end = (off + step).min(buf.len());
+            let chunk = &buf[off..end];
+            let seg = if chunk.len() > segment { seg16 } else { 0 };
+            if let Err(error) = send_one(chunk, seg) {
+                return GsoSend::Stopped { from: off, error };
+            }
+            off = end;
+        }
+        GsoSend::Sent
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1449,5 +2175,341 @@ mod tests {
                 sufficient: true
             }
         );
+    }
+
+    // ---- Linux GRO/GSO offload (3.1) ---------------------------------------
+
+    /// Non-blocking socket on 127.0.0.1 with UDP_GRO on; `None` on a kernel without it.
+    #[cfg(target_os = "linux")]
+    fn gro_socket() -> Option<std::net::UdpSocket> {
+        use std::os::fd::AsRawFd;
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_nonblocking(true).unwrap();
+        match offload::set_gro(s.as_raw_fd(), true) {
+            Ok(()) => Some(s),
+            Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+                eprintln!("skip: no UDP_GRO");
+                None
+            }
+            Err(e) => panic!("set_gro failed: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gso_sender() -> std::net::UdpSocket {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap()
+    }
+
+    /// Plain (no GRO) receiver with a read timeout.
+    #[cfg(target_os = "linux")]
+    fn plain_receiver() -> std::net::UdpSocket {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_no_check(fd: std::os::fd::RawFd) {
+        let one: libc::c_int = 1;
+        // SAFETY: `one` outlives the call and the length matches its type.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NO_CHECK,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
+    }
+
+    /// `offload::recv` in a loop that sleeps 5 ms on WouldBlock, up to `within`.
+    #[cfg(target_os = "linux")]
+    fn poll_recv(
+        fd: std::os::fd::RawFd,
+        buf: &mut [u8],
+        within: Duration,
+    ) -> Option<offload::Recv> {
+        let deadline = Instant::now() + within;
+        loop {
+            match offload::recv(fd, buf, true) {
+                Ok(r) => return Some(r),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("recv failed: {e}"),
+            }
+        }
+    }
+
+    /// `n` segments of `seg` bytes, segment `i` filled with the byte `i`.
+    #[cfg(target_os = "linux")]
+    fn distinct_segments(n: usize, seg: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| vec![i as u8; seg]).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_gso_send_arrives_coalesced_at_a_gro_socket() {
+        use std::os::fd::AsRawFd;
+        let Some(rx) = gro_socket() else { return };
+        let tx = gso_sender();
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        let payload = distinct_segments(10, 1000);
+        let n = offload::send(tx.as_raw_fd(), &payload, 1000, Some(&to)).unwrap();
+        assert_eq!(n, 10_000);
+        let mut buf = vec![0_u8; offload::GRO_BUF_BYTES];
+        let r = poll_recv(rx.as_raw_fd(), &mut buf, Duration::from_secs(2)).expect("a burst");
+        assert_eq!(r.len, 10_000);
+        assert_eq!(r.segment, 1000);
+        assert_eq!(r.from, Some(tx.local_addr().unwrap()));
+        assert!(!r.truncated);
+        assert_eq!(&buf[..r.len], &payload[..]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_gso_send_is_split_for_a_socket_without_gro() {
+        use std::os::fd::AsRawFd;
+        let rx = plain_receiver();
+        let tx = gso_sender();
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        let payload = distinct_segments(10, 1000);
+        assert_eq!(
+            offload::send(tx.as_raw_fd(), &payload, 1000, Some(&to)).unwrap(),
+            10_000
+        );
+        let mut buf = vec![0_u8; 65536];
+        for i in 0..10_u8 {
+            let (n, _) = rx.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 1000, "datagram {i}");
+            assert!(buf[..n].iter().all(|b| *b == i), "datagram {i} content");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_tail_segment_is_kept() {
+        use std::os::fd::AsRawFd;
+        let Some(rx) = gro_socket() else { return };
+        let tx = gso_sender();
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        let mut payload = distinct_segments(3, 1000);
+        payload.extend_from_slice(&[3_u8; 200]);
+        assert_eq!(
+            offload::send(tx.as_raw_fd(), &payload, 1000, Some(&to)).unwrap(),
+            3200
+        );
+        let mut buf = vec![0_u8; offload::GRO_BUF_BYTES];
+        let r = poll_recv(rx.as_raw_fd(), &mut buf, Duration::from_secs(2)).expect("a burst");
+        assert_eq!(r.len, 3200);
+        assert_eq!(r.segment, 1000);
+        let lens: Vec<usize> = buf[..r.len].chunks(r.segment).map(<[u8]>::len).collect();
+        assert_eq!(lens, vec![1000, 1000, 1000, 200]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_zero_length_datagram_round_trips() {
+        use std::os::fd::AsRawFd;
+        let Some(rx) = gro_socket() else { return };
+        let tx = gso_sender();
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        assert_eq!(offload::send(tx.as_raw_fd(), &[], 0, Some(&to)).unwrap(), 0);
+        let mut buf = vec![0_u8; offload::GRO_BUF_BYTES];
+        let r = poll_recv(rx.as_raw_fd(), &mut buf, Duration::from_secs(2)).expect("a datagram");
+        assert_eq!(r.len, 0);
+        assert_eq!(r.segment, 0);
+        assert_eq!(offload::segments(0, 0), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_segments_and_chunk_bytes_math() {
+        assert_eq!(offload::segments(0, 0), 1);
+        assert_eq!(offload::segments(5, 0), 1);
+        assert_eq!(offload::segments(10, 10), 1);
+        assert_eq!(offload::segments(11, 10), 2);
+        assert_eq!(offload::segments(6400, 100), 64);
+        assert_eq!(offload::chunk_bytes(1000), 64_000);
+        assert_eq!(offload::chunk_bytes(1472), 64_768);
+        assert_eq!(offload::chunk_bytes(100), 6400);
+        assert_eq!(offload::chunk_bytes(30_000), 60_000);
+        assert_eq!(offload::chunk_bytes(65_507), 65_507);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_send_chunks_stops_at_the_first_error_with_its_offset() {
+        let buf = vec![7_u8; 6450];
+        let mut calls = Vec::new();
+        let r = offload::send_chunks(&buf, 100, |chunk, seg| {
+            calls.push((chunk.len(), seg));
+            if calls.len() == 2 {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            } else {
+                Ok(chunk.len())
+            }
+        });
+        assert_eq!(calls, vec![(6400, 100), (50, 0)]);
+        match r {
+            offload::GsoSend::Stopped { from, error } => {
+                assert_eq!(from, 6400);
+                assert!(offload::is_fallback_error(&error));
+            }
+            offload::GsoSend::Sent => panic!("expected Stopped"),
+        }
+
+        let r = offload::send_chunks(&buf, 100, |chunk, _| Ok(chunk.len()));
+        assert!(matches!(r, offload::GsoSend::Sent));
+
+        let r = offload::send_chunks(&buf, 100, |_, _| {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        });
+        match r {
+            offload::GsoSend::Stopped { from, error } => {
+                assert_eq!(from, 0);
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            }
+            offload::GsoSend::Sent => panic!("expected Stopped"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offload_gso_rejection_is_a_fallback_error() {
+        use std::os::fd::AsRawFd;
+        let rx = plain_receiver();
+        let tx = gso_sender();
+        set_no_check(tx.as_raw_fd());
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        let payload = distinct_segments(10, 100);
+        let err = offload::send(tx.as_raw_fd(), &payload, 100, Some(&to)).unwrap_err();
+        assert!(offload::is_fallback_error(&err), "got {err}");
+        for piece in payload.chunks(100) {
+            assert_eq!(
+                offload::send(tx.as_raw_fd(), piece, 0, Some(&to)).unwrap(),
+                100
+            );
+        }
+        let mut buf = vec![0_u8; 65536];
+        for i in 0..10_u8 {
+            let (n, _) = rx.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 100);
+            assert!(buf[..n].iter().all(|b| *b == i));
+        }
+    }
+
+    /// Pins the kernel premise of D32a: a burst queued while UDP_GRO was on is
+    /// read fused and without a cmsg once UDP_GRO is off, so rfw never clears it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disabling_udp_gro_leaves_queued_bursts_merged() {
+        use std::os::fd::AsRawFd;
+        let Some(rx) = gro_socket() else { return };
+        let tx = gso_sender();
+        let to = socket2::SockAddr::from(rx.local_addr().unwrap());
+        let payload = distinct_segments(10, 100);
+        assert_eq!(
+            offload::send(tx.as_raw_fd(), &payload, 100, Some(&to)).unwrap(),
+            1000
+        );
+        // Let the burst reach the receive queue while GRO is still on.
+        std::thread::sleep(Duration::from_millis(50));
+        offload::set_gro(rx.as_raw_fd(), false).unwrap();
+        let mut buf = vec![0_u8; offload::GRO_BUF_BYTES];
+        let r = poll_recv(rx.as_raw_fd(), &mut buf, Duration::from_secs(2)).expect("data");
+        assert_eq!(r.len, 1000);
+        assert_eq!(r.segment, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reply_coalesced_falls_back_once_and_delivers_everything() {
+        use std::os::fd::AsRawFd;
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        set_no_check(listener.as_raw_fd());
+        let client = plain_receiver();
+        let client_addr = client.local_addr().unwrap();
+        let to = socket2::SockAddr::from(client_addr);
+        listener.writable().await.unwrap();
+        let gso_ok = AtomicBool::new(true);
+        let data = distinct_segments(8, 500);
+        for round in 0..2 {
+            let mut batch = Batch::default();
+            let r = reply_coalesced(
+                &listener,
+                &to,
+                client_addr,
+                &data,
+                500,
+                &gso_ok,
+                &mut batch,
+                "t",
+            );
+            assert!(r.is_none(), "round {round}");
+            assert!(!gso_ok.load(Ordering::Relaxed), "round {round}");
+            assert_eq!(batch.datagrams, 8, "round {round}");
+            assert_eq!(batch.bytes, 4000, "round {round}");
+            assert_eq!(batch.dropped, 0, "round {round}");
+            let mut buf = vec![0_u8; 65536];
+            for i in 0..8_u8 {
+                let (n, _) = client.recv_from(&mut buf).unwrap();
+                assert_eq!(n, 500);
+                assert!(buf[..n].iter().all(|b| *b == i), "round {round} piece {i}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forward_upstream_coalesced_falls_back_and_counts() {
+        use std::os::fd::AsRawFd;
+        let target = plain_receiver();
+        let remote = target.local_addr().unwrap();
+        let upstream = connect_upstream(remote, None).unwrap();
+        set_no_check(upstream.as_raw_fd());
+        let stats = Arc::new(ForwarderStats::with_protocol("t".into(), Protocol::Udp));
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let shared = Arc::new(SessionShared {
+            client: "127.0.0.1:9".parse().unwrap(),
+            remote,
+            upstream,
+            last_activity_ms: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            rx_datagrams: AtomicU64::new(0),
+            _guard: ConnGuard::new(stats.clone()),
+            _permit: permit,
+            gro: false,
+            listener_gso: Arc::new(AtomicBool::new(true)),
+        });
+        let mut entry = SessionEntry {
+            shared,
+            cancel: CancellationToken::new(),
+            opened: Instant::now(),
+            tx_datagrams: 0,
+            gso_ok: true,
+        };
+        let data = distinct_segments(8, 500);
+        let mut batch = Batch::default();
+        let mut gates = Gates::default();
+        forward_upstream_coalesced(
+            &mut entry, &data, 500, 1, &mut batch, &stats, &mut gates, "t",
+        );
+        assert!(!entry.gso_ok);
+        assert_eq!(entry.tx_datagrams, 8);
+        assert_eq!(batch.datagrams, 8);
+        assert_eq!(batch.bytes, 4000);
+        assert_eq!(batch.dropped, 0);
+        let mut buf = vec![0_u8; 65536];
+        for i in 0..8_u8 {
+            let (n, _) = target.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 500);
+            assert!(buf[..n].iter().all(|b| *b == i), "piece {i}");
+        }
     }
 }

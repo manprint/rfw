@@ -44,6 +44,12 @@ Plan revision: 1.
   - Tutti i segmenti sono lunghi `segment`, tranne l'ultimo che può essere più corto (garanzia GRO del kernel, R1).
   - Lo split è `buf.chunks(segment)`.
   - Un buffer non coalescato è un singolo datagramma, anche di lunghezza 0: segue esattamente il percorso della fase 2.
+- **D32a (rev 3, supera la parte "spegnimento" di D32) — UDP_GRO non viene mai tolto da un socket.** Verificato in 3.1
+  sul kernel 7.0: il cmsg UDP_GRO viene allegato alla *lettura* solo se il flag è attivo in quel momento, mentre
+  la segmentazione per socket senza GRO avviene all'*accodamento*. Uno skb accodato con GRO attivo e letto dopo
+  `set_gro(false)` arriva fuso e **senza** cmsg (`segment == 0`): nessuna ricezione può ricostruire i confini.
+  Quindi: knob off ⇒ nessun nuovo socket riceve UDP_GRO (sessioni nuove), ma il listener che lo ha già lo tiene
+  fino al restart, con ricezione GRO-aware e inoltro dei burst invariati. Il messaggio di spegnimento lo dice.
 - **D32 — ricezione GRO-aware sticky.**
   - Gli skb accodati mentre UDP_GRO era attivo restano coalescati nella coda anche dopo averlo spento
     (inferenza del supervisore da R1: la segmentazione avviene all'accodamento). Quindi, una volta che un socket
@@ -407,8 +413,10 @@ enum SessionDrain { Idle, Full, Blocked(Pending), Dead }   // era Blocked(Vec<u8
 
 #[cfg(target_os = "linux")]
 struct ListenerOffload {
-    /// UDP_GRO is currently set on the listener.
+    /// UDP_GRO is set on the listener socket. Only ever goes true (D32a).
     gro_set: bool,
+    /// The knob state last applied (new sessions get UDP_GRO only while true).
+    enabled: bool,
     /// Receives parse GRO cmsgs. Sticky (D32).
     gro_aware: bool,
     /// The kernel refused UDP_GRO (D37).
@@ -417,7 +425,7 @@ struct ListenerOffload {
     gso_ok: Arc<AtomicBool>,
 }
 // Engine: nuovo campo `#[cfg(target_os = "linux")] off: ListenerOffload`, inizializzato in
-// run_udp_forwarder con { gro_set: false, gro_aware: false, unsupported: false,
+// run_udp_forwarder con { gro_set: false, enabled: false, gro_aware: false, unsupported: false,
 // gso_ok: Arc::new(AtomicBool::new(true)) }.
 // run_udp_forwarder: `let mut buf = vec![0_u8; LISTENER_BUF_BYTES];` (era UDP_BUF_BYTES).
 
@@ -433,22 +441,31 @@ struct ListenerOffload {
 
 #[cfg(target_os = "linux")]
 impl Engine {
+    // rev 3 (D32a): UDP_GRO is never cleared from a socket. `enabled` is the
+    // knob state last applied; `gro_set` is the socket state and only goes true.
     fn apply_gro_knob(&mut self) {
         let want = self.knobs.udp_gro_gso() && !self.off.unsupported;
-        if want == self.off.gro_set { return; }
-        if want { self.off.gro_aware = true; } // before the sockopt: never read a burst with a plain recv
-        match offload::set_gro(self.socket.as_raw_fd(), want) {
-            Ok(()) => {
-                self.off.gro_set = want;
-                if want {
-                    info!(forwarder = %self.label, "UDP GRO/GSO enabled on the listener");
-                } else {
-                    info!(forwarder = %self.label, "UDP GRO/GSO disabled on the listener (receives stay GRO-aware until restart)");
+        if want == self.off.enabled { return; }
+        if !want {
+            self.off.enabled = false;
+            info!(forwarder = %self.label, "UDP GRO/GSO disabled on the listener for new sessions (UDP_GRO stays set on the listener socket until restart)");
+            return;
+        }
+        if !self.off.gro_set {
+            self.off.gro_aware = true; // before the sockopt: never read a burst with a plain recv
+            match offload::set_gro(self.socket.as_raw_fd(), true) {
+                Ok(()) => self.off.gro_set = true,
+                Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => return self.mark_gro_unsupported(),
+                Err(e) => {
+                    // latch: one warn, no retry every sweep
+                    self.off.unsupported = true;
+                    warn!(forwarder = %self.label, error = %e, "Setting UDP_GRO on the listener failed; udp_gro_gso has no effect on this forwarder until restart");
+                    return;
                 }
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => self.mark_gro_unsupported(),
-            Err(e) => warn!(forwarder = %self.label, error = %e, "Setting UDP_GRO on the listener failed"),
         }
+        self.off.enabled = true;
+        info!(forwarder = %self.label, "UDP GRO/GSO enabled on the listener");
     }
 
     fn mark_gro_unsupported(&mut self) {
@@ -513,7 +530,7 @@ impl Engine {
 // la chiamata in on_client_datagram passa 1.
 // Dopo connect_upstream riuscita, prima di costruire SessionShared:
 //     #[cfg(target_os = "linux")]
-//     let gro = self.knobs.udp_gro_gso() && !self.off.unsupported && match offload::set_gro(upstream.as_raw_fd(), true) {
+//     let gro = self.off.enabled && match offload::set_gro(upstream.as_raw_fd(), true) {
 //         Ok(()) => true,
 //         Err(e) => {
 //             if e.raw_os_error() == Some(libc::ENOPROTOOPT) { self.mark_gro_unsupported(); }
@@ -715,7 +732,7 @@ Note su B:
   | `offload_segments_and_chunk_bytes_math` | — | `segments(0,0)=1`, `segments(5,0)=1`, `segments(10,10)=1`, `segments(11,10)=2`, `segments(6400,100)=64`; `chunk_bytes(1000)=64000`, `chunk_bytes(1472)=64768`, `chunk_bytes(100)=6400`, `chunk_bytes(30000)=60000`, `chunk_bytes(65507)=65507` |
   | `offload_send_chunks_stops_at_the_first_error_with_its_offset` | closure fittizia che registra `(len, seg)`; buffer 6450 B, segmento 100; al 2° invio restituisce `Err(EINVAL)` | chiamate registrate `[(6400, 100), (50, 0)]`; esito `Stopped { from: 6400 }` con `is_fallback_error`; con la closure sempre Ok l'esito è `Sent`; con `WouldBlock` al 1° invio l'esito è `Stopped { from: 0 }` e kind `WouldBlock` |
   | `offload_gso_rejection_is_a_fallback_error` | sender con `setsockopt(SOL_SOCKET, SO_NO_CHECK, 1)` | `send(.., 100, Some(addr))` di 1000 B → `Err` con `is_fallback_error` true; 10 send senza segmento degli stessi pezzi → 10 datagrammi ricevuti |
-  | `gro_aware_receive_is_exact_after_gro_is_disabled` | GSO 10×100 verso un GRO socket, **poi** `set_gro(fd, false)`, poi lettura GRO-aware fino a 1000 byte totali | la concatenazione dei `chunks(segment)` di ogni lettura (o i datagrammi singoli) dà esattamente 10 pezzi da 100 B nell'ordine inviato |
+  | `disabling_udp_gro_leaves_queued_bursts_merged` (rev 3, sostituisce `gro_aware_receive_is_exact_after_gro_is_disabled`) | GSO 10×100 verso un GRO socket, **poi** `set_gro(fd, false)`, poi una lettura `offload::recv` | pinna la premessa di D32a: `len == 1000`, `segment == 0` (burst fuso senza cmsg). Se un kernel futuro cambia comportamento il test fallisce e D32a va rivista; non adattare l'asserzione |
   | `reply_coalesced_falls_back_once_and_delivers_everything` | "listener" tokio `UdpSocket` con `SO_NO_CHECK`; client ricevente normale; `gso_ok = AtomicBool::new(true)`; buffer 8×500 distinti, segmento 500 | 1ª chiamata → `None`, `gso_ok == false`, `batch.datagrams == 8`, `batch.dropped == 0`; il client riceve gli 8 pezzi in ordine; 2ª chiamata → stesso esito senza tentare GSO |
   | `forward_upstream_coalesced_falls_back_and_counts` | `SessionEntry` costruita a mano: upstream connesso a un ricevente normale e con `SO_NO_CHECK`; `ConnGuard::new(stats)`; permit da `Semaphore::new(1)` | dopo una chiamata con 8×500: `entry.gso_ok == false`, `entry.tx_datagrams == 8`, `batch.datagrams == 8`, `batch.bytes == 4000`, `batch.dropped == 0`; il ricevente ha 8 datagrammi in ordine |
   | `config::tests::udp_gro_gso_setting_cli_and_knob` (tutte le piattaforme) | YAML `settings: { udp_gro_gso: true }`; default; `CliArgs::parse_from(["rfw", "--udp-gro-gso"])` + `apply_cli_overrides` su default | il YAML dà `true`; il default è `false`; la CLI dà `true`; `RuntimeKnobs::from_settings` + `update` riflettono il valore (true → false) |
@@ -818,7 +835,8 @@ Note su B:
     Nessun numero di prestazione nel README: i numeri vanno in STATE.md §7.
   - **Full CLI reference**: `--udp-gro-gso`.
   - **YAML settings**: `udp_gro_gso`.
-  - **Hot-reload**: `udp_gro_gso` nella lista live, con la nota sulle sessioni esistenti.
+  - **Hot-reload**: `udp_gro_gso` nella lista live, con la nota sulle sessioni esistenti e (rev 3, D32a) la nota:
+    "turning it off stops GRO on new sessions; a listener that already has UDP_GRO keeps it until restart".
   - **Development → Test**: menzione del bench GSO.
   - `forwarders.yml`: `# udp_gro_gso: false   # Linux only, hot-reloadable` nel blocco settings, più la flag
     nell'elenco CLI del commento.

@@ -189,6 +189,10 @@ pub struct Settings {
     /// Each session holds one socket (one file descriptor). Startup-only.
     #[serde(default = "default_udp_max_sessions")]
     pub udp_max_sessions: usize,
+    /// Linux only: receive coalesced UDP bursts (UDP_GRO) and forward them with
+    /// segmented sends (UDP_SEGMENT). Hot-reloadable.
+    #[serde(default)]
+    pub udp_gro_gso: bool,
 }
 
 impl Default for Settings {
@@ -212,6 +216,7 @@ impl Default for Settings {
             unreachable_after_secs: default_unreachable_after(),
             udp_session_timeout_secs: default_udp_session_timeout(),
             udp_max_sessions: default_udp_max_sessions(),
+            udp_gro_gso: false,
         }
     }
 }
@@ -416,6 +421,8 @@ pub struct RuntimeKnobs {
     unreachable_after_secs: AtomicU64,
     /// UDP session idle timeout (read live by the session sweep).
     udp_session_timeout_secs: AtomicU64,
+    /// Linux UDP GRO/GSO fast path (read by listeners at each sweep, by sessions at creation).
+    udp_gro_gso: AtomicBool,
 }
 
 impl RuntimeKnobs {
@@ -432,6 +439,7 @@ impl RuntimeKnobs {
             probe_interval_secs: AtomicU64::new(default_probe_interval()),
             unreachable_after_secs: AtomicU64::new(default_unreachable_after()),
             udp_session_timeout_secs: AtomicU64::new(default_udp_session_timeout()),
+            udp_gro_gso: AtomicBool::new(false),
         };
         knobs.update(s);
         knobs
@@ -465,6 +473,7 @@ impl RuntimeKnobs {
             .store(s.unreachable_after_secs, Ordering::Relaxed);
         self.udp_session_timeout_secs
             .store(s.udp_session_timeout_secs, Ordering::Relaxed);
+        self.udp_gro_gso.store(s.udp_gro_gso, Ordering::Relaxed);
     }
 
     /// Idle time after which a UDP session is closed (read live by every sweep).
@@ -510,6 +519,12 @@ impl RuntimeKnobs {
 
     pub fn use_splice(&self) -> bool {
         self.use_splice.load(Ordering::Relaxed)
+    }
+
+    /// Linux UDP GRO/GSO fast path (applied by listeners at their next sweep, by sessions at creation).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_gro_gso(&self) -> bool {
+        self.udp_gro_gso.load(Ordering::Relaxed)
     }
 
     pub fn connect_timeout(&self) -> std::time::Duration {
@@ -643,6 +658,10 @@ pub struct CliArgs {
     #[arg(long = "udp-max-sessions", value_name = "N")]
     pub udp_max_sessions: Option<usize>,
 
+    /// Enable the Linux UDP GRO/GSO fast path (same as `udp_gro_gso: true`).
+    #[arg(long = "udp-gro-gso")]
+    pub udp_gro_gso: bool,
+
     /// Directory for the rolling JSON log file. Use `--log-dir ""` to disable
     /// file logging entirely and log to the console only.
     #[arg(long = "log-dir", default_value = "logs")]
@@ -681,6 +700,7 @@ impl Default for CliArgs {
             unreachable_after_secs: None,
             udp_session_timeout_secs: None,
             udp_max_sessions: None,
+            udp_gro_gso: false,
             log_dir: "logs".to_string(),
             health_check: None,
             forwarders: Vec::new(),
@@ -901,6 +921,9 @@ pub fn apply_cli_overrides(settings: &mut Settings, cli: &CliArgs) {
     }
     if let Some(v) = cli.udp_max_sessions {
         settings.udp_max_sessions = v;
+    }
+    if cli.udp_gro_gso {
+        settings.udp_gro_gso = true;
     }
 }
 
@@ -1870,5 +1893,32 @@ mod tests {
             cli.forwarders,
             vec!["127.0.0.1:1:127.0.0.1:2/udp".to_string()]
         );
+    }
+
+    #[test]
+    fn udp_gro_gso_setting_cli_and_knob() {
+        let path = write_temp(
+            "udp-gro-gso",
+            "forwarders:\n  - {local_host: 127.0.0.1, local_port: 1, remote_host: b, remote_port: 2}\nsettings:\n  udp_gro_gso: true\n",
+        );
+        let loaded = load_yaml_config(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.settings.udp_gro_gso);
+        assert!(!Settings::default().udp_gro_gso);
+
+        let cli = CliArgs::try_parse_from(["rfw", "--udp-gro-gso", "127.0.0.1:1:127.0.0.1:2/udp"])
+            .expect("parse cli");
+        let mut s = Settings::default();
+        apply_cli_overrides(&mut s, &cli);
+        assert!(s.udp_gro_gso);
+        let plain = CliArgs::try_parse_from(["rfw", "127.0.0.1:1:127.0.0.1:2/udp"]).unwrap();
+        let mut t = Settings::default();
+        apply_cli_overrides(&mut t, &plain);
+        assert!(!t.udp_gro_gso);
+
+        let knobs = RuntimeKnobs::from_settings(&s);
+        assert!(knobs.udp_gro_gso());
+        knobs.update(&Settings::default());
+        assert!(!knobs.udp_gro_gso());
     }
 }
