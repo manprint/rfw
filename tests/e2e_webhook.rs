@@ -182,7 +182,7 @@ async fn startup_alert_reports_every_target() {
         "{text}"
     );
     assert!(
-        text.contains("rfw 1.0.6"),
+        text.contains(&format!("rfw {}", env!("CARGO_PKG_VERSION"))),
         "footer carries the version: {text}"
     );
 }
