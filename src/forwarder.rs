@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ForwarderConfig, KeepaliveConfig, KnobSnapshot, RuntimeKnobs};
+use crate::config::{ForwarderConfig, KeepaliveConfig, KnobSnapshot, Protocol, RuntimeKnobs};
 use crate::notify::{Event, Notifier};
-use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry};
+use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry, StatsSnapshot};
 
 /// Stagger between parallel connect attempts to successive resolved addresses
 /// (RFC 8305 "Happy Eyeballs" connection attempt delay). Small enough that a
@@ -561,6 +561,40 @@ pub async fn rate_sampler(
     }
 }
 
+/// One line of the traffic report, or `None` for a forwarder with no activity.
+/// TCP rows keep their v1.0.6 layout; UDP rows add datagram counters.
+fn traffic_row(s: &StatsSnapshot) -> Option<String> {
+    if s.bytes_sent == 0
+        && s.bytes_received == 0
+        && s.active_connections == 0
+        && s.datagrams_dropped == 0
+    {
+        return None;
+    }
+    let sent = format_bytes(s.bytes_sent);
+    let recv = format_bytes(s.bytes_received);
+    let tx = format_bytes(s.rate_sent_bps);
+    let rx = format_bytes(s.rate_recv_bps);
+    Some(match s.protocol {
+        Protocol::Tcp => format!(
+            "  {:<45} sent={:>10}  recv={:>10}  tx={:>10}/s  rx={:>10}/s  active={}",
+            s.label, sent, recv, tx, rx, s.active_connections
+        ),
+        Protocol::Udp => format!(
+            "  {:<45} sent={:>10}  recv={:>10}  tx={:>10}/s  rx={:>10}/s  sessions={}  dgrams tx={} rx={} drop={}",
+            s.label,
+            sent,
+            recv,
+            tx,
+            rx,
+            s.active_connections,
+            s.datagrams_sent,
+            s.datagrams_received,
+            s.datagrams_dropped
+        ),
+    })
+}
+
 /// Stats reporter: logs a traffic report every `report_interval`.
 /// Shows **lifetime cumulative** totals and the **current throughput rate**
 /// (counters are never reset — that is now the sampler's derived gauge).
@@ -590,16 +624,8 @@ pub async fn stats_reporter(
                 info!("─── Traffic Report ──────────────────────────────────");
 
                 for s in &snapshots {
-                    if s.bytes_sent > 0 || s.bytes_received > 0 || s.active_connections > 0 {
-                        info!(
-                            "  {:<45} sent={:>10}  recv={:>10}  tx={:>10}/s  rx={:>10}/s  active={}",
-                            s.label,
-                            format_bytes(s.bytes_sent),
-                            format_bytes(s.bytes_received),
-                            format_bytes(s.rate_sent_bps),
-                            format_bytes(s.rate_recv_bps),
-                            s.active_connections
-                        );
+                    if let Some(row) = traffic_row(s) {
+                        info!("{row}");
                     }
                 }
 
@@ -1502,5 +1528,64 @@ mod tests {
             "failover took {:?}; staggering is not working",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn traffic_row_formats_tcp_unchanged_and_udp_with_datagrams() {
+        let tcp = StatsSnapshot {
+            label: "a:1->b:2".to_string(),
+            protocol: Protocol::Tcp,
+            bytes_sent: 2048,
+            bytes_received: 1024,
+            datagrams_sent: 0,
+            datagrams_received: 0,
+            datagrams_dropped: 0,
+            active_connections: 1,
+            rejected_connections: 0,
+            rate_sent_bps: 100,
+            rate_recv_bps: 200,
+            listening: true,
+            target_reachable: Some(true),
+        };
+        let expected = format!(
+            "  {:<45} sent={:>10}  recv={:>10}  tx={:>10}/s  rx={:>10}/s  active={}",
+            "a:1->b:2",
+            format_bytes(2048),
+            format_bytes(1024),
+            format_bytes(100),
+            format_bytes(200),
+            1
+        );
+        assert_eq!(traffic_row(&tcp).as_deref(), Some(expected.as_str()));
+
+        let udp = StatsSnapshot {
+            label: "a:1->b:2/udp".to_string(),
+            protocol: Protocol::Udp,
+            datagrams_sent: 5,
+            datagrams_received: 4,
+            datagrams_dropped: 1,
+            ..tcp.clone()
+        };
+        let row = traffic_row(&udp).expect("active UDP forwarder has a row");
+        assert!(row.contains("sessions=1  dgrams tx=5 rx=4 drop=1"), "{row}");
+
+        // Dropped datagrams alone make a forwarder worth reporting.
+        let only_drops = StatsSnapshot {
+            bytes_sent: 0,
+            bytes_received: 0,
+            active_connections: 0,
+            datagrams_dropped: 2,
+            ..udp.clone()
+        };
+        assert!(traffic_row(&only_drops).is_some());
+
+        let idle = StatsSnapshot {
+            bytes_sent: 0,
+            bytes_received: 0,
+            active_connections: 0,
+            datagrams_dropped: 0,
+            ..udp
+        };
+        assert_eq!(traffic_row(&idle), None);
     }
 }

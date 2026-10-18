@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::config::Protocol;
 use crate::notify::{Event, Notifier, NotifierCounters, NotifierSnapshot};
 use crate::stats::{StatsRegistry, StatsSnapshot};
 
@@ -356,6 +357,39 @@ pub fn render_prometheus(snaps: &[StatsSnapshot]) -> String {
             ));
         }
     }
+    // UDP-only families: emitted only when a UDP forwarder exists, so a TCP-only
+    // deployment exposes exactly the series it always did.
+    let udp: Vec<StatsSnapshot> = snaps
+        .iter()
+        .filter(|s| s.protocol == Protocol::Udp)
+        .cloned()
+        .collect();
+    if !udp.is_empty() {
+        push_metric(
+            &mut out,
+            "rfw_datagrams_sent_total",
+            "Lifetime UDP datagrams forwarded client->remote.",
+            "counter",
+            &udp,
+            |s| s.datagrams_sent,
+        );
+        push_metric(
+            &mut out,
+            "rfw_datagrams_received_total",
+            "Lifetime UDP datagrams forwarded remote->client.",
+            "counter",
+            &udp,
+            |s| s.datagrams_received,
+        );
+        push_metric(
+            &mut out,
+            "rfw_datagrams_dropped_total",
+            "Lifetime UDP datagrams dropped (socket buffer full, session limit, target not resolved, send error).",
+            "counter",
+            &udp,
+            |s| s.datagrams_dropped,
+        );
+    }
     out
 }
 
@@ -412,9 +446,19 @@ pub fn render_json(snaps: &[StatsSnapshot]) -> String {
             Some(false) => "false",
             None => "null",
         };
+        // Datagram fields are appended only for UDP, so TCP entries keep their
+        // exact v1.0.6 shape apart from the added "protocol" key.
+        let udp = match s.protocol {
+            Protocol::Udp => format!(
+                ",\"datagrams_sent\":{},\"datagrams_received\":{},\"datagrams_dropped\":{}",
+                s.datagrams_sent, s.datagrams_received, s.datagrams_dropped
+            ),
+            Protocol::Tcp => String::new(),
+        };
         out.push_str(&format!(
-            "{{\"label\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{},\"listening\":{},\"target_reachable\":{}}}",
+            "{{\"label\":\"{}\",\"protocol\":\"{}\",\"bytes_sent\":{},\"bytes_received\":{},\"active_connections\":{},\"rejected_connections\":{},\"rate_sent_bps\":{},\"rate_recv_bps\":{},\"listening\":{},\"target_reachable\":{}{udp}}}",
             escape(&s.label),
+            s.protocol.as_str(),
             s.bytes_sent,
             s.bytes_received,
             s.active_connections,
@@ -436,8 +480,12 @@ mod tests {
     fn snap() -> StatsSnapshot {
         StatsSnapshot {
             label: "a:1->b:2".to_string(),
+            protocol: Protocol::Tcp,
             bytes_sent: 100,
             bytes_received: 200,
+            datagrams_sent: 0,
+            datagrams_received: 0,
+            datagrams_dropped: 0,
             active_connections: 1,
             rejected_connections: 3,
             rate_sent_bps: 10,
@@ -648,6 +696,58 @@ mod tests {
         assert_eq!(sent_body, body);
         assert!(head.contains(&format!("Content-Length: {}", body.len())));
         assert!(head.contains("Connection: close"));
+    }
+
+    #[test]
+    fn tcp_only_exposition_has_no_datagram_families() {
+        let out = render_prometheus(&[snap()]);
+        assert!(!out.contains("rfw_datagrams_"), "{out}");
+        assert!(!out.contains("protocol="), "{out}");
+        assert!(out.contains("rfw_bytes_sent_total{label=\"a:1->b:2\"} 100"));
+    }
+
+    fn udp_snap() -> StatsSnapshot {
+        StatsSnapshot {
+            label: "a:1->b:2/udp".to_string(),
+            protocol: Protocol::Udp,
+            datagrams_sent: 5,
+            datagrams_received: 4,
+            datagrams_dropped: 1,
+            ..snap()
+        }
+    }
+
+    #[test]
+    fn udp_forwarders_expose_datagram_counters() {
+        let out = render_prometheus(&[snap(), udp_snap()]);
+        assert!(out.contains("# TYPE rfw_datagrams_sent_total counter"));
+        assert!(out.contains("rfw_datagrams_sent_total{label=\"a:1->b:2/udp\"} 5"));
+        assert!(out.contains("rfw_datagrams_received_total{label=\"a:1->b:2/udp\"} 4"));
+        assert!(out.contains("rfw_datagrams_dropped_total{label=\"a:1->b:2/udp\"} 1"));
+        assert!(
+            !out.contains("rfw_datagrams_sent_total{label=\"a:1->b:2\"}"),
+            "TCP entries get no datagram series: {out}"
+        );
+        assert!(out.contains("rfw_bytes_sent_total{label=\"a:1->b:2/udp\"} 100"));
+    }
+
+    #[test]
+    fn json_carries_protocol_and_udp_datagram_fields() {
+        let out = render_json(&[snap(), udp_snap()]);
+        assert!(
+            out.contains("{\"label\":\"a:1->b:2\",\"protocol\":\"tcp\",\"bytes_sent\":100"),
+            "{out}"
+        );
+        assert!(out.contains("\"protocol\":\"udp\""), "{out}");
+        assert!(
+            out.contains("\"datagrams_sent\":5,\"datagrams_received\":4,\"datagrams_dropped\":1}"),
+            "{out}"
+        );
+        let first = out.split("},{").next().unwrap();
+        assert!(
+            !first.contains("datagrams"),
+            "TCP entry must not carry datagram fields: {first}"
+        );
     }
 
     // ---- Live endpoint behaviour -------------------------------------------

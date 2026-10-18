@@ -121,6 +121,7 @@ pub async fn probe_all(
                 ProbeReport {
                     label: cfg.label(),
                     target: format!("{}:{}", cfg.remote_host, cfg.remote_port),
+                    protocol: cfg.protocol,
                     outcome: outcome.result,
                 },
             )

@@ -133,7 +133,10 @@ impl ForwarderManager {
         }
 
         let token = CancellationToken::new();
-        let stats = self.stats_registry.register(&label).await;
+        let stats = self
+            .stats_registry
+            .register_with_protocol(&label, cfg.protocol)
+            .await;
         let cfg_clone = cfg.clone();
         let token_clone = token.clone();
         let resolver = self.resolver.clone();
@@ -176,7 +179,9 @@ impl ForwarderManager {
         let monitor = tokio::spawn(run_monitor(
             Arc::new(cfg.clone()),
             token.clone(),
-            self.stats_registry.register(&label).await,
+            self.stats_registry
+                .register_with_protocol(&label, cfg.protocol)
+                .await,
             self.resolver.clone(),
             self.knobs.clone(),
             notifier,

@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::config::Protocol;
+
 /// Google Chat rejects `text` messages beyond 4096 characters; stay under it.
 pub const MAX_TEXT_CHARS: usize = 4000;
 /// Events waiting for delivery. Producers drop (and count) beyond this.
@@ -65,6 +67,7 @@ pub enum Severity {
 pub struct ProbeReport {
     pub label: String,
     pub target: String,
+    pub protocol: Protocol,
     /// `Ok((address that answered, connect latency))` or the error text.
     pub outcome: Result<(SocketAddr, Duration), String>,
 }
@@ -216,6 +219,14 @@ impl Event {
                 for f in forwarders {
                     text.push('\n');
                     match &f.outcome {
+                        Ok((addr, latency)) if f.protocol == Protocol::Udp => {
+                            text.push_str(&format!(
+                                "• {} ✅ resolved to {} ({} ms, udp: passive check)",
+                                mono(&f.label),
+                                mono(&addr.to_string()),
+                                latency.as_millis()
+                            ))
+                        }
                         Ok((addr, latency)) => text.push_str(&format!(
                             "• {} ✅ reachable at {} ({} ms)",
                             mono(&f.label),
@@ -1081,6 +1092,7 @@ mod tests {
         ProbeReport {
             label: label.to_string(),
             target: "db:5432".to_string(),
+            protocol: Protocol::Tcp,
             outcome: if ok {
                 Ok((
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5432),
@@ -1111,6 +1123,30 @@ mod tests {
         let text = mixed.render(&instance(), 0);
         assert!(text.contains("1 target(s) unreachable"), "{text}");
         assert!(text.contains("❌ unreachable: connect timeout to 10.0.0.9:5432"));
+    }
+
+    #[test]
+    fn started_reports_udp_targets_as_resolved() {
+        let r = ProbeReport {
+            label: "a:1->b:53/udp".to_string(),
+            target: "b:53".to_string(),
+            protocol: Protocol::Udp,
+            outcome: Ok((
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 53),
+                Duration::from_millis(3),
+            )),
+        };
+        let text = Event::Started {
+            forwarders: vec![r],
+        }
+        .render(&instance(), 0);
+        assert!(
+            text.contains(
+                "• `a:1->b:53/udp` ✅ resolved to `10.0.0.5:53` (3 ms, udp: passive check)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("reachable at"), "{text}");
     }
 
     #[test]

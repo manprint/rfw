@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, RwLock};
 
+use crate::config::Protocol;
+
 /// EWMA smoothing factor for rate derivation (0..1). Higher = more reactive.
 const RATE_ALPHA: f64 = 0.3;
 
@@ -22,10 +24,18 @@ const RATE_ALPHA: f64 = 0.3;
 #[derive(Debug)]
 pub struct ForwarderStats {
     label: String,
+    /// Transport of this forwarder; fixed at registration.
+    protocol: Protocol,
     /// Lifetime bytes client -> remote.
     pub bytes_sent: AtomicU64,
     /// Lifetime bytes remote -> client.
     pub bytes_received: AtomicU64,
+    /// UDP datagrams forwarded client -> remote (lifetime).
+    pub datagrams_sent: AtomicU64,
+    /// UDP datagrams forwarded remote -> client (lifetime).
+    pub datagrams_received: AtomicU64,
+    /// UDP datagrams dropped in either direction (lifetime).
+    pub datagrams_dropped: AtomicU64,
     pub active_connections: AtomicU64,
     /// Lifetime connections refused because `max_connections` was saturated.
     /// A non-zero value in staging means the cap is the bottleneck, not the link.
@@ -68,11 +78,15 @@ const TARGET_DOWN: u8 = 2;
 const NEVER_MS: u64 = u64::MAX;
 
 impl ForwarderStats {
-    pub fn new(label: String) -> Self {
+    pub fn with_protocol(label: String, protocol: Protocol) -> Self {
         Self {
             label,
+            protocol,
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            datagrams_sent: AtomicU64::new(0),
+            datagrams_received: AtomicU64::new(0),
+            datagrams_dropped: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
             rate_sent_bps: AtomicU64::new(0),
@@ -86,6 +100,11 @@ impl ForwarderStats {
             last_connect_ok_ms: AtomicU64::new(NEVER_MS),
             probe_kick: Notify::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(label: String) -> Self {
+        Self::with_protocol(label, Protocol::Tcp)
     }
 
     pub fn label(&self) -> &str {
@@ -194,8 +213,12 @@ impl ForwarderStats {
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             label: self.label.clone(),
+            protocol: self.protocol,
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            datagrams_sent: self.datagrams_sent.load(Ordering::Relaxed),
+            datagrams_received: self.datagrams_received.load(Ordering::Relaxed),
+            datagrams_dropped: self.datagrams_dropped.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
             rate_sent_bps: self.rate_sent_bps.load(Ordering::Relaxed),
@@ -245,8 +268,12 @@ pub fn compute_rate(prev: u64, cur: u64, dt_secs: f64, prev_ewma: u64) -> u64 {
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub label: String,
+    pub protocol: Protocol,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_received: u64,
+    pub datagrams_dropped: u64,
     pub active_connections: u64,
     pub rejected_connections: u64,
     pub rate_sent_bps: u64,
@@ -274,14 +301,23 @@ impl StatsRegistry {
     /// Idempotent by label: re-registering an existing label hands back the same
     /// counters instead of pushing a second entry. Two entries with one label
     /// would emit a duplicate Prometheus series, which scrapers reject.
-    pub async fn register(&self, label: &str) -> Arc<ForwarderStats> {
+    pub async fn register_with_protocol(
+        &self,
+        label: &str,
+        protocol: Protocol,
+    ) -> Arc<ForwarderStats> {
         let mut stats = self.stats.write().await;
         if let Some(existing) = stats.iter().find(|s| s.label() == label) {
             return existing.clone();
         }
-        let s = Arc::new(ForwarderStats::new(label.to_string()));
+        let s = Arc::new(ForwarderStats::with_protocol(label.to_string(), protocol));
         stats.push(s.clone());
         s
+    }
+
+    #[cfg(test)]
+    pub async fn register(&self, label: &str) -> Arc<ForwarderStats> {
+        self.register_with_protocol(label, Protocol::Tcp).await
     }
 
     /// Collect non-resetting snapshots of all forwarders for reporting/exposure.
@@ -652,5 +688,34 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 3 / 2), "1.500 MB");
         // Beyond the largest unit it keeps scaling TB rather than overflowing.
         assert!(format_bytes(u64::MAX).ends_with(" TB"));
+    }
+
+    #[tokio::test]
+    async fn registry_records_the_protocol() {
+        let reg = StatsRegistry::new();
+        let a = reg
+            .register_with_protocol("a:1->b:2/udp", Protocol::Udp)
+            .await;
+        assert_eq!(a.snapshot().protocol, Protocol::Udp);
+
+        // Re-registering the same label keeps the first entry and its protocol.
+        let b = reg
+            .register_with_protocol("a:1->b:2/udp", Protocol::Tcp)
+            .await;
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(b.snapshot().protocol, Protocol::Udp);
+        assert_eq!(reg.collect().await.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_carries_datagram_counters() {
+        let s = ForwarderStats::with_protocol("a:1->b:2/udp".into(), Protocol::Udp);
+        s.datagrams_sent.fetch_add(3, Ordering::Relaxed);
+        s.datagrams_received.fetch_add(2, Ordering::Relaxed);
+        s.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+        let snap = s.snapshot();
+        assert_eq!(snap.datagrams_sent, 3);
+        assert_eq!(snap.datagrams_received, 2);
+        assert_eq!(snap.datagrams_dropped, 1);
     }
 }

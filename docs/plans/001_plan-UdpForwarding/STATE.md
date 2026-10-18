@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 1.1 / 1) |
+| ID / attempt | — (last closed: 1.2 / 1) |
 | Status | none |
-| Intent | Protocol in config: type, parsing, label, duplicates, UDP settings, gate D17 |
-| Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
-| File / unit heading | phase_02.md "1.1" |
+| Intent | Plumbing: stats protocol + datagram counters, Prometheus, JSON, traffic report, startup report |
+| Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
+| File / unit heading | phase_02.md "1.2" |
 | Current step | none |
-| Next eligible plan unit | 1.2, phase_02.md |
-| Unit base | dedf948; branch: main; owned changes: src/config.rs, src/forwarder.rs/manager.rs/monitor.rs (test literals), src/main.rs, tests/e2e_lifecycle.rs |
-| Repo state | HEAD dedf948 |
+| Next eligible plan unit | P1 (phase_02.md closure) |
+| Unit base | 356cfa2; branch: main; owned changes: src/stats.rs, src/metrics.rs, src/forwarder.rs, src/notify.rs, src/monitor.rs, src/manager.rs |
+| Repo state | HEAD 356cfa2 |
 
-Next action: open 1.2 (agent-3:haiku).
+Next action: open P1: G-PHASE + review.
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 1.2 / 1 | 1 | agent-3:haiku (impl), agent-1:opus (review) | stats.rs (protocol, datagram counters, with_protocol, register_with_protocol), metrics.rs (UDP-only datagram families, JSON protocol + datagram fields), forwarder.rs (traffic_row), notify.rs (ProbeReport.protocol, Started UDP render), monitor.rs, manager.rs | G-HYG pass; G-U1.2 66 passed incl. 7 new | unit:1.2:1 |
 | sub-phase | 1.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (Protocol, label /udp, D1a parsing, (protocol,addr) duplicates, udp_* settings+CLI, D17 gate), test literals in forwarder/manager/monitor, e2e_lifecycle +2 | G-HYG pass; config::tests 47 passed incl. 9 new; e2e_lifecycle 17 passed | unit:1.1:1 |
 | plan | 001 / 1 | 1 | agent-1:opus | overview.md, phase_01–04.md, STATE.md (untracked) | readiness check in §7 | staged with 0.1 (unit:0.1:1) |
 | phase-close | P0 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass (see §7); review approve | unit:P0:1 |
@@ -364,6 +365,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 1.2 post-diff | agent-1:opus | rev 1; 356cfa2 + 1.2 diff | I-13 TCP exposition/JSON/report unchanged except added "protocol"; datagram families UDP-only; HELP texts | approve |
 | 1.1 post-diff | agent-1:opus | rev 1; dedf948 + 1.1 diff | I-1 TCP label byte-identical; D1a strings; D4 dup key; D12 validate/clamp; D17 gate in both load paths | approve |
 | P0 phase review | agent-1:opus | rev 1; 003e943 | D20 behavior, 6 unit + 2 e2e tests, README point 5/pinned accurate vs log texts, no TCP data-path change | approve |
 | 0.1 post-diff | agent-1:opus | rev 1; base c50db1f + 0.1 working diff | D20 reload: settings + apply_cli_overrides then update_knobs; sync only when source File; pinned log text; startup log; no `{:?}` of CliArgs/ReloadPolicy in logs; README matches | approve |
@@ -402,7 +404,7 @@ none
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0.1 pass; review agent-1:opus |
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U1.1 pass; review agent-1:opus |
-| 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
+| 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1.2 pass; review agent-1:opus |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
 | 2.3 | phase_03.md | 2.2 | TODO | 1 | — |
@@ -451,13 +453,13 @@ automatically satisfy dependent units.
 | `config::tests::udp_forwarders_are_rejected_until_the_engine_lands` | 1.1 (removed in 2.2) | G-U1.1 | pass | 1.1/1 |
 | e2e `invalid_protocol_suffix_is_rejected` | 1.1 | G-U1.1 | pass | 1.1/1 |
 | e2e `udp_forwarder_is_refused_until_supported` | 1.1 (removed in 2.2) | G-U1.1 | pass | 1.1/1 |
-| `stats::tests::registry_records_the_protocol` | 1.2 | G-U1.2 | TODO | — |
-| `stats::tests::snapshot_carries_datagram_counters` | 1.2 | G-U1.2 | TODO | — |
-| `metrics::tests::tcp_only_exposition_has_no_datagram_families` | 1.2 | G-U1.2 | TODO | — |
-| `metrics::tests::udp_forwarders_expose_datagram_counters` | 1.2 | G-U1.2 | TODO | — |
-| `metrics::tests::json_carries_protocol_and_udp_datagram_fields` | 1.2 | G-U1.2 | TODO | — |
-| `forwarder::tests::traffic_row_formats_tcp_unchanged_and_udp_with_datagrams` | 1.2 | G-U1.2 | TODO | — |
-| `notify::tests::started_reports_udp_targets_as_resolved` | 1.2 | G-U1.2 | TODO | — |
+| `stats::tests::registry_records_the_protocol` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `stats::tests::snapshot_carries_datagram_counters` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `metrics::tests::tcp_only_exposition_has_no_datagram_families` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `metrics::tests::udp_forwarders_expose_datagram_counters` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `metrics::tests::json_carries_protocol_and_udp_datagram_fields` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `forwarder::tests::traffic_row_formats_tcp_unchanged_and_udp_with_datagrams` | 1.2 | G-U1.2 | pass | 1.2/1 |
+| `notify::tests::started_reports_udp_targets_as_resolved` | 1.2 | G-U1.2 | pass | 1.2/1 |
 | `udp::tests::forwards_a_datagram_and_its_reply` | 2.1 | G-U2.1 | TODO | — |
 | `udp::tests::first_datagram_of_a_new_session_is_never_dropped` | 2.1 | G-U2.1 | TODO | — |
 | `udp::tests::datagram_boundaries_are_preserved_for_all_sizes` | 2.1 | G-U2.1 | TODO | — |
