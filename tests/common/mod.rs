@@ -31,18 +31,73 @@ fn claimed_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> 
 /// (i.e. the `rfw` child). The port is recorded so no in-process backend can
 /// take it in the gap before `rfw` binds.
 pub fn free_port() -> u16 {
+    reserve_port(|port| StdListener::bind(("127.0.0.1", port)).is_ok())
+}
+
+/// Ports handed to an `rfw` child come from below the kernel's ephemeral range
+/// (Linux default 32768-60999). Between reservation and rfw's bind, a port
+/// from that range can be picked as the *source* port of any outgoing
+/// connection on the host (a client, rfw dialing a backend, a self-connect
+/// while polling the closed port), which then makes rfw's bind fail or the
+/// test talk to the wrong socket. Ports outside the range are never assigned
+/// implicitly, so only an explicit bind can take them.
+const RESERVED_PORTS: std::ops::Range<u16> = 20000..32768;
+
+/// Held exclusively while [`reserve_port`] probes ports, and shared while a
+/// child process is being spawned ([`ForkSafe`]).
+///
+/// A spawned child starts with a copy of every open descriptor of this process
+/// and only drops them at `exec`. If another test spawns while a probe socket
+/// is open, the copy outlives the probe: the "free" port stays bound (rfw's
+/// bind fails with EADDRINUSE and retries 5s later) and, for a TCP probe,
+/// keeps listening, so `wait_port` connects to it and the test's next connect
+/// is refused or reset. Under CPU load the fork-to-exec gap is long enough to
+/// hit this a few percent of the time.
+static FORK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Spawn children through [`FORK_GATE`]; see there.
+pub trait ForkSafe {
+    fn spawn_safe(&mut self) -> std::io::Result<Child>;
+    fn output_safe(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl ForkSafe for Command {
+    fn spawn_safe(&mut self) -> std::io::Result<Child> {
+        // `spawn` returns once the child has exec'd, so the gate is held only
+        // for the window in which descriptors are duplicated.
+        let _gate = FORK_GATE.read().unwrap_or_else(|e| e.into_inner());
+        self.spawn()
+    }
+
+    fn output_safe(&mut self) -> std::io::Result<std::process::Output> {
+        self.spawn_safe()?.wait_with_output()
+    }
+}
+
+/// Reserve a port from [`RESERVED_PORTS`] that `is_free` accepts and nothing
+/// else in this binary has claimed. The scan starts at a per-process offset so
+/// test binaries running one after another do not reuse each other's ports.
+fn reserve_port(is_free: impl Fn(u16) -> bool) -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let span = u32::from(RESERVED_PORTS.end - RESERVED_PORTS.start);
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id().wrapping_mul(7919) % span,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    let _no_fork = FORK_GATE.write().unwrap_or_else(|e| e.into_inner());
     let mut claimed = claimed_ports().lock().unwrap();
-    for _ in 0..1000 {
-        let port = StdListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if claimed.insert(port) {
+    for _ in 0..span {
+        let off = NEXT.fetch_add(1, Ordering::Relaxed) % span;
+        let port = RESERVED_PORTS.start + off as u16;
+        if !claimed.contains(&port) && is_free(port) {
+            claimed.insert(port);
             return port;
         }
     }
-    panic!("could not reserve an unused ephemeral port");
+    panic!("could not reserve a free port in {RESERVED_PORTS:?}");
 }
 
 /// Bind an in-process listener on a port nothing else in this binary has
@@ -101,6 +156,7 @@ pub fn rfw_command(args: &[&str]) -> Command {
     cmd.arg("--log-dir")
         .arg("")
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd
@@ -108,7 +164,7 @@ pub fn rfw_command(args: &[&str]) -> Command {
 
 /// Spawn `rfw` with the given extra args. Panics if it cannot start.
 pub fn spawn_rfw(args: &[&str]) -> ChildGuard {
-    ChildGuard(rfw_command(args).spawn().expect("spawn rfw"))
+    ChildGuard(rfw_command(args).spawn_safe().expect("spawn rfw"))
 }
 
 /// Captured stdout+stderr lines of an `rfw` child, ANSI stripped.
@@ -187,7 +243,7 @@ pub fn spawn_rfw_logged(args: &[&str], envs: &[(&str, &str)]) -> (ChildGuard, Lo
         cmd.env(k, v);
     }
 
-    let mut child = cmd.spawn().expect("spawn rfw");
+    let mut child = cmd.spawn_safe().expect("spawn rfw");
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -387,34 +443,15 @@ impl Drop for TempConfig {
 /// Reserve a free UDP port on 127.0.0.1 for a process that will bind it itself
 /// (the `rfw` child). Claimed in the shared set, like [`free_port`].
 pub fn free_udp_port() -> u16 {
-    let mut claimed = claimed_ports().lock().unwrap();
-    for _ in 0..1000 {
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if claimed.insert(port) {
-            return port;
-        }
-    }
-    panic!("could not reserve an unused UDP port");
+    reserve_port(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
 }
 
 /// Reserve a port number that is free for TCP *and* UDP on 127.0.0.1.
 pub fn free_dual_port() -> u16 {
-    let mut claimed = claimed_ports().lock().unwrap();
-    for _ in 0..1000 {
-        let tcp = StdListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
-            continue;
-        }
-        if claimed.insert(port) {
-            return port;
-        }
-    }
-    panic!("could not reserve a port free for both TCP and UDP");
+    reserve_port(|port| {
+        StdListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+    })
 }
 
 /// Bind an in-process UDP socket on a port nothing else in this binary has claimed.

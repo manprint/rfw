@@ -10,6 +10,7 @@ mod common;
 
 use std::time::Duration;
 
+use common::ForkSafe;
 use common::{
     free_port, free_udp_port, rfw_command, spawn_echo, spawn_rfw, spawn_udp_echo,
     spawn_udp_echo_on, udp_client, wait_port, ChildGuard, TempConfig,
@@ -166,7 +167,7 @@ async fn startup_alert_reports_every_target() {
     // The URL travels through the environment, as production should do it.
     let mut cmd = rfw_command(&["--instance-name", "e2e-instance", &fwd_ok, &fwd_dead]);
     cmd.env("RFW_WEBHOOK_URL", &hook);
-    let _rfw = ChildGuard(cmd.spawn().expect("spawn rfw"));
+    let _rfw = ChildGuard(cmd.spawn_safe().expect("spawn rfw"));
     wait_port(la).await;
 
     let text = expect_message(&mut rx, Duration::from_secs(15), &["*rfw started*"]).await;
@@ -424,7 +425,7 @@ fn invalid_webhook_url_is_rejected_at_startup() {
         "127.0.0.1:1:127.0.0.1:2",
     ])
     .stderr(std::process::Stdio::piped())
-    .output()
+    .output_safe()
     .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -437,7 +438,7 @@ fn invalid_webhook_url_is_rejected_at_startup() {
 fn help_documents_the_webhook_flags() {
     let out = rfw_command(&["--help"])
         .stdout(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     let help = String::from_utf8_lossy(&out.stdout);
     for flag in [

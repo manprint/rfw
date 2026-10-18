@@ -7,6 +7,7 @@ mod common;
 
 use std::time::Duration;
 
+use common::ForkSafe;
 use common::{
     free_port, http_get, rfw_command, spawn_counting_sink, spawn_echo, spawn_rfw, wait_for_stats,
     wait_port,
@@ -30,7 +31,7 @@ fn zero_intervals_are_rejected_at_startup() {
     ] {
         let out = rfw_command(&[flag, "0", "127.0.0.1:1:127.0.0.1:2"])
             .stderr(std::process::Stdio::piped())
-            .output()
+            .output_safe()
             .expect("run rfw");
         assert!(!out.status.success(), "{flag} 0 must fail startup");
         let err = String::from_utf8_lossy(&out.stderr);
@@ -44,7 +45,7 @@ fn zero_intervals_are_rejected_at_startup() {
 fn zero_buffer_bytes_is_rejected_at_startup() {
     let out = rfw_command(&["--buffer-bytes", "0", "127.0.0.1:1:127.0.0.1:2"])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -55,7 +56,7 @@ fn zero_buffer_bytes_is_rejected_at_startup() {
 fn unparseable_metrics_addr_is_rejected_at_startup() {
     let out = rfw_command(&["--metrics-addr", "not-a-socket-addr", "127.0.0.1:1:h:2"])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -66,7 +67,7 @@ fn unparseable_metrics_addr_is_rejected_at_startup() {
 fn no_forwarders_is_a_clear_error() {
     let out = rfw_command(&[])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -77,7 +78,7 @@ fn no_forwarders_is_a_clear_error() {
 fn malformed_forwarder_argument_is_rejected() {
     let out = rfw_command(&["not:enough:parts"])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -88,7 +89,7 @@ fn malformed_forwarder_argument_is_rejected() {
 fn invalid_protocol_suffix_is_rejected() {
     let out = rfw_command(&["127.0.0.1:1:127.0.0.1:2/sctp"])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -411,7 +412,7 @@ async fn health_check_probe_reports_liveness() {
         let addr = metrics_addr.clone();
         move || {
             rfw_command(&["--health-check", &addr])
-                .output()
+                .output_safe()
                 .expect("run probe")
         }
     })
@@ -430,7 +431,7 @@ async fn health_check_probe_reports_liveness() {
         let addr = metrics_addr.clone();
         move || {
             rfw_command(&["--health-check", &addr])
-                .output()
+                .output_safe()
                 .expect("run probe")
         }
     })
@@ -473,7 +474,7 @@ async fn health_check_fails_while_a_forwarder_cannot_bind_and_recovers() {
         let addr = metrics_addr.clone();
         move || {
             rfw_command(&["--health-check", &addr])
-                .output()
+                .output_safe()
                 .expect("run probe")
         }
     })
@@ -504,7 +505,7 @@ async fn health_check_fails_while_a_forwarder_cannot_bind_and_recovers() {
         let addr = metrics_addr.clone();
         move || {
             rfw_command(&["--health-check", &addr])
-                .output()
+                .output_safe()
                 .expect("run probe")
         }
     })
@@ -517,7 +518,7 @@ async fn health_check_fails_while_a_forwarder_cannot_bind_and_recovers() {
 fn health_check_rejects_a_malformed_address() {
     let out = rfw_command(&["--health-check", "not-an-address"])
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run probe");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);

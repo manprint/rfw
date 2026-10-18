@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::ForkSafe;
 use common::{
     free_dual_port, free_port, free_udp_port, http_get, rfw_command, spawn_echo, spawn_rfw,
     spawn_rfw_logged, spawn_udp_echo, spawn_udp_echo_on, spawn_udp_tagged, stat_of, udp_client,
@@ -227,7 +228,7 @@ fn duplicate_udp_forwarder_is_rejected() {
     }
     let out = cmd
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_safe()
         .expect("run rfw");
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
