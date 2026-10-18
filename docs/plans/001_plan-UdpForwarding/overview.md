@@ -43,7 +43,8 @@ Prima del lavoro UDP si corregge il bug TCP B1 (precedenza della configurazione 
 | D4 | Il duplicato si valuta sulla coppia (protocol, local_addr): TCP+UDP sulla stessa porta è ammesso, UDP+UDP no. Il messaggio TCP resta invariato (`Duplicate local address '0.0.0.0:8080'. …`); quello UDP mostra `'0.0.0.0:53/udp'`. | supervisore | — |
 | D5 | Modello sessione: un socket listener UDP per forwarder. Per ogni client `SocketAddr` si apre un socket upstream **connesso** (porta effimera), che dà filtraggio sorgente kernel e consegna errori ICMP. Il task listener possiede in esclusiva `HashMap<SocketAddr, SessionEntry>` (std SipHash, resistente a HashDoS con sorgenti spoofate), senza lock. | supervisore | — |
 | D6 | Percorso client→upstream nel listener, a batch di 64 datagrammi per wakeup (`try_recv_from`). Si invia con **syscall raw** `SockRef::from(&upstream).send()`, senza usare la readiness di tokio: un socket appena registrato ha readiness vuota e `try_send` scarterebbe il primo datagramma. `WouldBlock` = drop contato, il listener non attende mai. | supervisore + advisor | — |
-| D7 | Percorso upstream→client nel task sessione: `upstream.ready(READABLE\|ERROR)`, poi `try_io(READABLE\|ERROR, read raw via SockRef)` con buffer thread-local da 64 KiB. Si invia con `listener.try_send_to`; se dà `WouldBlock` si copia in un `Vec` e si fa `send_to().await` in select con cancel. Il borrow thread-local non attraversa mai un `.await`. Con batch pieno si fa `yield_now()`. | supervisore (R2, R3) | — |
+| D7 | ~~Superata da D7a (rev 2).~~ Percorso upstream→client nel task sessione: `upstream.ready(READABLE\|ERROR)`, poi `try_io(READABLE\|ERROR, read raw via SockRef)` con buffer thread-local da 64 KiB. Si invia con `listener.try_send_to`; se dà `WouldBlock` si copia in un `Vec` e si fa `send_to().await` in select con cancel. Il borrow thread-local non attraversa mai un `.await`. Con batch pieno si fa `yield_now()`. | supervisore (R2, R3) | — |
+| D7a | Come D7, ma la lettura è `recv_upstream`: prima `try_io(Interest::READABLE, raw read)`, su `WouldBlock` `try_io(Interest::ERROR, raw read)`. `try_io` di tokio 1.53.1 onora solo interest a flag singolo (`Interest::mask()` mappa un interest combinato su `Ready::EMPTY` → closure mai eseguita → spin). Ogni `try_io` azzera la propria readiness su `WouldBlock`; l'ICMP solo-EPOLLERR viene consumato dal ramo ERROR. Vale anche per lo scheletro B di 3.1. | supervisore (R3 rev 2; evidenza 2.1) | D7 |
 | D8 | Un unico classificatore `classify_udp_err(&io::Error) -> UdpErr {WouldBlock, Transient, Icmp(IcmpKind), Fatal}`: Interrupted→Transient; ConnectionRefused\|ConnectionReset→Icmp(PortUnreachable); HostUnreachable→Icmp(HostUnreachable); NetworkUnreachable→Icmp(NetworkUnreachable). Uso per percorso in D8a. | supervisore + advisor | — |
 | D8a | Uso del classificatore per percorso:<br>• recv listener: Transient e Icmp = ignora (Windows WSAECONNRESET riguarda i client); Fatal = log rate-limited + backoff 50 ms.<br>• send upstream: ogni errore = drop contato; Icmp anche `mark_udp_icmp_error`; Fatal = debug, la sessione resta.<br>• recv upstream: Icmp = `mark_udp_icmp_error` e continua; Fatal = sessione `dead`.<br>• send verso client: WouldBlock = slow path; altro = drop contato. | supervisore | — |
 | D9 | Eviction fatta solo dal listener, con uno sweep fisso ogni 1 s (`tokio::time::interval`). Il timeout si legge live dai knobs a ogni sweep. Si rimuove la sessione se idle ≥ timeout o se `dead`. | supervisore | — |
@@ -90,7 +91,7 @@ client ──dgram──▶ listener UdpSocket (Arc) ── try_recv_from batch 
                 │        │ try_send_to / send_to().await (slow path)      │ miss: open_session (sync): target=watch.first(),
                 │        │                                                │       permit=udp_limit.try_acquire, socket2 connect,
                 │   run_session task (1 per sessione, TaskTracker) ◀──────┘       spawn run_session, insert
-                │     ready(READABLE|ERROR) → try_io(raw read) batch 64 ◀── reply dal target / ICMP (sk_err)
+                │     ready(READABLE|ERROR) → try_io(READABLE) poi try_io(ERROR) batch 64 ◀── reply dal target / ICMP (sk_err)
                 │   sweep ogni 1s: idle ≥ knobs.udp_session_timeout() o dead → cancel + remove
                 │   watch<Arc<[SocketAddr]>> ◀── run_dns_refresher (1s, solo hostname) → DnsChanged
                 └─ stop: cancel → close_all → tracker.wait(≤2s) → drop listener → ListeningGuard off
@@ -153,7 +154,7 @@ la libreria alternativa (quinn-udp), le costanti libc e le API di socket2, la fa
 |----|-------------------------|-------|--------------------------|
 | R1 | Formato cmsg e limiti di UDP_SEGMENT/UDP_GRO; errori della send GSO (obbligatoria per la fase 3) | CONFIRMED | D18, D19, D21; 3.1; test offload |
 | R2 | Come Linux consegna ICMP su UDP connesso (poll/recv/send) (obbligatoria) | CONFIRMED | D7, D8, D14; 2.1, 2.2 |
-| R3 | Readiness di tokio 1.53.1 e mio 1.2.4 (Interest::ERROR, try_io) (obbligatoria) | CONFIRMED | D6, D7; 2.1 |
+| R3 | Readiness di tokio 1.53.1 e mio 1.2.4 (Interest::ERROR, try_io) (obbligatoria) | CONFIRMED (corretta in rev 2) | D6, D7a; 2.1, 3.1 |
 | R4 | quinn-udp come alternativa (opzionale) | CONFIRMED (scartato) | D19 |
 | R5 | Costanti libc 0.2.186 e API socket2 0.6.5 (obbligatoria) | CONFIRMED | 2.1, 3.1 |
 | R6 | WSAECONNRESET di Winsock su UDP dopo ICMP (opzionale) | INFERENCE (non riletta) | D8 |
@@ -182,8 +183,8 @@ la libreria alternativa (quinn-udp), le costanti libc e le API di socket2, la fa
   - si riporta solo se il socket è connesso (harderr: port e host unreachable; net unreachable no, senza IP_RECVERR);
   - su loopback non c'è rate-limit ICMP; altrove circa 1 ICMP/s per destinazione con burst 6.
 - Inferenza: un waiter solo-READABLE non si sveglia mai su ICMP, e `try_recv` di tokio (interest READABLE)
-  non consumerebbe l'errore, producendo un busy loop. Servono quindi `Interest::ERROR` e `try_io` con interest
-  READABLE|ERROR. L'errore può arrivare anche sulla `send` (advisor), da qui il classificatore unico.
+  non consumerebbe l'errore, producendo un busy loop. Servono quindi `Interest::ERROR` sul wait e un `try_io` con
+  interest ERROR (D7a, rev 2: non un interest combinato). L'errore può arrivare anche sulla `send` (advisor), da qui il classificatore unico.
 - Impatto: D7, D8, D8a e la truth table di D14 (finestra quiet di 3 s ≥ 2 periodi di refill ICMP).
 
 ### R3 — readiness di tokio e mio
@@ -195,6 +196,9 @@ la libreria alternativa (quinn-udp), le costanti libc e le API di socket2, la fa
 - Fatto:
   - `try_io` non esegue la closure se la readiness filtrata è vuota e azzera la readiness solo su WouldBlock;
   - `Interest::ERROR` mappa `Ready::ERROR`;
+  - **rev 2 (correzione)**: `Interest::mask()` (`src/io/interest.rs`) è un `match` sui flag singoli; un interest
+    combinato (READABLE|ERROR) mappa `Ready::EMPTY`, quindi `try_io` combinato non esegue mai la closure.
+    `ready()` invece onora gli interest combinati. Osservato in 2.1: spin al 100 % CPU. Da qui D7a;
   - in mio `is_readable` = EPOLLIN|EPOLLPRI (EPOLLERR escluso) e `is_error` = EPOLLERR.
 - Inferenza: un socket appena registrato ha readiness vuota, quindi `try_send` darebbe WouldBlock senza
   syscall. Da qui D6 (send raw per l'upstream).

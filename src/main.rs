@@ -7,6 +7,7 @@ mod monitor;
 mod notify;
 mod stats;
 mod testutil;
+mod udp;
 
 use std::sync::Arc;
 use std::time::Duration;

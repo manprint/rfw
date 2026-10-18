@@ -12,13 +12,14 @@ use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use crate::config::{
-    apply_cli_overrides, load_yaml_config, CliArgs, ForwarderConfig, ForwarderSource, RuntimeKnobs,
-    Settings,
+    apply_cli_overrides, load_yaml_config, CliArgs, ForwarderConfig, ForwarderSource, Protocol,
+    RuntimeKnobs, Settings, MAX_UDP_SESSIONS,
 };
 use crate::forwarder::{rate_sampler, run_forwarder, stats_reporter};
 use crate::monitor::{probe_all, run_monitor};
 use crate::notify::{Event as Alert, Notifier, ProbeReport};
 use crate::stats::StatsRegistry;
+use crate::udp::run_udp_forwarder;
 
 /// How long to wait for in-flight connections to finish on shutdown before
 /// abandoning them (the runtime drops the rest at process exit).
@@ -59,6 +60,8 @@ pub struct ForwarderManager {
     conn_tracker: TaskTracker,
     /// Global cap on concurrently proxied connections. `None` = unbounded.
     conn_limit: Option<Arc<Semaphore>>,
+    /// Global cap on concurrent UDP sessions (`udp_max_sessions`, startup-only).
+    udp_limit: Arc<Semaphore>,
     /// Alert sink shared by every forwarder, monitor and the reload path.
     notifier: Notifier,
 }
@@ -92,6 +95,9 @@ impl ForwarderManager {
                 .max_connections
                 .filter(|n| *n > 0)
                 .map(|n| Arc::new(Semaphore::new(n))),
+            udp_limit: Arc::new(Semaphore::new(
+                settings.udp_max_sessions.clamp(1, MAX_UDP_SESSIONS),
+            )),
             notifier,
         })
     }
@@ -143,6 +149,7 @@ impl ForwarderManager {
         let knobs = self.knobs.clone();
         let conn_tracker = self.conn_tracker.clone();
         let conn_limit = self.conn_limit.clone();
+        let udp_limit = self.udp_limit.clone();
         let notifier = self.notifier.clone();
 
         // Supervisor: the accept loop runs in its own task so a panic inside
@@ -152,16 +159,27 @@ impl ForwarderManager {
             let label = label.clone();
             let notifier = notifier.clone();
             tokio::spawn(async move {
-                let inner = tokio::spawn(run_forwarder(
-                    cfg_clone,
-                    token_clone,
-                    stats,
-                    resolver,
-                    knobs,
-                    conn_tracker,
-                    conn_limit,
-                    notifier.clone(),
-                ));
+                let inner = match cfg_clone.protocol {
+                    Protocol::Tcp => tokio::spawn(run_forwarder(
+                        cfg_clone,
+                        token_clone,
+                        stats,
+                        resolver,
+                        knobs,
+                        conn_tracker,
+                        conn_limit,
+                        notifier.clone(),
+                    )),
+                    Protocol::Udp => tokio::spawn(run_udp_forwarder(
+                        cfg_clone,
+                        token_clone,
+                        stats,
+                        resolver,
+                        knobs,
+                        udp_limit,
+                        notifier.clone(),
+                    )),
+                };
                 if let Err(e) = inner.await {
                     if e.is_panic() {
                         error!(forwarder = %label, error = %e, "Forwarder task panicked; its port is no longer served");
@@ -755,6 +773,36 @@ mod tests {
         TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("port must be free the moment stop_one returns");
+    }
+
+    #[tokio::test]
+    async fn stop_one_releases_the_udp_port() {
+        let m = manager();
+        let port = free_port().await;
+        let udp = ForwarderConfig {
+            protocol: Protocol::Udp,
+            ..cfg(port, 9)
+        };
+        m.start_all(&[udp]).await;
+        let mut listening = false;
+        for _ in 0..150 {
+            if m.stats_registry()
+                .collect()
+                .await
+                .iter()
+                .any(|s| s.listening)
+            {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(listening, "the UDP forwarder must start listening");
+
+        m.sync(&[]).await;
+
+        std::net::UdpSocket::bind(("127.0.0.1", port))
+            .expect("UDP port must be free the moment sync returns");
     }
 
     #[tokio::test]

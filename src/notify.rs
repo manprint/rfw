@@ -126,6 +126,8 @@ pub enum Event {
     ConfigReloadFailed { path: String, error: String },
     /// `max_connections` saturated; new connections are being refused.
     ConnectionLimitReached { label: String, rejected_total: u64 },
+    /// `udp_max_sessions` saturated; datagrams from new UDP clients are being dropped.
+    UdpSessionLimitReached { label: String, rejected_total: u64 },
     /// Anything else that went wrong inside the process.
     Internal {
         component: &'static str,
@@ -147,6 +149,7 @@ impl Event {
             Event::ConfigReloaded { .. } => "config_reloaded",
             Event::ConfigReloadFailed { .. } => "config_reload_failed",
             Event::ConnectionLimitReached { .. } => "connection_limit_reached",
+            Event::UdpSessionLimitReached { .. } => "udp_session_limit_reached",
             Event::Internal { .. } => "internal",
         }
     }
@@ -167,6 +170,7 @@ impl Event {
             | Event::ConfigReloaded { .. } => Severity::Info,
             Event::ConfigReloadFailed { .. }
             | Event::ConnectionLimitReached { .. }
+            | Event::UdpSessionLimitReached { .. }
             | Event::Internal { .. } => Severity::Warning,
             Event::TargetUnreachable { .. } | Event::BindFailed { .. } => Severity::Critical,
         }
@@ -179,7 +183,8 @@ impl Event {
         match self {
             Event::DnsChanged { label, .. } => Some((format!("dns:{label}"), THROTTLE_DNS)),
             Event::BindFailed { label, .. } => Some((format!("bind:{label}"), THROTTLE_BIND)),
-            Event::ConnectionLimitReached { label, .. } => {
+            Event::ConnectionLimitReached { label, .. }
+            | Event::UdpSessionLimitReached { label, .. } => {
                 Some((format!("limit:{label}"), THROTTLE_LIMIT))
             }
             Event::ConfigReloadFailed { .. } => {
@@ -353,6 +358,15 @@ impl Event {
             } => {
                 text.push_str(&format!(
                     "{icon} *Connection limit reached*\nForwarder {}\nmax_connections is saturated; new connections are being refused ({rejected_total} refused so far).",
+                    mono(label)
+                ));
+            }
+            Event::UdpSessionLimitReached {
+                label,
+                rejected_total,
+            } => {
+                text.push_str(&format!(
+                    "{icon} *UDP session limit reached*\nForwarder {}\nudp_max_sessions is saturated; datagrams from new clients are being dropped ({rejected_total} refused so far).",
                     mono(label)
                 ));
             }
@@ -1256,6 +1270,13 @@ mod tests {
                 &["*Connection limit reached*", "99 refused"],
             ),
             (
+                Event::UdpSessionLimitReached {
+                    label: "l".into(),
+                    rejected_total: 7,
+                },
+                &["*UDP session limit reached*", "7 refused"],
+            ),
+            (
                 Event::Internal {
                     component: "metrics",
                     message: "failed to bind 127.0.0.1:9090".into(),
@@ -1277,6 +1298,20 @@ mod tests {
             );
             assert!(text.chars().count() <= MAX_TEXT_CHARS);
         }
+    }
+
+    #[test]
+    fn udp_session_limit_alert_is_rendered_and_throttled() {
+        let ev = Event::UdpSessionLimitReached {
+            label: "a:1->b:2/udp".into(),
+            rejected_total: 7,
+        };
+        assert_eq!(ev.kind(), "udp_session_limit_reached");
+        assert_eq!(ev.severity(), Severity::Warning);
+        assert_eq!(ev.throttle().unwrap().0, "limit:a:1->b:2/udp");
+        let text = ev.render(&instance(), 0);
+        assert!(text.contains("*UDP session limit reached*"), "{text}");
+        assert!(text.contains("(7 refused so far)"), "{text}");
     }
 
     #[test]
@@ -1307,6 +1342,10 @@ mod tests {
                 attempts: 1,
             },
             Event::ConnectionLimitReached {
+                label: "l".into(),
+                rejected_total: 1,
+            },
+            Event::UdpSessionLimitReached {
                 label: "l".into(),
                 rejected_total: 1,
             },

@@ -599,7 +599,13 @@ fn drain_upstream_gro(shared: &SessionShared, listener: &UdpSocket, stats: &Forw
         let mut replied = false;
         let mut outcome = SessionDrain::Full;
         for _ in 0..SESSION_BATCH {
-            let res = shared.upstream.try_io(Interest::READABLE | Interest::ERROR, || offload::recv(fd, &mut buf[..], false));
+            // D7a (rev 2): single-flag interests only; READABLE first, ERROR on WouldBlock.
+            let res = match shared.upstream.try_io(Interest::READABLE, || offload::recv(fd, &mut buf[..], false)) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    shared.upstream.try_io(Interest::ERROR, || offload::recv(fd, &mut buf[..], false))
+                }
+                res => res,
+            };
             match res {
                 Ok(r) => {
                     replied = true;

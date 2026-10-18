@@ -414,6 +414,8 @@ pub struct RuntimeKnobs {
     /// Target monitor cadence and alert threshold (read live by the monitor).
     probe_interval_secs: AtomicU64,
     unreachable_after_secs: AtomicU64,
+    /// UDP session idle timeout (read live by the session sweep).
+    udp_session_timeout_secs: AtomicU64,
 }
 
 impl RuntimeKnobs {
@@ -429,6 +431,7 @@ impl RuntimeKnobs {
             keepalive_retries: AtomicU32::new(default_keepalive_retries()),
             probe_interval_secs: AtomicU64::new(default_probe_interval()),
             unreachable_after_secs: AtomicU64::new(default_unreachable_after()),
+            udp_session_timeout_secs: AtomicU64::new(default_udp_session_timeout()),
         };
         knobs.update(s);
         knobs
@@ -460,6 +463,13 @@ impl RuntimeKnobs {
             .store(s.probe_interval_secs, Ordering::Relaxed);
         self.unreachable_after_secs
             .store(s.unreachable_after_secs, Ordering::Relaxed);
+        self.udp_session_timeout_secs
+            .store(s.udp_session_timeout_secs, Ordering::Relaxed);
+    }
+
+    /// Idle time after which a UDP session is closed (read live by every sweep).
+    pub fn udp_session_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.udp_session_timeout_secs.load(Ordering::Relaxed).max(1))
     }
 
     /// Cadence of the target monitor's active probes.
@@ -1376,6 +1386,26 @@ mod tests {
         let s = load_settings(&cli).unwrap();
         assert_eq!(s.keepalive_idle_secs, 0);
         assert!(RuntimeKnobs::from_settings(&s).keepalive().is_none());
+    }
+
+    #[test]
+    fn knobs_expose_the_udp_session_timeout() {
+        let knobs = RuntimeKnobs::from_settings(&Settings {
+            udp_session_timeout_secs: 7,
+            ..Settings::default()
+        });
+        assert_eq!(
+            knobs.udp_session_timeout(),
+            std::time::Duration::from_secs(7)
+        );
+        knobs.update(&Settings {
+            udp_session_timeout_secs: 0,
+            ..Settings::default()
+        });
+        assert_eq!(
+            knobs.udp_session_timeout(),
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[test]

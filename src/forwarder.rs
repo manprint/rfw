@@ -21,12 +21,12 @@ use crate::stats::{format_bytes, CountingStream, ForwarderStats, StatsRegistry, 
 const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// Backoff between attempts to bind a local address that is taken.
-const BIND_RETRY_DELAY: Duration = Duration::from_secs(5);
+pub(crate) const BIND_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Local gate on the "connection limit reached" alert: the accept loop is a
 /// hot path, so the check is one `Instant` comparison, not a channel send per
 /// rejected connection. The notifier throttles further downstream.
-const LIMIT_ALERT_SPACING: Duration = Duration::from_secs(60);
+pub(crate) const LIMIT_ALERT_SPACING: Duration = Duration::from_secs(60);
 
 /// Apply per-socket tuning: disable Nagle, (optionally) size the kernel
 /// send/receive buffers, and (optionally) arm TCP keepalive. Failures are
@@ -97,10 +97,10 @@ fn keepalive_params(ka: KeepaliveConfig) -> socket2::TcpKeepalive {
 /// Created right after a successful bind and dropped on every exit path of the
 /// accept loop (cancel, panic), so the health route can never keep reporting a
 /// listener that is gone.
-struct ListeningGuard(Arc<ForwarderStats>);
+pub(crate) struct ListeningGuard(Arc<ForwarderStats>);
 
 impl ListeningGuard {
-    fn new(stats: Arc<ForwarderStats>) -> Self {
+    pub(crate) fn new(stats: Arc<ForwarderStats>) -> Self {
         stats.set_listening(true);
         Self(stats)
     }
@@ -505,7 +505,7 @@ async fn proxy_connection(
 }
 
 /// Sleep unless cancelled. Returns true if cancelled.
-async fn cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
+pub(crate) async fn cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => true,
         _ = tokio::time::sleep(dur) => false,
@@ -515,10 +515,10 @@ async fn cancelled(cancel: &CancellationToken, dur: Duration) -> bool {
 /// RAII guard: increments the active-connection count on creation and
 /// decrements it on drop, guaranteeing the count is restored on every exit
 /// path of the connection task, including a panic.
-struct ConnGuard(Arc<ForwarderStats>);
+pub(crate) struct ConnGuard(Arc<ForwarderStats>);
 
 impl ConnGuard {
-    fn new(stats: Arc<ForwarderStats>) -> Self {
+    pub(crate) fn new(stats: Arc<ForwarderStats>) -> Self {
         stats.inc_connections();
         Self(stats)
     }

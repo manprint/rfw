@@ -1,7 +1,7 @@
 # UDP Forwarding — Implementation state
 
 Read first at every session. Updated 2026-10-18 by agent-1:opus (planning session).
-Plan ID: 001_plan-UdpForwarding. Revision: 1. Repo root: /mnt/fabio/dati/Git/Github-manprint/rfw.
+Plan ID: 001_plan-UdpForwarding. Revision: 2. Repo root: /mnt/fabio/dati/Git/Github-manprint/rfw.
 Plan baseline: c50db1f (branch main).
 
 Pre-existing changes at baseline:
@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: P1 / 1) |
+| ID / attempt | — (last closed: 2.1 / 1) |
 | Status | none |
-| Intent | Plumbing: stats protocol + datagram counters, Prometheus, JSON, traffic report, startup report |
-| Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
-| File / unit heading | phase_02.md "1.2" |
+| Intent | UDP engine src/udp.rs + manager dispatch (gate D17 still active) |
+| Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
+| File / unit heading | phase_03.md "2.1" |
 | Current step | none |
-| Next eligible plan unit | 2.1, phase_03.md |
-| Unit base | 356cfa2; branch: main; owned changes: src/stats.rs, src/metrics.rs, src/forwarder.rs, src/notify.rs, src/monitor.rs, src/manager.rs |
-| Repo state | HEAD 6772a41 |
+| Next eligible plan unit | 2.2 |
+| Unit base | 447101a; branch: main; owned changes: src/udp.rs (NEW), src/forwarder.rs (pub(crate)), src/stats.rs, src/config.rs (knob), src/notify.rs, src/manager.rs, src/main.rs |
+| Repo state | HEAD 447101a |
 
-Next action: open 2.1: agent-1:opus pre-dispatch review, then agent-2:sonnet.
+Next action: dispatch 2.2 to agent-2:sonnet (un-gate D17, monitor, main.rs, e2e_udp, webhook tests)
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 2.1 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review + D7a fix) | udp.rs (new engine + 14 tests; recv_upstream per D7a), forwarder.rs (pub(crate) guards/consts/cancelled), stats.rs (IcmpKind, ICMP marks, now_ms, datagram adders, mark_connect_ok_at), config.rs (udp_session_timeout knob), notify.rs (UdpSessionLimitReached), manager.rs (udp_limit, Protocol dispatch), main.rs (mod udp) | G-HYG pass; G-U2.1 130 passed incl. udp::tests 14/14 ×6 runs, +4 outside tests; red: worker run hung (combined-interest try_io spin) → rev 2 | unit:2.1:1 |
 | phase-close | P1 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass; review approve | unit:P1:1 |
 | sub-phase | 1.2 / 1 | 1 | agent-3:haiku (impl), agent-1:opus (review) | stats.rs (protocol, datagram counters, with_protocol, register_with_protocol), metrics.rs (UDP-only datagram families, JSON protocol + datagram fields), forwarder.rs (traffic_row), notify.rs (ProbeReport.protocol, Started UDP render), monitor.rs, manager.rs | G-HYG pass; G-U1.2 66 passed incl. 7 new | unit:1.2:1 |
 | sub-phase | 1.1 / 1 | 1 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (Protocol, label /udp, D1a parsing, (protocol,addr) duplicates, udp_* settings+CLI, D17 gate), test literals in forwarder/manager/monitor, e2e_lifecycle +2 | G-HYG pass; config::tests 47 passed incl. 9 new; e2e_lifecycle 17 passed | unit:1.1:1 |
@@ -367,6 +368,8 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 2.1 post-diff | agent-1:opus | rev 2; working tree on 447101a | I-4 listener path sync, I-6 tasks.wait grace, I-14 raw send, thread-local buf never across await, log levels; worker escalation on R3 verified in tokio source | approve (after D7a fix) |
+| 2.1 pre-dispatch | agent-1:opus | rev 1; 447101a | skeleton vs HEAD: stats.with_protocol/datagram counters pub, elapsed_ms private (now_ms wrapper needed), resolve_targets pub(crate) signature, knobs getters, Notifier::disabled, bind loop of run_forwarder, mod list in main.rs | approve dispatch |
 | P1 phase review | agent-1:opus | rev 1; 6772a41 | I-1, I-7 (UDP refused in CLI/env/YAML), I-13; README unchanged and still accurate (UDP gated, syntax docs describe TCP only) | approve |
 | 1.2 post-diff | agent-1:opus | rev 1; 356cfa2 + 1.2 diff | I-13 TCP exposition/JSON/report unchanged except added "protocol"; datagram families UDP-only; HELP texts | approve |
 | 1.1 post-diff | agent-1:opus | rev 1; dedf948 + 1.1 diff | I-1 TCP label byte-identical; D1a strings; D4 dup key; D12 validate/clamp; D17 gate in both load paths | approve |
@@ -388,7 +391,7 @@ Readiness notes:
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
-| — | — | — | — | — |
+| 2 | D7 / R3: session read via `try_io(READABLE \| ERROR, raw read)` | D7a: `recv_upstream` = `try_io(READABLE)` then, on WouldBlock, `try_io(ERROR)`. tokio 1.53.1 `Interest::mask()` maps combined interests to `Ready::EMPTY`, so the combined try_io never ran its closure and the session task spun at 100 % CPU (found by agent-2 in 2.1, confirmed in tokio source). | agent-1:opus | 2.1 code fixed by supervisor, G-U2.1 green ×6; phase_04 skeleton B line updated (3.1); overview D7a/R3, phase_03 D7/R3/troubleshooting updated |
 
 ## 9. Blockers
 none
@@ -398,7 +401,9 @@ none
 - Local cross-compile for Windows GNU/Darwin without Docker fails (no mingw `x86_64-w64-mingw32-gcc` for ring, no
   macOS SDK). Use G-XPLAT in Docker. Do not install toolchains on the host.
 - `upstream.try_recv()`/`try_send()` on a fresh session socket loses the first datagram, and READABLE-only
-  interest spins on ICMP (R2, R3). Use the raw send and `try_io(READABLE | ERROR)` as specified.
+  interest spins on ICMP (R2, R3). Use the raw send and `recv_upstream` (D7a).
+- Never call tokio `try_io` with a combined interest (e.g. READABLE | ERROR): on tokio 1.53.1 it never runs the
+  closure and never clears readiness → 100 % CPU spin (rev 2). One `try_io` per single-flag interest.
 
 ## 11. Progress board
 
@@ -408,7 +413,7 @@ none
 | 0.1 | phase_01.md | none | DONE | 1 | G-U0.1 pass; review agent-1:opus |
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U1.1 pass; review agent-1:opus |
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1.2 pass; review agent-1:opus |
-| 2.1 | phase_03.md | P1 | TODO | 1 | — |
+| 2.1 | phase_03.md | P1 | DONE | 1 | G-U2.1 pass; review agent-1:opus |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
 | 2.3 | phase_03.md | 2.2 | TODO | 1 | — |
 | 3.1 | phase_04.md | P2 | TODO | 1 | — |
@@ -428,7 +433,7 @@ README obligation per phase:
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | DONE | review agent-1:opus; unit:P1:1 |
-| 2 | phase_03.md | P2 | TODO | — |
+| 2 | phase_03.md | P2 | IN_PROGRESS | — |
 | 3 | phase_04.md | P3 | TODO | — |
 
 Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED. SKIPPED keeps a reason and does not
@@ -463,24 +468,24 @@ automatically satisfy dependent units.
 | `metrics::tests::json_carries_protocol_and_udp_datagram_fields` | 1.2 | G-U1.2 | pass | 1.2/1 |
 | `forwarder::tests::traffic_row_formats_tcp_unchanged_and_udp_with_datagrams` | 1.2 | G-U1.2 | pass | 1.2/1 |
 | `notify::tests::started_reports_udp_targets_as_resolved` | 1.2 | G-U1.2 | pass | 1.2/1 |
-| `udp::tests::forwards_a_datagram_and_its_reply` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::first_datagram_of_a_new_session_is_never_dropped` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::datagram_boundaries_are_preserved_for_all_sizes` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::each_client_gets_its_own_session_and_only_its_replies` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::idle_sessions_expire_and_release_their_slot` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::session_cap_drops_and_counts_new_flows` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::cancel_releases_the_port_before_returning` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::sessions_follow_a_dns_change_and_old_ones_close` (linux) | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::classify_udp_err_covers_every_kind` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::bind_conflict_retries_then_listens` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::session_timeout_is_read_live` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::icmp_errors_are_recorded_and_kick_the_monitor` (linux) | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::log_gate_reports_suppressed_counts` | 2.1 | G-U2.1 | TODO | — |
-| `udp::tests::same_addr_set_ignores_order` | 2.1 | G-U2.1 | TODO | — |
-| `stats::tests::mark_connect_ok_at_is_throttled_but_never_hides_a_reply_after_icmp` | 2.1 | G-U2.1 | TODO | — |
-| `config::tests::knobs_expose_the_udp_session_timeout` | 2.1 | G-U2.1 | TODO | — |
-| `notify::tests::udp_session_limit_alert_is_rendered_and_throttled` | 2.1 | G-U2.1 | TODO | — |
-| `manager::tests::stop_one_releases_the_udp_port` | 2.1 | G-U2.1 | TODO | — |
+| `udp::tests::forwards_a_datagram_and_its_reply` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::first_datagram_of_a_new_session_is_never_dropped` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::datagram_boundaries_are_preserved_for_all_sizes` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::each_client_gets_its_own_session_and_only_its_replies` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::idle_sessions_expire_and_release_their_slot` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::session_cap_drops_and_counts_new_flows` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::cancel_releases_the_port_before_returning` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::sessions_follow_a_dns_change_and_old_ones_close` (linux) | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::classify_udp_err_covers_every_kind` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::bind_conflict_retries_then_listens` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::session_timeout_is_read_live` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::icmp_errors_are_recorded_and_kick_the_monitor` (linux) | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::log_gate_reports_suppressed_counts` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `udp::tests::same_addr_set_ignores_order` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `stats::tests::mark_connect_ok_at_is_throttled_but_never_hides_a_reply_after_icmp` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `config::tests::knobs_expose_the_udp_session_timeout` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `notify::tests::udp_session_limit_alert_is_rendered_and_throttled` | 2.1 | G-U2.1 | pass | 2.1/1 |
+| `manager::tests::stop_one_releases_the_udp_port` | 2.1 | G-U2.1 | pass | 2.1/1 |
 | `monitor::tests::udp_verdict_truth_table` | 2.2 | G-U2.2 | TODO | — |
 | `monitor::tests::udp_monitor_alerts_on_icmp_and_recovers_on_reply` | 2.2 | G-U2.2 | TODO | — |
 | `monitor::tests::udp_monitor_freezes_without_new_evidence` | 2.2 | G-U2.2 | TODO | — |

@@ -13,6 +13,16 @@ use crate::config::Protocol;
 /// EWMA smoothing factor for rate derivation (0..1). Higher = more reactive.
 const RATE_ALPHA: f64 = 0.3;
 
+/// Kind of the last ICMP error reported on a UDP session's upstream socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(clippy::enum_variant_names)]
+pub enum IcmpKind {
+    PortUnreachable = 1,
+    HostUnreachable = 2,
+    NetworkUnreachable = 3,
+}
+
 /// Per-forwarder traffic counters.
 ///
 /// `bytes_sent` / `bytes_received` are **lifetime-monotonic**: they accumulate
@@ -70,6 +80,11 @@ pub struct ForwarderStats {
     /// Wakes the monitor when a real connection fails, so the downtime clock
     /// starts within a second of the first client-visible failure.
     probe_kick: Notify,
+    /// Milliseconds since `epoch` of the last ICMP error seen by any session
+    /// (`u64::MAX` = never).
+    udp_icmp_error_ms: AtomicU64,
+    /// [`IcmpKind`] of the last ICMP error (0 = none).
+    udp_icmp_kind: AtomicU8,
 }
 
 const TARGET_UNKNOWN: u8 = 0;
@@ -99,6 +114,8 @@ impl ForwarderStats {
             epoch: Instant::now(),
             last_connect_ok_ms: AtomicU64::new(NEVER_MS),
             probe_kick: Notify::new(),
+            udp_icmp_error_ms: AtomicU64::new(NEVER_MS),
+            udp_icmp_kind: AtomicU8::new(0),
         }
     }
 
@@ -166,6 +183,48 @@ impl ForwarderStats {
 
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX - 1)
+    }
+
+    /// Milliseconds since this forwarder's epoch: the clock of every `*_ms` field.
+    pub fn now_ms(&self) -> u64 {
+        self.elapsed_ms()
+    }
+
+    pub fn add_datagrams_sent(&self, n: u64) {
+        self.datagrams_sent.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_datagrams_received(&self, n: u64) {
+        self.datagrams_received.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_datagrams_dropped(&self, n: u64) {
+        self.datagrams_dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A UDP reply arrived at `now_ms`. Throttled to one store per 100 ms, except that a
+    /// reply after the latest ICMP error is always recorded (the monitor compares the two).
+    pub fn mark_connect_ok_at(&self, now_ms: u64) {
+        let last = self.last_connect_ok_ms.load(Ordering::Relaxed);
+        let icmp = self.udp_icmp_error_ms.load(Ordering::Relaxed);
+        let due = last == NEVER_MS
+            || last.saturating_add(100) <= now_ms
+            || (icmp != NEVER_MS && icmp >= last);
+        if due {
+            self.last_connect_ok_ms.store(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// A UDP session saw an ICMP error at `now_ms`. Wakes the monitor.
+    pub fn mark_udp_icmp_error(&self, now_ms: u64, kind: IcmpKind) {
+        self.udp_icmp_kind.store(kind as u8, Ordering::Relaxed);
+        self.udp_icmp_error_ms.store(now_ms, Ordering::Relaxed);
+        self.probe_kick.notify_one();
+    }
+
+    #[cfg(test)]
+    fn last_connect_ok_ms_raw(&self) -> u64 {
+        self.last_connect_ok_ms.load(Ordering::Relaxed)
     }
 
     /// A real outbound connection to the target just succeeded.
@@ -606,6 +665,22 @@ mod tests {
             .await
             .expect("a failed connect must wake the monitor")
             .unwrap();
+    }
+
+    #[test]
+    fn mark_connect_ok_at_is_throttled_but_never_hides_a_reply_after_icmp() {
+        let s = ForwarderStats::with_protocol("t".into(), Protocol::Udp);
+        s.mark_connect_ok_at(1000);
+        assert_eq!(s.last_connect_ok_ms_raw(), 1000);
+        s.mark_connect_ok_at(1050);
+        assert_eq!(s.last_connect_ok_ms_raw(), 1000);
+        s.mark_connect_ok_at(1100);
+        assert_eq!(s.last_connect_ok_ms_raw(), 1100);
+        s.mark_udp_icmp_error(1120, IcmpKind::PortUnreachable);
+        s.mark_connect_ok_at(1130);
+        assert_eq!(s.last_connect_ok_ms_raw(), 1130);
+        s.mark_connect_ok_at(1140);
+        assert_eq!(s.last_connect_ok_ms_raw(), 1130);
     }
 
     #[test]

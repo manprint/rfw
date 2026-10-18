@@ -33,7 +33,7 @@ Plan revision: 1.
   - batch da `LISTENER_BATCH = 64` `try_recv_from` per wakeup;
   - send con syscall raw `socket2::SockRef::from(&upstream).send(data)`, **mai** `upstream.try_send()`/`send().await`;
   - `WouldBlock` = drop contato; il listener non fa mai `.await` su questo percorso (I-4).
-- **D7 — upstream→client** in un task per sessione:
+- **D7 — upstream→client** (superata da D7a, rev 2: la lettura è `recv_upstream`, `try_io(READABLE)` poi `try_io(ERROR)`; un `try_io` con interest combinato non esegue mai la closure) in un task per sessione:
   - attesa: `upstream.ready(Interest::READABLE | Interest::ERROR)`;
   - lettura: `upstream.try_io(Interest::READABLE | Interest::ERROR, || (&*sockref).read(buf))`, con buffer
     thread-local da 64 KiB;
@@ -137,8 +137,8 @@ Plan revision: 1.
   - l'errore è consumato dalla prima `recv` o `send`;
   - su loopback non c'è rate limit ICMP.
 
-  Conseguenza (inferenza del supervisore): servono `Interest::ERROR` sul wait e `try_io` con
-  READABLE|ERROR. `try_recv()` di tokio con interest READABLE non consumerebbe l'errore e farebbe busy loop.
+  Conseguenza (inferenza del supervisore): servono `Interest::ERROR` sul wait e un `try_io` con
+  interest ERROR separato (D7a, rev 2). `try_recv()` di tokio con interest READABLE non consumerebbe l'errore e farebbe busy loop.
 - **R3** (sorgente tokio 1.53.1 / mio 1.2.4, letto):
   - `try_io` non esegue la closure se la readiness filtrata è vuota, e azzera la readiness solo su `WouldBlock`;
   - un socket appena registrato ha readiness vuota.
@@ -274,7 +274,7 @@ Plan revision: 1.
   Failure handling:
   - **I-14 rosso** (il primo datagramma si perde): verificare che il send upstream sia la raw `SockRef::send`.
     Non aggiungere retry né sleep.
-  - **Busy loop / CPU al 100 % su una sessione dopo ICMP**: verificare `Interest::ERROR` sia in `ready` sia in `try_io`.
+  - **Busy loop / CPU al 100 % su una sessione dopo ICMP**: verificare `Interest::ERROR` in `ready` e il ramo `try_io(Interest::ERROR)` di `recv_upstream`; mai un `try_io` con interest combinato (D7a).
   - **Port in use al rebind** dopo lo stop: verificare che `run_udp_forwarder` attenda `tasks.wait()` e che nessun
     `Arc<UdpSocket>` sopravviva fuori dai task tracciati.
   - Qualsiasi deviazione dallo scheletro va escalata ad agent-1:opus.
@@ -880,7 +880,9 @@ fn drain_upstream(shared: &SessionShared, listener: &UdpSocket, stats: &Forwarde
         for _ in 0..SESSION_BATCH {
             // READABLE|ERROR: an ICMP error is reported as EPOLLERR alone and
             // must be consumed by a receive, or `ready()` would spin.
-            let res = shared.upstream.try_io(Interest::READABLE | Interest::ERROR, || (&*sock).read(&mut buf[..]));
+            // rev 2 (D7a): implemented as `recv_upstream(&shared.upstream, &sock, &mut buf[..])`,
+            // READABLE then ERROR; a combined-interest try_io never runs its closure.
+            let res = recv_upstream(&shared.upstream, &sock, &mut buf[..]);
             match res {
                 Ok(n) => {
                     replied = true;
