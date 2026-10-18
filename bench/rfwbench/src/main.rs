@@ -9,7 +9,7 @@ mod tcp;
 mod udp;
 mod util;
 
-const USAGE: &str = "usage: rfwbench <echo|rr|cps|hold|integrity|udprr|udpflood|udphold> [--key value]...";
+const USAGE: &str = "usage: rfwbench <echo|rr|cps|hold|integrity|udprr|udpflood|udphold|pin> [--key value]...";
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -26,6 +26,7 @@ fn main() {
         "udprr" => udp::udprr(&a),
         "udpflood" => udp::udpflood(&a),
         "udphold" => udp::udphold(&a),
+        "pin" => util::pin(&a),
         _ => util::die(USAGE),
     }
 }

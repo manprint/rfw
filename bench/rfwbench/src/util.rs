@@ -95,3 +95,31 @@ impl Prng {
         }
     }
 }
+
+/// `pin --cpus 0,2 --pids 12,34`: sched_setaffinity on every thread of every
+/// pid (run from a privileged --pid=host container to pin root-owned
+/// processes such as docker-proxy, which Docker itself starts unpinned).
+pub fn pin(a: &Args) {
+    let cpus: Vec<usize> = a.str("cpus", "0").split(',').filter_map(|c| c.trim().parse().ok()).collect();
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for c in &cpus {
+        unsafe { libc::CPU_SET(*c, &mut set) };
+    }
+    let (mut ok, mut fail) = (0, 0);
+    for pid in a.str("pids", "").split(',').filter(|p| !p.is_empty()) {
+        let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            fail += 1;
+            continue;
+        };
+        for t in rd.flatten() {
+            let tid: i32 = t.file_name().to_string_lossy().parse().unwrap_or(0);
+            let r = unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+            if r == 0 {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+    }
+    println!("{{\"pinned_threads\":{ok},\"failed\":{fail}}}");
+}

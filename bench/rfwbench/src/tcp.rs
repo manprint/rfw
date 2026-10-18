@@ -180,6 +180,9 @@ pub fn hold(a: &Args) {
     let conns: usize = a.num("conns", 1000);
     let hold_s: f64 = a.num("hold", 10.0);
     let threads: usize = a.num("threads", 8).min(conns.max(1));
+    // `--burst B`: echo B bytes through every connection (16 KiB chunks) before
+    // holding, so the forwarder's per-connection copy buffers are really touched.
+    let burst: usize = a.num("burst", 0);
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads)
         .map(|t| {
@@ -194,6 +197,14 @@ pub fn hold(a: &Args) {
                         s.write_all(&[1])?;
                         let mut b = [0u8; 1];
                         s.read_exact(&mut b)?;
+                        let mut chunk = vec![0x5au8; 16384];
+                        let mut left = burst;
+                        while left > 0 {
+                            let n = left.min(chunk.len());
+                            s.write_all(&chunk[..n])?;
+                            s.read_exact(&mut chunk[..n])?;
+                            left -= n;
+                        }
                         Ok(s)
                     }) {
                         Ok(s) => socks.push(s),

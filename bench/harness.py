@@ -428,9 +428,14 @@ class DockerProxy(Variant):
         if not self.pids:
             raise RuntimeError("no docker-proxy processes found (userland-proxy disabled?)")
         if self.ctx.pin_proxy:
-            sh(["docker", "run", "--rm", "--privileged", "--pid=host", "--label", LABEL, IMG_ALPINE, "sh", "-c",
-                "for p in %s; do taskset -pc %s $p >/dev/null; done" % (" ".join(map(str, self.pids)), self.ctx.cpus_fwd)],
-               check=False)
+            # Docker starts docker-proxy unpinned; pin it to the forwarder CPUs so
+            # it gets the same CPU budget as every other userland forwarder.
+            r = sh(["docker", "run", "--rm", "--privileged", "--pid=host", "--label", LABEL, "-v",
+                    f"{self.ctx.bench_bin}:/rfwbench:ro", IMG_ALPINE, "/rfwbench", "pin", "--cpus", self.ctx.cpus_fwd,
+                    "--pids", ",".join(map(str, self.pids))], check=False)
+            j = last_json(r.stdout) or {}
+            if not j.get("pinned_threads") or j.get("failed"):
+                log("  WARNING: docker-proxy pinning incomplete:", r.stdout.strip(), r.stderr.strip()[-200:])
         self.base = {p: read_stat_cpu(p) for p in self.pids}
 
     def ep(self, bport, proto="tcp"):
@@ -483,12 +488,13 @@ class RfwNative(Variant):
     name = "rfw"
     desc = "rfw release binary on the host (default settings)"
     extra = []
+    env = {}
 
     def start(self):
         args = [self.ctx.rfw_bin, "--log-dir", "", "--metrics-addr", f"127.0.0.1:{METRICS_PORT}", *self.extra]
         for proto, lp, ip, bp in specs(self.ctx):
             args.append(f"0.0.0.0:{lp}:{ip}:{bp}/{proto}")
-        env = dict(os.environ, RUST_LOG="warn")
+        env = dict(os.environ, RUST_LOG="warn", **self.env)
 
         def lim():
             import resource
@@ -524,6 +530,18 @@ class RfwSplice(RfwNative):
     extra = ["--splice"]
 
 
+class RfwWorkers1(RfwNative):
+    name = "rfw-w1"
+    desc = "rfw with TOKIO_WORKER_THREADS=1 (experiment)"
+    env = {"TOKIO_WORKER_THREADS": "1"}
+
+
+class RfwWorkers4(RfwNative):
+    name = "rfw-w4"
+    desc = "rfw with TOKIO_WORKER_THREADS=4 on 2 CPUs (experiment)"
+    env = {"TOKIO_WORKER_THREADS": "4"}
+
+
 class RfwGro(RfwNative):
     name = "rfw-gro"
     desc = "rfw --udp-gro-gso"
@@ -537,11 +555,14 @@ class RfwDocker(Variant):
     extra = []
     bridge = False
     image = None  # default: local build
+    ulimit = "nofile=1048576:1048576"  # None = leave Docker's default (soft 1024)
 
     def start(self):
         image = self.image or IMG_RFW_LOCAL
         args = ["run", "-d", "--name", "rfwb-fwd", "--label", LABEL, "--cpuset-cpus", self.ctx.cpus_fwd,
-                "--ulimit", "nofile=1048576:1048576", "-e", "RUST_LOG=warn", *self.docker_flags]
+                "-e", "RUST_LOG=warn", *self.docker_flags]
+        if self.ulimit:
+            args += ["--ulimit", self.ulimit]
         if self.bridge:
             args += ["--network", NET]
             for proto, lp, ip, bp in specs(self.ctx):
@@ -603,15 +624,21 @@ class RfwDockerBridge(RfwDocker):
     bridge = True
 
 
+class RfwDockerDefaultUlimit(RfwDocker):
+    name = "rfw-d-default-ulimit"
+    desc = "rfw image, host network, Docker's default nofile limit (no --ulimit)"
+    ulimit = None
+
+
 class RfwDockerReleased(RfwDocker):
     name = "rfw-d-v1.1.0"
     desc = "published ghcr.io/manprint/rfw:v1.1.0 image, host network"
     image = IMG_RFW_RELEASED
 
 
-ALL_VARIANTS = [Direct, DockerNat, DockerProxy, Socat, SocatTuned, RfwNative, RfwSplice, RfwGro, RfwDocker,
+ALL_VARIANTS = [Direct, DockerNat, DockerProxy, Socat, SocatTuned, RfwNative, RfwSplice, RfwWorkers1, RfwWorkers4, RfwGro, RfwDocker,
                 RfwDockerSplice, RfwDockerUnconfined, RfwDockerPrivileged, RfwDockerSysRes, RfwDockerBridge,
-                RfwDockerReleased]
+                RfwDockerDefaultUlimit, RfwDockerReleased]
 VARIANTS = {v.name: v for v in ALL_VARIANTS}
 
 
