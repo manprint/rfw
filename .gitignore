@@ -4,3 +4,5 @@ target
 .intentionally-empty-file.o
 note.ai
 .serena
+bench/results/
+bench/rfwbench/target/
