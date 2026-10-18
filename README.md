@@ -1,10 +1,11 @@
 # rfw — Rust Forwarder
 
-**rfw** (Rust Forwarder) is a fast, cross-platform TCP port forwarder. It listens on local ports and forwards all traffic to remote destinations — similar to `socat` but specialized and simpler for TCP-only use cases.
+**rfw** (Rust Forwarder) is a fast, cross-platform TCP and UDP port forwarder. It listens on local ports and forwards all traffic to remote destinations — similar to `socat` but specialized and simpler for TCP and UDP forwarding.
 
 ## Features
 
-- **TCP forwarding** — Bidirectional proxy between local and remote hosts
+- **TCP and UDP forwarding** — Bidirectional proxy between local and remote hosts; UDP keeps one upstream socket per client address (session), preserving datagram boundaries
+- **UDP sessions** — Idle timeout (`udp_session_timeout_secs`, default 60s, hot-reloadable), global cap `udp_max_sessions` (default 16384), drops counted, never blocking other clients
 - **Multiple forwarders** — Run many forwarders in a single process
 - **Configuration sources** — CLI args, YAML file, or environment variables
 - **Hot-reload** — Watch YAML config file for changes, apply without restart
@@ -14,7 +15,7 @@
 - **Cross-platform** — Windows, macOS, Linux (amd64 + arm64), Android (arm64)
 - **Traffic stats** — Lifetime cumulative bytes + live throughput rate per forwarder, in periodic logs and an optional HTTP endpoint (`/metrics`, `/stats`)
 - **Honest healthcheck** — `GET /` answers `200` only while every forwarder is actually bound and accepting; a forwarder stuck retrying a taken port turns it `503`
-- **Target monitoring** — Each target is probed (resolve + one TCP connect) on a cadence that backs off while real traffic proves it reachable; exposed as `rfw_target_reachable`
+- **Target monitoring** — Each TCP target is probed (resolve + one TCP connect); UDP targets are checked passively, from ICMP errors and replies (DNS only, nothing sent). Probes run on a cadence that backs off while real traffic proves it reachable; exposed as `rfw_target_reachable`
 - **Google Chat alerting** — Optional webhook (`--webhook-url` / `RFW_WEBHOOK_URL`) that reports startup with per-target reachability, DNS answer changes, a target unreachable for longer than a configurable threshold (default 5 minutes) and its recovery, ports that cannot be bound, reload errors, connection-limit saturation, internal faults and shutdown; throttled, retried, never on the data path
 - **Structured logging** — Console (human-friendly, color) + JSON file (machine-readable)
 - **High throughput** — Async I/O with `tokio`, tunable copy/socket buffers, optional Linux `splice(2)` zero-copy path; handles thousands of concurrent connections
@@ -67,7 +68,7 @@ For the "database behind a cloud DNS name on the host network" deployment, see
 ## Forwarder syntax
 
 ```
-local_host:local_port:remote_host:remote_port
+local_host:local_port:remote_host:remote_port[/tcp|/udp]
 ```
 
 | Part | Description | Example |
@@ -76,6 +77,9 @@ local_host:local_port:remote_host:remote_port
 | `local_port` | Port to listen on locally | `8080`, `3306`, `443` |
 | `remote_host` | Destination hostname/IP | `example.com`, `192.168.1.5` |
 | `remote_port` | Destination port | `80`, `443`, `5432` |
+| `/tcp`, `/udp` | Optional protocol suffix (case-insensitive); default `tcp` | `/udp` |
+
+A TCP and a UDP forwarder may share the same local port; two UDP (or two TCP) forwarders may not.
 
 **Examples:**
 
@@ -83,6 +87,7 @@ local_host:local_port:remote_host:remote_port
 127.0.0.1:8080:192.168.1.100:80         → local web proxy
 0.0.0.0:3306:db-prod.example.com:3306   → database tunnel
 0.0.0.0:443:app.azure.com:443           → cloud service proxy
+0.0.0.0:5353:1.1.1.1:53/udp             → DNS over UDP
 ```
 
 ## Configuration
@@ -107,6 +112,12 @@ forwarders:
     local_port: 3306
     remote_host: "db-prod.example.com"
     remote_port: 3306
+
+  - local_host: "0.0.0.0"
+    local_port: 5353
+    remote_host: "1.1.1.1"
+    remote_port: 53
+    protocol: udp     # tcp (default) or udp
 ```
 
 Usage:
@@ -115,13 +126,16 @@ Usage:
 rfw -f forwarders.yml
 ```
 
-The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold) are hot-reloaded; interval, `max_connections`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
+The `protocol` key accepts `tcp` or `udp` (case-insensitive); any other value is a parse error. A misspelled key name is ignored, and the forwarder then stays TCP.
+
+The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold, `udp_session_timeout_secs`) are hot-reloaded; interval, `max_connections`, `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
 
 ### 3. Environment variables
 
 ```bash
 export RFW_FORWARDER_1=127.0.0.1:8080:172.16.0.5:80
 export RFW_FORWARDER_2=0.0.0.0:3306:db-prod.example.com:3306
+export RFW_FORWARDER_3=0.0.0.0:5353:1.1.1.1:53/udp
 rfw
 ```
 
@@ -159,6 +173,11 @@ Options:
                                   (default 30)
       --unreachable-after <SECS>  Continuous failure before the "target
                                   unreachable" alert (default 300 = 5 min)
+      --udp-session-timeout <SECS>
+                                  Seconds a UDP session may stay idle before
+                                  it is closed (default 60; hot-reloadable)
+      --udp-max-sessions <N>      Max concurrent UDP sessions across all UDP
+                                  forwarders (default 16384; startup only)
       --log-dir <DIR>             Rolling JSON log directory; "" disables file
                                   logging (default "logs")
       --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
@@ -208,11 +227,12 @@ Changes are debounced (1s window) to avoid reload storms.
 > **Note:** Hot-reload applies the `forwarders:` list and the data-plane knobs
 > (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, `connect_timeout_secs`,
 > `dns_timeout_secs`, `keepalive_idle_secs`, `keepalive_interval_secs`,
-> `keepalive_retries`, `probe_interval_secs`, `unreachable_after_secs`) live —
+> `keepalive_retries`, `probe_interval_secs`, `unreachable_after_secs`,
+> `udp_session_timeout_secs`) live —
 > new connections pick up the new values; in-flight connections keep theirs.
 > CLI flags still win over the reloaded `settings:` block.
 > Changes to `report_interval_secs`, `sample_interval_secs`, `max_connections`,
-> `metrics_addr`, `webhook_url` and `instance_name` still require a restart.
+> `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` still require a restart.
 >
 > Every reload outcome is alerted when a webhook is configured: a successful
 > one names the forwarders added and removed, a rejected one says the running
@@ -226,7 +246,9 @@ reason logged. Duplicate local addresses are rejected the same way.
 
 Re-targeting a forwarder (same local port, different remote) tears down its
 listener and rebuilds it on the same port; the old socket is fully released
-before the rebind, so the port does not go dark in between.
+before the rebind, so the port does not go dark in between. For a UDP
+forwarder the existing sessions are closed with it, and the client's next
+datagram opens a new session.
 
 ## How it works
 
@@ -269,6 +291,25 @@ Each forwarder runs as an independent async task:
 - **Target monitoring:** One monitor task per forwarder resolves the target and opens (then closes) a TCP connection every `probe_interval_secs`, feeding `rfw_target_reachable`. The probe is skipped while real connections keep succeeding, and pulled forward when a real connection fails, so the downtime clock starts within a second of the first client-visible failure. The resolved address set is shared with the data path, so a DNS change is reported exactly once, by whichever sees it first.
 - **Alerting:** Events go into a bounded queue drained by one delivery task (`POST {"text": …}` to the webhook, rustls + bundled roots, 3 attempts with backoff, per-kind throttling). Producers never wait on it: a slow or dead webhook costs a counter, not a connection. See [Alerting to Google Chat](#alerting-to-google-chat-webhook).
 - **Logging:** All connection/disconnection/error events are logged to stdout (color, human-friendly) and to `logs/rfw.log` (JSON, daily rotation).
+
+### UDP
+
+A UDP forwarder has no connection to accept. Each client address gets a
+**session**: one upstream socket, connected to the target, so the kernel
+filters the replies and delivers ICMP errors to it. Datagram boundaries are
+preserved in both directions, and each session has its own task for the
+replies from the target.
+
+- The listener reads up to 64 datagrams per wakeup. It never waits on the
+  client-to-target path: when the upstream send buffer is full, the datagram
+  is dropped and counted.
+- Sessions idle for `udp_session_timeout_secs` are closed; a sweep runs every
+  second.
+- For a remote hostname, the DNS refresh runs every second. When the set of
+  addresses changes, sessions towards addresses that are no longer published
+  are closed, and new sessions use the first address of the new set.
+- On stop, UDP sessions get up to 2 seconds to finish, after which the port is
+  released.
 
 ## Performance & tuning
 
@@ -337,6 +378,29 @@ The buffer, socket-buffer, splice, timeout and keepalive knobs above are
 **hot-reloadable** via the YAML `settings:` block — new connections adopt the
 new values without a restart. `max_connections` is fixed at startup.
 
+### UDP tuning
+
+- **`--socket-buffer-bytes <N>`** applies to the UDP listener (at bind) and to
+  every new upstream socket, best effort. The listener reads back
+  `SO_RCVBUF`; when the kernel caps it below the request, rfw logs
+  `UDP listener receive buffer capped by the kernel; raise net.core.rmem_max`.
+  Check the limits with `sysctl net.core.rmem_max net.core.wmem_max`, and look
+  for `RcvbufErrors` in `netstat -su` or `nstat`.
+- **`--buffer-bytes`** does not apply to UDP: each receive uses a fixed 64 KiB
+  buffer, enough for the largest IPv6 datagram.
+- **File descriptors:** each session holds one upstream socket. At startup rfw
+  raises the soft open-file limit to `udp_max_sessions + 256` when the hard
+  limit allows it. If it cannot, rfw logs a warning naming `LimitNOFILE`, and
+  sessions beyond the limit fail to open.
+- **Limitation:** with a wildcard bind on a multi-homed host, a reply can leave
+  from a different source IP than the one the client contacted (no
+  `IP_PKTINFO`). Bind the specific address instead.
+- `--udp-max-sessions <N>` (default 16384) caps all UDP sessions together. A
+  datagram from a new client beyond the cap is dropped and counted in
+  `rfw_rejected_connections_total`; the other sessions keep working.
+- `--udp-session-timeout <SECS>` (default 60) sets how long an idle session
+  lives, and it is hot-reloadable.
+
 ## Logging
 
 Logs go to:
@@ -350,6 +414,13 @@ per-connection detail, or `RUST_LOG=warn` to quieten both.
 Per-connection lifecycle records ("Connected" / "Disconnected") are at **debug**
 level. At `info` a busy forwarder logs only startup, reloads, the periodic
 traffic report, and genuine problems.
+
+For UDP, the startup line is `Listening (udp) on …`. Drops, session-cap
+refusals, EMFILE and DNS failures are warnings or errors, rate-limited per
+kind, and carry a `suppressed` count. Opening and closing a session is logged at
+**debug** (with the client, the local and remote addresses, the reason, the
+duration and the byte counts); per-datagram events are never logged above
+debug. To see them, run with `RUST_LOG=debug`.
 
 > **Operational note:** rotated log files are never deleted. For a long-lived
 > deployment either point `--log-dir` at a volume managed by logrotate, or run
@@ -384,9 +455,13 @@ the current throughput rate:
 ```
 ─── Traffic Report ──────────────────────────────────
   127.0.0.1:8080->172.16.0.5:80      sent=  1.230 GB  recv=  4.560 GB  tx=12.300 MB/s  rx=45.600 MB/s  active=3
+  0.0.0.0:5353->1.1.1.1:53/udp       sent=  2.100 MB  recv=  3.400 MB  tx=  0.100 MB/s  rx=  0.200 MB/s  sessions=12  dgrams tx=8800 rx=8795 drop=5
   TOTAL (all forwarders, lifetime)    sent=  1.230 GB  recv=  4.560 GB
 ──────────────────────────────────────────────────────
 ```
+
+UDP rows show `sessions=` (live sessions) and `dgrams tx= rx= drop=` (datagrams
+forwarded in each direction, and dropped) in place of `active=`.
 
 ## Bandwidth metrics endpoint
 
@@ -432,13 +507,22 @@ rfw --metrics-addr 127.0.0.1:9090 127.0.0.1:8080:172.16.0.5:80
   the webhook, given up on after retries, dropped because the queue was full,
   or folded into a later message by the throttle.
 
+  For UDP forwarders the endpoint adds `rfw_datagrams_sent_total`,
+  `rfw_datagrams_received_total` and `rfw_datagrams_dropped_total`; these
+  families appear only when a UDP forwarder is configured. For a UDP forwarder,
+  `rfw_active_connections` counts its live sessions, and
+  `rfw_rejected_connections_total` counts datagrams from new clients refused by
+  `udp_max_sessions`.
+
 - **`GET /stats`** — JSON array of per-forwarder snapshots:
 
   ```json
-  [{"label":"127.0.0.1:8080->172.16.0.5:80","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234,"listening":true,"target_reachable":true}]
+  [{"label":"127.0.0.1:8080->172.16.0.5:80","protocol":"tcp","bytes_sent":1321205760,"bytes_received":4896202752,"active_connections":3,"rejected_connections":0,"rate_sent_bps":12897484,"rate_recv_bps":48234234,"listening":true,"target_reachable":true}]
   ```
 
   `target_reachable` is `true`/`false` after the first probe and `null` before.
+  Each entry carries a `protocol` field (`"tcp"` or `"udp"`). UDP entries also
+  carry `datagrams_sent`, `datagrams_received` and `datagrams_dropped`.
 
 - **`GET /`** — Health probe. `200 OK` (body `rfw ok`) while **every**
   configured forwarder has its listener bound and accepting;
@@ -515,6 +599,7 @@ settings:
 | **Config reloaded** | Hot-reload applied; names forwarders added and removed. | info |
 | **Config reload failed** | The edited file did not parse or validate; running configuration kept. | warning |
 | **Connection limit reached** | `max_connections` is saturated and new connections are being refused (at most one message per 5 min per forwarder). | warning |
+| **UDP session limit reached** | `udp_max_sessions` is saturated and datagrams from new clients are being dropped (at most one message per 5 min per forwarder). | warning |
 | **Internal problem** | Anything else that breaks a component: the stats endpoint cannot bind, the config watcher dies, a forwarder task panics. | warning |
 | **rfw stopping** | `SIGTERM`/`SIGINT` received; says how many connections are being drained. Sent while the drain runs. | info |
 
@@ -535,6 +620,18 @@ real connection, then closes it. To keep this cheap and quiet:
   client-visible failure rather than at the next tick;
 - while the target is down, probes run every 5 s so the alert lands close to
   the threshold and recovery is noticed within seconds.
+
+For a **UDP** target nothing is ever sent to it: the probe is DNS resolution
+only. The verdict is passive, from the data path:
+
+- **unreachable** when the forwarder's sessions receive ICMP port, host or
+  network unreachable and no reply has arrived since;
+- **recovered** at the first reply, or when new datagrams are sent and no ICMP
+  error has arrived for 3 seconds;
+- with no traffic, the state stays as it was, and no alert is sent.
+
+The startup message says `resolved to … (udp: passive check)`. The same
+thresholds apply as for TCP.
 
 For a database target each probe is an empty connection: PostgreSQL logs it as
 `incomplete startup packet` at `LOG` level. With the default 30 s cadence and a
@@ -855,7 +952,7 @@ cargo build --release
 cargo test
 ```
 
-The suite has five parts:
+The suite has six parts:
 
 | Target | What it covers |
 |---|---|
@@ -863,6 +960,7 @@ The suite has five parts:
 | `tests/e2e_forward.rs` | byte-exact forwarding and live cumulative metrics, on both the portable and `splice` paths |
 | `tests/e2e_lifecycle.rs` | startup validation, `SIGTERM` drain, `max_connections` shedding, half-close propagation, abrupt-reset leak checks, the healthcheck probe including `503` while a port cannot be bound and recovery once it frees |
 | `tests/e2e_hot_reload.rs` | re-targeting a port without an outage, add/remove, malformed and duplicate configs, live knob reloads, counter continuity |
+| `tests/e2e_udp.rs` | UDP round trips and metrics, env and YAML `protocol: udp` with hot-reload re-target, TCP and UDP sharing a port, duplicate UDP rejected, idle-session expiry, `udp_max_sessions` cap and counting, `/` returning `503` while a UDP port is taken, `SIGTERM` with idle sessions, rate-limited drop logs, closed UDP target reported unreachable, a TCP and UDP reference scenario; `udp_bench` is ignored by default (run it with `cargo test --release --test e2e_udp udp_bench -- --ignored --nocapture`) |
 | `tests/e2e_webhook.rs` | the real binary against an in-process webhook sink: startup report with a reachable and an unreachable target, target outage → single alert → recovery, taken port → alert → recovery, reload success and failure, `SIGTERM` "stopping" message, invalid URL rejected without echoing it, `--help`, `rfw_target_reachable` and `rfw_webhook_*` on `/metrics` |
 
 The e2e suites spawn the real binary and drive it over real sockets, so they
@@ -901,6 +999,7 @@ cargo run -- localhost:8080:example.com:80
 │   ├── main.rs         # Entry point, CLI parsing
 │   ├── config.rs       # Config loading (CLI, YAML, env)
 │   ├── forwarder.rs    # TCP forwarding logic + reporter + rate sampler
+│   ├── udp.rs          # UDP forwarding engine (sessions, DNS refresh, fd budget)
 │   ├── manager.rs      # Forwarder lifecycle management (+ per-forwarder monitor)
 │   ├── monitor.rs      # Target reachability probes, DNS-change detection, outage alerts
 │   ├── notify.rs       # Google Chat webhook: events, throttle, delivery worker
@@ -913,6 +1012,7 @@ cargo run -- localhost:8080:example.com:80
 │   ├── e2e_forward.rs    # Byte-exact forwarding + live metrics
 │   ├── e2e_lifecycle.rs  # Startup validation, SIGTERM, admission control
 │   ├── e2e_hot_reload.rs # Config watcher, rebinds, malformed/duplicate configs
+│   ├── e2e_udp.rs        # UDP forwarding, sessions, reload, monitor
 │   └── e2e_webhook.rs    # Alerts against an in-process webhook sink
 └── README.md           # This file
 ```

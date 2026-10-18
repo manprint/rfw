@@ -23,12 +23,20 @@ forwarders:
     remote_host: "app.azure.com"
     remote_port: 443
 
+  # Forward UDP port 5353 to a DNS resolver (one upstream socket per client)
+  - local_host: "0.0.0.0"
+    local_port: 5353
+    remote_host: "1.1.1.1"
+    remote_port: 53
+    protocol: udp
+
 # ------------------------------------------------------------
 # Optional runtime settings (all fields optional; defaults shown).
 # CLI flags (--metrics-addr, --report-interval, --sample-interval,
 # --buffer-bytes, --socket-buffer-bytes, --splice, --max-connections,
 # --connect-timeout, --dns-timeout, --keepalive-*, --webhook-url,
-# --instance-name, --probe-interval, --unreachable-after) override these.
+# --instance-name, --probe-interval, --unreachable-after,
+# --udp-session-timeout, --udp-max-sessions) override these.
 # ------------------------------------------------------------
 settings:
   # Enable the HTTP stats endpoint (GET /metrics Prometheus, /stats JSON,
@@ -72,6 +80,14 @@ settings:
   keepalive_idle_secs: 60
   keepalive_interval_secs: 10
   keepalive_retries: 3
+
+  # Seconds a UDP session may stay idle before it is closed (hot-reloadable).
+  # Each UDP client address has its own upstream socket until this expires.
+  # udp_session_timeout_secs: 60
+  # Max concurrent UDP sessions across all UDP forwarders (startup only — a
+  # change needs a restart). Datagrams from new clients beyond it are dropped
+  # and counted in rfw_rejected_connections_total.
+  # udp_max_sessions: 16384
 
   # ── Alerting to a Google Chat webhook (startup only — a change needs a restart) ──
   # Sends a message on: startup (with one reachability probe per target), a

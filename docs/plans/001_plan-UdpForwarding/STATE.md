@@ -118,17 +118,17 @@ Project-specific hard rules, which hold in every unit:
 | Active scope | plan — whole plan `001_plan-UdpForwarding` (phases 0–3) |
 | Scope result | RUNNING |
 | Type | none |
-| ID / attempt | — (last closed: 2.2 / 1) |
+| ID / attempt | — (last closed: 2.3 / 1) |
 | Status | none |
-| Intent | un-gate D17, passive UDP monitor, fd budget, startup/shutdown, e2e_udp + webhook tests |
-| Assigned | agent-2:sonnet (delegated); supervisor: agent-1:opus |
-| File / unit heading | 2.2 Sblocco, monitor passivo, avvio/shutdown, e2e UDP |
+| Intent | UDP documentation: README, forwarders.yml, example-config test |
+| Assigned | agent-3:haiku (delegated); supervisor: agent-1:opus |
+| File / unit heading | 2.3 Documentazione UDP (README, forwarders.yml) |
 | Current step | none |
-| Next eligible plan unit | 2.3 |
-| Unit base | f13caed; branch: main; owned changes: config.rs stats.rs monitor.rs main.rs notify.rs udp.rs Cargo.toml tests/common tests/e2e_lifecycle.rs tests/e2e_udp.rs tests/e2e_webhook.rs |
-| Repo state | HEAD f13caed |
+| Next eligible plan unit | P2 |
+| Unit base | 165788d; branch: main; owned changes: README.md forwarders.yml src/config.rs (test only) |
+| Repo state | HEAD 165788d |
 
-Next action: dispatch 2.3 to agent-3:haiku (README + forwarders.yml; Dockerfile label wording noted)
+Next action: P2: Dockerfile label (supervisor), G-PHASE, G-XPLAT, G-PERF-TCP, G-UDP-BENCH, README accuracy, review
 
 ## 2. Feature context and readiness
 
@@ -312,6 +312,7 @@ cargo test --release --test e2e_udp reference_scenario -- --nocapture 2>&1 | gre
 
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
+| sub-phase | 2.3 / 1 | 2 | agent-3:haiku (impl), agent-1:opus (review) | README (intro, features, syntax, YAML, env, CLI ref, hot-reload, How it works/UDP, UDP tuning, logging, traffic report, metrics, alerting, tests, structure), forwarders.yml (UDP entry + commented udp_* settings), config.rs (example test 4 forwarders, 1 UDP) | G-U2.3 1 passed; fmt + clippy exit 0 | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review) | config.rs (D17 gate + test removed, about), Cargo.toml (description), stats.rs (UdpSample, IcmpKind as_str/from_u8), monitor.rs (udp_verdict, run_udp_monitor, probe_udp_target, shared record_up/down/report_dns_change/wait_for_tick), notify.rs (DnsChanged UDP text), main.rs ((udp) suffix, ensure_fd_budget, UDP startup probe line, TCP-only drain count), udp.rs (fd budget), tests/common (UDP harness), e2e_lifecycle (-1 gate test), e2e_webhook (+2), e2e_udp (new, 12 + ignored bench) | G-HYG pass; G-U2.2 GATE_EXIT=0: unit 123 incl. 7 new; e2e_udp 12+1 ignored (×5); e2e_webhook 10; e2e_lifecycle 16; git grep exit 1 | unit:2.2:1 |
 | sub-phase | 2.1 / 1 | 2 | agent-2:sonnet (impl), agent-1:opus (review + D7a fix) | udp.rs (new engine + 14 tests; recv_upstream per D7a), forwarder.rs (pub(crate) guards/consts/cancelled), stats.rs (IcmpKind, ICMP marks, now_ms, datagram adders, mark_connect_ok_at), config.rs (udp_session_timeout knob), notify.rs (UdpSessionLimitReached), manager.rs (udp_limit, Protocol dispatch), main.rs (mod udp) | G-HYG pass; G-U2.1 130 passed incl. udp::tests 14/14 ×6 runs, +4 outside tests; red: worker run hung (combined-interest try_io spin) → rev 2 | unit:2.1:1 |
 | phase-close | P1 / 1 | 1 | agent-1:opus | STATE.md | G-PHASE pass; review approve | unit:P1:1 |
@@ -369,6 +370,7 @@ relevant failing output or evidence references.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| 2.3 post-diff | agent-1:opus | rev 2; working tree on 165788d | README claims vs udp.rs constants (batch 64, sweep/DNS 1 s, grace 2 s, fd headroom 256, rmem_max warn), notify THROTTLE_LIMIT 5 min (correct vs D16 local 60 s spacing), ICMP quiet 3 s | approve |
 | 2.2 post-diff | agent-1:opus | rev 2; working tree on f13caed | udp_verdict vs truth table (D14), gate fully removed, fd budget (unix + non-unix stub), Stopping drain TCP-only, deviations: wait_for_tick extraction, clippy allow for rlim_t casts, test-helper drain; Dockerfile/README wording left to 2.3 | approve |
 | 2.1 post-diff | agent-1:opus | rev 2; working tree on 447101a | I-4 listener path sync, I-6 tasks.wait grace, I-14 raw send, thread-local buf never across await, log levels; worker escalation on R3 verified in tokio source | approve (after D7a fix) |
 | 2.1 pre-dispatch | agent-1:opus | rev 1; 447101a | skeleton vs HEAD: stats.with_protocol/datagram counters pub, elapsed_ms private (now_ms wrapper needed), resolve_targets pub(crate) signature, knobs getters, Notifier::disabled, bind loop of run_forwarder, mod list in main.rs | approve dispatch |
@@ -417,7 +419,7 @@ none
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1.2 pass; review agent-1:opus |
 | 2.1 | phase_03.md | P1 | DONE | 1 | G-U2.1 pass; review agent-1:opus |
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | G-U2.2 pass; review agent-1:opus |
-| 2.3 | phase_03.md | 2.2 | TODO | 1 | — |
+| 2.3 | phase_03.md | 2.2 | DONE | 1 | G-U2.3 pass; review agent-1:opus |
 | 3.1 | phase_04.md | P2 | TODO | 1 | — |
 | 3.2 | phase_04.md | 3.1 | TODO | 1 | — |
 
@@ -510,7 +512,7 @@ automatically satisfy dependent units.
 | e2e_udp `udp_bench` (ignored) | 2.2 | G-UDP-BENCH | pass | 2.2/1 |
 | e2e_webhook `startup_reports_udp_targets_as_resolved` | 2.2 | G-U2.2 | pass | 2.2/1 |
 | e2e_webhook `udp_outage_is_alerted_and_recovery_reported` | 2.2 | G-U2.2 | pass | 2.2/1 |
-| `config::tests::shipped_example_config_parses_and_validates` (updated) | 2.3 | G-U2.3 | TODO | — |
+| `config::tests::shipped_example_config_parses_and_validates` (updated) | 2.3 | G-U2.3 | pass | 2.3/1 |
 | `udp::tests::offload_gso_send_arrives_coalesced_at_a_gro_socket` | 3.1 | G-U3.1 | TODO | — |
 | `udp::tests::offload_gso_send_is_split_for_a_socket_without_gro` | 3.1 | G-U3.1 | TODO | — |
 | `udp::tests::offload_tail_segment_is_kept` | 3.1 | G-U3.1 | TODO | — |

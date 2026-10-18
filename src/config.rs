@@ -1036,7 +1036,15 @@ mod tests {
         // The file in the repo root is what users copy; it must always load.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("forwarders.yml");
         let loaded = load_yaml_config(&path).expect("forwarders.yml must parse");
-        assert_eq!(loaded.forwarders.len(), 3);
+        assert_eq!(loaded.forwarders.len(), 4);
+        assert_eq!(
+            loaded
+                .forwarders
+                .iter()
+                .filter(|f| f.protocol == Protocol::Udp)
+                .count(),
+            1
+        );
         loaded
             .settings
             .validate()
