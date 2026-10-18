@@ -257,28 +257,40 @@ def listening_ports():
 # ------------------------------------------------------------ backend fleet
 
 class Fleet:
-    """Backend containers on a private bridge, each published on PUBLISH_BASE+port
-    (that is the `docker -p` forwarder under test)."""
+    """Backend containers on a private bridge.
 
-    def __init__(self, bench_bin, outdir, cpus_backend, with_db=True, with_dns=True):
+    The main fleet is *not* published: forwarders reach it by container IP. The
+    `docker -p` variants build their own published fleet (`published=True`) when
+    they start and remove it when they stop, because docker-proxy is a root
+    process that keeps pooled pipes after carrying traffic and so exhausts the
+    uid-0 pipe budget (`fs.pipe-user-pages-soft`) for every container that runs
+    afterwards; see docs/benchmarks. Removing the containers ends the proxies."""
+
+    def __init__(self, bench_bin, outdir, cpus_backend, with_db=True, with_dns=True, published=False, prefix="rfwb-"):
         self.bin = bench_bin
         self.out = outdir
         self.cpus = cpus_backend
         self.with_db = with_db
         self.with_dns = with_dns
+        self.published = published
+        self.prefix = prefix
         self.ip = {}
         self.ids = {}
 
     def _run(self, name, image, *args, publish=(), extra=()):
-        a = ["run", "-d", "--name", f"rfwb-{name}", "--label", LABEL, "--network", NET, "--cpuset-cpus", self.cpus,
+        a = ["run", "-d", "--name", f"{self.prefix}{name}", "--label", LABEL, "--network", NET, "--cpuset-cpus", self.cpus,
              "--ulimit", "nofile=1048576:1048576"]
-        for p in publish:
-            a += ["-p", p]
+        if self.published:
+            for p in publish:
+                a += ["-p", p]
         a += list(extra) + [image, *args]
         cid = docker(*a).stdout.strip()
         self.ids[name] = cid
         self.ip[name] = docker("inspect", "-f", "{{(index .NetworkSettings.Networks \"%s\").IPAddress}}" % NET, cid).stdout.strip()
         return cid
+
+    def _addr(self, svc, bport):
+        return ("127.0.0.1", PUBLISH_BASE + bport) if self.published else (self.ip[svc], bport)
 
     def start(self):
         for img in (IMG_ALPINE, IMG_SOCAT, IMG_IPERF, IMG_REDIS, IMG_PG, IMG_DNS):
@@ -307,18 +319,26 @@ class Fleet:
             self._run("dns", IMG_DNS, "-conf", "/Corefile", publish=[f"{PUBLISH_BASE + 53}:53/udp"],
                       extra=["-v", f"{corefile}:/Corefile:ro"])
         # wait for readiness
-        deadline = time.time() + 60
+        probes = [self._addr("echo", e), self._addr("iperf", 5201)]
+        if self.with_db:
+            probes += [self._addr("pg", 5432), self._addr("redis", 6379)]
+        deadline = time.time() + 90
         while time.time() < deadline:
-            ok = tcp_port_open("127.0.0.1", PUBLISH_BASE + e) and tcp_port_open("127.0.0.1", PUBLISH_BASE + 5201)
-            if self.with_db:
-                ok = ok and tcp_port_open("127.0.0.1", PUBLISH_BASE + 5432) and tcp_port_open("127.0.0.1", PUBLISH_BASE + 6379)
-            if ok:
+            if all(tcp_port_open(h, p) for h, p in probes):
                 break
             time.sleep(0.5)
         else:
             raise RuntimeError("backends did not come up")
         if self.with_db:
             self._wait_pg()
+            if self.published:
+                self.init_pgbench()
+
+    def stop(self):
+        ids = list(self.ids.values())
+        if ids:
+            docker("rm", "-f", *ids, check=False)
+        self.ids = {}
 
     def _wait_pg(self):
         for _ in range(60):
@@ -410,10 +430,23 @@ class Direct(Variant):
         raise KeyError(bport)
 
 
+def published_fleet(ctx):
+    f = ctx.fleet
+    pf = Fleet(f.bin, f.out, f.cpus, with_db=f.with_db, with_dns=f.with_dns, published=True, prefix="rfwb-pub-")
+    pf.start()
+    return pf
+
+
 class DockerNat(Variant):
     name = "docker-nat"
     desc = "docker -p, kernel DNAT/conntrack path (client -> host IP)"
     kind = "ceiling"
+
+    def start(self):
+        self.pub = published_fleet(self.ctx)
+
+    def stop(self):
+        self.pub.stop()
 
     def ep(self, bport, proto="tcp"):
         return self.ctx.host_ip, PUBLISH_BASE + bport
@@ -424,7 +457,8 @@ class DockerProxy(Variant):
     desc = "docker -p, userland docker-proxy (client -> 127.0.0.1)"
 
     def start(self):
-        self.pids = proxy_pids(self.ctx.fleet.published_ports())
+        self.pub = published_fleet(self.ctx)
+        self.pids = proxy_pids(self.pub.published_ports())
         if not self.pids:
             raise RuntimeError("no docker-proxy processes found (userland-proxy disabled?)")
         if self.ctx.pin_proxy:
@@ -437,6 +471,9 @@ class DockerProxy(Variant):
             if not j.get("pinned_threads") or j.get("failed"):
                 log("  WARNING: docker-proxy pinning incomplete:", r.stdout.strip(), r.stderr.strip()[-200:])
         self.base = {p: read_stat_cpu(p) for p in self.pids}
+
+    def stop(self):
+        self.pub.stop()
 
     def ep(self, bport, proto="tcp"):
         return "127.0.0.1", PUBLISH_BASE + bport
@@ -636,9 +673,15 @@ class RfwDockerReleased(RfwDocker):
     image = IMG_RFW_RELEASED
 
 
+class RfwDockerReleasedSplice(RfwDockerReleased):
+    name = "rfw-d-v1.1.0-splice"
+    desc = "published v1.1.0 image with --splice (before the pipe-capacity fallback)"
+    extra = ["--splice"]
+
+
 ALL_VARIANTS = [Direct, DockerNat, DockerProxy, Socat, SocatTuned, RfwNative, RfwSplice, RfwWorkers1, RfwWorkers4, RfwGro, RfwDocker,
                 RfwDockerSplice, RfwDockerUnconfined, RfwDockerPrivileged, RfwDockerSysRes, RfwDockerBridge,
-                RfwDockerDefaultUlimit, RfwDockerReleased]
+                RfwDockerDefaultUlimit, RfwDockerReleased, RfwDockerReleasedSplice]
 VARIANTS = {v.name: v for v in ALL_VARIANTS}
 
 

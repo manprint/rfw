@@ -123,3 +123,39 @@ pub fn pin(a: &Args) {
     }
     println!("{{\"pinned_threads\":{ok},\"failed\":{fail}}}");
 }
+
+/// `pipeprobe --count N --size B`: create N pipes, ask for B bytes of capacity
+/// (as rfw --splice does) and report what the kernel granted. Shows the
+/// fs.pipe-user-pages-soft limit biting: past it, unprivileged pipes shrink to
+/// one page and F_SETPIPE_SZ fails with EPERM.
+pub fn pipeprobe(a: &Args) {
+    let count: usize = a.num("count", 100);
+    let size: i32 = a.num("size", 65536);
+    let mut fds = Vec::new();
+    let (mut set_fail, mut min_cap, mut small) = (0, i32::MAX, 0);
+    let mut first_small: i64 = -1;
+    for i in 0..count {
+        let mut p = [0i32; 2];
+        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            break;
+        }
+        if unsafe { libc::fcntl(p[1], libc::F_SETPIPE_SZ, size) } < 0 {
+            set_fail += 1;
+        }
+        let cap = unsafe { libc::fcntl(p[1], libc::F_GETPIPE_SZ) };
+        min_cap = min_cap.min(cap);
+        if cap < 65536 {
+            small += 1;
+            if first_small < 0 {
+                first_small = i as i64;
+            }
+        }
+        fds.push(p);
+    }
+    println!(
+        "{{\"pipes\":{},\"requested\":{size},\"set_failures\":{set_fail},\"below_64k\":{small},\"first_below_64k_at\":{first_small},\"min_capacity\":{},\"uid\":{}}}",
+        fds.len(),
+        if min_cap == i32::MAX { 0 } else { min_cap },
+        unsafe { libc::getuid() }
+    );
+}

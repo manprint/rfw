@@ -6,3 +6,4 @@ note.ai
 .serena
 bench/results/
 bench/rfwbench/target/
+__pycache__/

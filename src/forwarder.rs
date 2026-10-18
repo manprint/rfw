@@ -463,18 +463,30 @@ async fn proxy_connection(
     debug!(forwarder = %label, peer = %peer_addr, remote = %remote_addr, "Connected");
 
     // Linux zero-copy fast path (opt-in): splice bytes kernel-side, no userspace copy.
+    // The pipes are made *before* the sockets are handed over so that a pipe the
+    // kernel refuses or shrinks (see `splice::Pipes::new`) falls back to the
+    // portable copy path below instead of failing or crawling.
+    #[cfg(target_os = "linux")]
     if knobs.use_splice {
-        #[cfg(target_os = "linux")]
-        {
-            let r =
-                splice::copy_bidirectional_splice(inbound, outbound, &stats, knobs.buffer_bytes)
+        match splice::Pipes::new(knobs.buffer_bytes) {
+            Ok(pipes) => {
+                let r = splice::copy_bidirectional_splice(inbound, outbound, &stats, pipes)
                     .await
                     .map_err(anyhow::Error::from);
-            if let Err(e) = &r {
-                warn!(forwarder = %label, peer = %peer_addr, error = %e, "splice closed with error");
+                if let Err(e) = &r {
+                    // A peer that resets or vanishes mid-transfer is routine for a
+                    // forwarder (the copy path logs it at debug); only surprising
+                    // errors deserve a warning per connection.
+                    if is_peer_hangup(e) {
+                        debug!(forwarder = %label, peer = %peer_addr, error = %e, "splice closed with error");
+                    } else {
+                        warn!(forwarder = %label, peer = %peer_addr, error = %e, "splice closed with error");
+                    }
+                }
+                debug!(forwarder = %label, peer = %peer_addr, "Disconnected");
+                return r;
             }
-            debug!(forwarder = %label, peer = %peer_addr, "Disconnected");
-            return r;
+            Err(why) => splice::note_fallback(label, &why),
         }
     }
 
@@ -502,6 +514,19 @@ async fn proxy_connection(
     debug!(forwarder = %label, peer = %peer_addr, "Disconnected");
 
     Ok(())
+}
+
+/// `true` for the errors a normal peer disconnect produces mid-transfer.
+fn is_peer_hangup(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+    };
+    e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(
+            io.kind(),
+            ConnectionReset | BrokenPipe | ConnectionAborted | NotConnected | UnexpectedEof
+        )
+    })
 }
 
 /// Sleep unless cancelled. Returns true if cancelled.
@@ -658,6 +683,27 @@ mod splice {
 
     use crate::stats::ForwarderStats;
 
+    /// Below this a pipe makes splice slower than a plain read/write copy: every
+    /// `splice` then moves at most a couple of pages. 32 KiB is half the kernel's
+    /// default capacity (64 KiB), so only a *limited* pipe trips it.
+    const MIN_USEFUL_CAPACITY: usize = 32 * 1024;
+
+    /// `true` when a pipe of `got` bytes is good enough for a request of `want`.
+    fn capacity_ok(got: usize, want: usize) -> bool {
+        got >= want.min(MIN_USEFUL_CAPACITY)
+    }
+
+    /// Why the splice path was not used for a connection.
+    pub enum Unavailable {
+        /// `pipe2` failed (almost always EMFILE: splice needs 4 extra fds per connection).
+        Pipe(io::Error),
+        /// The kernel granted a smaller pipe than asked for. Past
+        /// `fs.pipe-user-pages-soft` (16384 pages per user, shared by *every*
+        /// process of that uid: other containers, docker-proxy) an unprivileged
+        /// process gets 1-2 page pipes and `F_SETPIPE_SZ` fails with EPERM.
+        Limited { got: usize, wanted: usize },
+    }
+
     /// Owns a `pipe2` pair and closes both ends on drop.
     struct Pipe {
         r: RawFd,
@@ -677,12 +723,82 @@ mod splice {
                 r: fds[0],
                 w: fds[1],
             };
-            // Best-effort: enlarge the pipe to the configured buffer size so each
-            // splice moves a bigger chunk (fewer syscalls). Ignore failure.
+            // Best-effort: set the pipe to the configured buffer size so each
+            // splice moves a chunk of that size. The result is checked by
+            // `Pipes::new` through `capacity()`, not here.
             if size > 0 {
                 unsafe { libc::fcntl(pipe.w, libc::F_SETPIPE_SZ, size as libc::c_int) };
             }
             Ok(pipe)
+        }
+
+        /// Capacity the kernel actually granted (bytes).
+        fn capacity(&self) -> usize {
+            let n = unsafe { libc::fcntl(self.w, libc::F_GETPIPE_SZ) };
+            if n > 0 {
+                n as usize
+            } else {
+                0
+            }
+        }
+    }
+
+    /// The two pipes of one connection (one per direction), verified usable.
+    pub struct Pipes {
+        c2r: Pipe,
+        r2c: Pipe,
+        chunk: usize,
+    }
+
+    impl Pipes {
+        /// Create both pipes and check the kernel really gave `size` bytes of
+        /// capacity (or at least `MIN_USEFUL_CAPACITY`). A degraded pipe would
+        /// not fail: splice would just run several times slower than the copy
+        /// path, silently.
+        pub fn new(size: usize) -> Result<Pipes, Unavailable> {
+            let want = size.max(4096);
+            let c2r = Pipe::new(size).map_err(Unavailable::Pipe)?;
+            let r2c = Pipe::new(size).map_err(Unavailable::Pipe)?;
+            let got = c2r.capacity().min(r2c.capacity());
+            if !capacity_ok(got, want) {
+                return Err(Unavailable::Limited { got, wanted: want });
+            }
+            // Never ask splice for more than a pipe can hold.
+            Ok(Pipes {
+                c2r,
+                r2c,
+                chunk: got.min(want),
+            })
+        }
+    }
+
+    /// Log (at most once a minute) that connections are using the copy path
+    /// although `--splice` is on, and why.
+    pub fn note_fallback(label: &str, why: &Unavailable) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 60
+            || LAST
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        match why {
+            Unavailable::Pipe(e) => tracing::warn!(
+                forwarder = %label, error = %e,
+                "splice unavailable (pipe2 failed, usually out of file descriptors); using the copy path for these connections"
+            ),
+            Unavailable::Limited { got, wanted } => tracing::warn!(
+                forwarder = %label, got, wanted,
+                "splice pipe capacity limited by the kernel (fs.pipe-user-pages-soft is shared by every process of this uid); using the copy path. Run the container with --cap-add SYS_RESOURCE or raise the sysctl to get splice back"
+            ),
         }
     }
 
@@ -725,13 +841,13 @@ mod splice {
     async fn splice_dir(
         src: &TcpStream,
         dst: &TcpStream,
-        pipe_size: usize,
+        pipe: &Pipe,
+        chunk: usize,
         on_bytes: impl Fn(u64),
     ) -> io::Result<()> {
-        let pipe = Pipe::new(pipe_size)?;
         let src_fd = src.as_raw_fd();
         let dst_fd = dst.as_raw_fd();
-        let chunk = pipe_size.max(1);
+        let chunk = chunk.max(1);
 
         loop {
             // src -> pipe
@@ -790,11 +906,15 @@ mod splice {
         inbound: TcpStream,
         outbound: TcpStream,
         stats: &ForwarderStats,
-        pipe_size: usize,
+        pipes: Pipes,
     ) -> io::Result<()> {
-        let client_to_remote = splice_dir(&inbound, &outbound, pipe_size, |n| stats.add_sent(n));
-        let remote_to_client =
-            splice_dir(&outbound, &inbound, pipe_size, |n| stats.add_received(n));
+        let chunk = pipes.chunk;
+        let client_to_remote = splice_dir(&inbound, &outbound, &pipes.c2r, chunk, |n| {
+            stats.add_sent(n)
+        });
+        let remote_to_client = splice_dir(&outbound, &inbound, &pipes.r2c, chunk, |n| {
+            stats.add_received(n)
+        });
 
         // `try_join!` short-circuits on the first error, and that is required,
         // not merely convenient.
@@ -813,6 +933,42 @@ mod splice {
         tokio::try_join!(client_to_remote, remote_to_client)?;
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_limited_pipe_is_rejected_but_a_small_configured_one_is_fine() {
+            // kernel default (64 KiB) requested, kernel shrank it to 2 pages
+            assert!(!capacity_ok(8192, 65536));
+            assert!(!capacity_ok(4096, 262_144));
+            // healthy
+            assert!(capacity_ok(65536, 65536));
+            assert!(capacity_ok(262_144, 262_144));
+            // the operator asked for a small buffer and got it: not a limit
+            assert!(capacity_ok(16384, 16384));
+            assert!(capacity_ok(4096, 4096));
+            // the kernel rounds up to a power-of-two number of pages
+            assert!(capacity_ok(32768, 65536));
+        }
+
+        #[test]
+        fn pipes_get_the_requested_capacity_and_chunk() {
+            // Only meaningful while this uid is under the pipe soft limit, which
+            // holds for the test process; skip rather than flake if it is not.
+            match Pipes::new(65536) {
+                Ok(p) => assert_eq!(p.chunk, 65536),
+                Err(Unavailable::Limited { .. }) => eprintln!("pipe budget exhausted; skipped"),
+                Err(Unavailable::Pipe(e)) => panic!("pipe2 failed: {e}"),
+            }
+            match Pipes::new(16384) {
+                Ok(p) => assert_eq!(p.chunk, 16384),
+                Err(Unavailable::Limited { .. }) => eprintln!("pipe budget exhausted; skipped"),
+                Err(Unavailable::Pipe(e)) => panic!("pipe2 failed: {e}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -825,6 +981,25 @@ mod tests {
 
     use crate::config::{Protocol, Settings};
     use crate::testutil::{fake_dns_response, resolver_for, spawn_fake_dns};
+
+    #[test]
+    fn peer_hangups_are_not_warning_worthy() {
+        use std::io::{Error, ErrorKind};
+        for k in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                is_peer_hangup(&anyhow::Error::from(Error::from(k))),
+                "{k:?}"
+            );
+        }
+        assert!(!is_peer_hangup(&anyhow::Error::from(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(!is_peer_hangup(&anyhow::anyhow!("not an io error")));
+    }
 
     // ---- socket tuning ------------------------------------------------------
 

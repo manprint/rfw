@@ -1,4 +1,5 @@
 mod config;
+mod fdlimit;
 mod forwarder;
 mod logging;
 mod manager;
@@ -117,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
     if settings.use_splice {
         tracing::warn!("--splice / use_splice is Linux-only; using the portable copy path");
     }
+
+    // Proxied connections cost descriptors; Docker's default soft limit (1024)
+    // would otherwise cap a TCP-only forwarder at ~500 connections.
+    fdlimit::raise_soft_limit(settings.max_connections, settings.use_splice);
 
     // Webhook alerting (opt-in). Built before the manager so every forwarder,
     // monitor and the reload path share one delivery queue.

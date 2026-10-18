@@ -1,0 +1,148 @@
+name: Benchmark
+
+# Compares rfw with socat and docker's own forwarding (docker-proxy and kernel
+# DNAT) on every change that can touch the data path, and keeps the numbers as
+# artifacts. See bench/README.md.
+#
+#  * Hard failure: only correctness (byte-for-byte integrity, leaked
+#    connections, a variant that does not start). Never absolute speed: shared
+#    runners are too noisy for that.
+#  * Performance: scores are ratios against the `direct` (no forwarder) run
+#    measured in the same job, compared with bench/baseline/*.json. A drop
+#    beyond the tolerance is reported in the job summary and, on main, fails
+#    the job.
+#  * bench/baseline/quick-2c.json must be produced on a GitHub runner: run this
+#    workflow by hand (workflow_dispatch), download the `bench-results`
+#    artifact and commit its baseline.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "quick (~10 min) or full (hours: do not use on a hosted runner)"
+        default: quick
+        type: choice
+        options: [quick, full]
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "bench/**"
+      - ".github/workflows/bench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "bench/**"
+      - ".github/workflows/bench.yml"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-tool:
+    # The load generator is a separate crate (own workspace) so it has its own gates.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench/rfwbench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench/rfwbench
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            bench/rfwbench
+
+      - name: Build rfw (release) and the load generator (static)
+        run: |
+          cargo build --release
+          cargo build --release --target x86_64-unknown-linux-musl --manifest-path bench/rfwbench/Cargo.toml
+
+      # The image people deploy, built from the repo's own Dockerfile.
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rfw-bench:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Benchmark (forwarder pinned to 2 cores, like the small deployment targets)
+        run: |
+          python3 bench/run.py \
+            --profile "${{ inputs.profile || 'quick' }}" \
+            --fwd-cores 2 --no-image-build \
+            --out bench/results/ci
+
+      - name: Memory and scaling
+        run: |
+          python3 bench/memtest.py --tests ports,conns,udp \
+            --variants rfw,rfw-splice,rfw-d-host,socat,docker-proxy \
+            --ports-n 10,100 --conns-n 100,1000 --udp-n 100,1000 \
+            --out bench/results/ci-mem --no-image-build
+
+      - name: Report
+        if: always()
+        run: |
+          python3 bench/report.py bench/results/ci \
+            --md bench/results/ci/report.md \
+            --json bench/results/ci/summary.json \
+            --update-baseline bench/results/ci/baseline.json || true
+          python3 bench/memreport.py bench/results/ci-mem --md bench/results/ci-mem/report.md || true
+          { cat bench/results/ci/report.md; echo; cat bench/results/ci-mem/report.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate (correctness always; ratio regressions on main/schedule)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 bench/report.py bench/results/ci --check --baseline bench/baseline/quick-2c.json --tolerance 0.35 || \
+              { python3 bench/report.py bench/results/ci --check >/dev/null 2>&1 \
+                && echo "::warning::performance ratio regression vs baseline (see summary); not blocking on PRs"; }
+          else
+            python3 bench/report.py bench/results/ci --check --baseline bench/baseline/quick-2c.json --tolerance 0.35
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps -aq --filter label=rfwbench=1 | xargs -r docker rm -f
+          docker network rm rfwb-net 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            bench/results/ci
+            bench/results/ci-mem
+          retention-days: 90
