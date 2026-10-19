@@ -223,6 +223,10 @@ def scores(data):
         for name, ex, fmt, hib in cols:
             if name in ("fwd cores", "core·s/GB", "ok", "errors", "retrans"):
                 continue
+            # Tail percentiles are reported but never gated: on a shared 4-vCPU CI
+            # runner a single scheduling hiccup moves p99/p99.9 by 2x between runs.
+            if "p99" in name:
+                continue
             d = med([ex(r) for r in data[test]["direct"]])
             if not d:
                 continue

@@ -80,7 +80,7 @@ everything as an artifact and writes the tables into the job summary.
 * **Hard failures**: byte-for-byte integrity, TCP connections still active after
   the run, a forwarder that does not start or errors in any test.
 * **Performance gate**: each score is `variant / direct` measured in the *same*
-  job; the job fails (on `main`/schedule) if a score drops more than the
+  job (tail percentiles p99/p99.9 are reported but not gated: too noisy on shared runners); the job fails (on `main`/schedule) if a score drops more than the
   tolerance below `bench/baseline/quick-2c.json`. On pull requests it only warns.
 * **Updating the baseline**: run the workflow manually, download the
   `bench-results` artifact, commit its `baseline.json` as
