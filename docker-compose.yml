@@ -14,7 +14,7 @@
 services:
   rfw:
     # Pin a release tag in production; `latest` moves on every release.
-    image: ghcr.io/manprint/rfw:v1.1.0
+    image: ghcr.io/manprint/rfw:v1.1.1
     container_name: rfw
     restart: unless-stopped
 
