@@ -5,6 +5,19 @@
 #   curl -s 127.0.0.1:9090/stats        # on the VM
 #
 # Host ports 80, 443, 7835, 7836 and 30000-30050 (plus 127.0.0.1:9090) must be free.
+#
+# REQUIRED on the host, once (sysctl.conf next to this file): with host
+# networking rfw's sockets live in the HOST network namespace, so the congestion
+# control and buffer limits you tuned inside the backend's container (bbr, 16 MiB)
+# no longer apply to the client-facing leg, and UDP sockets get the 212 KiB
+# net.core.rmem_default. Without it expect slow transfers and QUIC drops
+# (nstat -az UdpRcvbufErrors rising).
+#   sudo cp sysctl.conf /etc/sysctl.d/99-rfw-tunnel.conf
+#   echo tcp_bbr | sudo tee /etc/modules-load.d/bbr.conf
+#   sudo modprobe tcp_bbr && sudo sysctl --system
+#
+# Caveat: rfw is an L4 proxy without PROXY protocol, so the backend sees every
+# client as the proxy's address (not the client IP).
 
 services:
   rfw:
@@ -28,24 +41,25 @@ services:
       - RFW_INSTANCE_NAME=tunnel-edge
       # - RFW_WEBHOOK_URL=${RFW_WEBHOOK_URL}   # Google Chat alerts, from .env
 
-    # --splice needs a pipe budget: SYS_RESOURCE lifts fs.pipe-user-pages-soft
-    # (report section 4.3). Narrow replacement for --privileged, which gains nothing.
+    # Only needed if you enable use_splice in the config: SYS_RESOURCE lifts
+    # fs.pipe-user-pages-soft (report section 4.3). Narrow replacement for
+    # --privileged, which gains nothing.
     cap_add:
       - SYS_RESOURCE
 
-    # 10000 conns x 6 fds (splice) + 16384 UDP sessions + headroom.
+    # 10000 conns x 6 fds (with splice) + 16384 UDP sessions + headroom.
     ulimits:
       nofile:
         soft: 131072
         hard: 131072
 
-    # 10000 x ~60 KiB ~ 600 MiB, plus pipe pages charged to the cgroup. Leaves
-    # ~1 GiB for the OS and Docker on a 4 GB VM. CPU is left unlimited on purpose:
-    # rfw scales with both cores.
+    # 10000 x ~60 KiB ~ 600 MiB, plus socket buffers (charged to the cgroup under
+    # cgroup v2: a limit that is too tight throttles the sockets). CPU is left
+    # unlimited on purpose: rfw scales with both cores.
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 2G
         reservations:
           memory: 128M
 

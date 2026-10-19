@@ -384,6 +384,17 @@ Full tables: [`data/report-memory.md`](data/report-memory.md).
 
 **Kernel / host**
 
+* **Host networking moves the TCP stack to the host.** With `--network host` the
+  sockets facing the clients live in the host's network namespace, so the
+  congestion control and buffer ceilings tuned inside a backend's container (BBR,
+  16 MiB) no longer apply to that leg. Reported from production: in front of a
+  tunnel server whose container ran BBR, rfw on a stock host (cubic, 4 MiB
+  `tcp_wmem`, 212 KiB `rmem_default`) was far slower than Docker's NAT and QUIC
+  datagrams were dropped (`UdpRcvbufErrors` climbing); setting
+  `tcp_congestion_control=bbr`, `tcp_wmem/rmem` max 16 MiB and
+  `net.core.rmem_default/wmem_default` 8 MiB on the host restored line rate.
+  This benchmark ran on loopback and cannot show it. See
+  `examples/tunnel-2c-4g/sysctl.conf`.
 * `net.core.rmem_max`/`wmem_max` ≥ 4 MiB if you set `--socket-buffer-bytes` (WAN links) or
   carry heavy UDP; otherwise the setting is silently capped.
 * For UDP at high packet rates consider `--udp-gro-gso` on kernels that support UDP
@@ -414,6 +425,9 @@ conntrack guard; do not remove it on a shared host.
 
 ## 10. Limitations
 
+* Loopback cannot show congestion-control, buffer-ceiling or RTT effects
+  (section 9, "Host networking moves the TCP stack to the host"); a WAN-facing
+  deployment must be validated on its real path.
 * One machine, loopback/bridge only; a real NIC, a hypervisor, or a cloud vCPU changes
   absolute numbers (and 2 vCPUs are often 1 physical core with hyperthreading).
 * 2 repetitions in the final matrices (3 in tuning): ±5–35 % noise on UDP flood and

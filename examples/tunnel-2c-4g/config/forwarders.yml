@@ -23,10 +23,12 @@ forwarders:
 settings:
   # loopback only: host network would otherwise expose it on every interface
   metrics_addr: "127.0.0.1:9090"
-  # 2 cores: splice halves forwarder CPU on bulk streams, -4% on saturated tiny messages
-  use_splice: true
-  # QUIC / STUN datagrams: +5-13% lossless rate on kernels with UDP GRO/GSO
-  udp_gro_gso: true
+  # Both OFF on purpose. Reported on a real deployment in front of bore: splice
+  # and UDP GRO/GSO are opt-in because the loopback benchmark that favours them
+  # cannot see real-NIC/WAN behaviour. Enable one at a time and measure with
+  # your own traffic (both hot-reload, no restart).
+  use_splice: false
+  udp_gro_gso: false
   # ~60 KiB/conn in the image => 10k conns ~ 600 MiB; 6 fds/conn with splice
   max_connections: 10000
   connect_timeout_secs: 5
