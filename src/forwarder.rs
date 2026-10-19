@@ -1643,19 +1643,28 @@ mod tests {
 
     // ---- connect racing -----------------------------------------------------
 
-    /// An address with nothing listening, on the loopback.
-    async fn dead_addr() -> std::net::SocketAddr {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = l.local_addr().unwrap();
-        drop(l);
-        addr
+    /// A loopback address that refuses connections. The socket is bound but
+    /// never listens, so connects get RST and, unlike a freed port, no other
+    /// test running in parallel can be handed the same port. Keep the guard
+    /// alive for as long as the address is used.
+    fn dead_addr() -> (std::net::SocketAddr, socket2::Socket) {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        sock.bind(&bind.into()).unwrap();
+        let addr = sock.local_addr().unwrap().as_socket().unwrap();
+        (addr, sock)
     }
 
     #[tokio::test]
     async fn connect_racing_picks_the_only_live_address() {
         let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        let dead = dead_addr().await;
+        let (dead, _dead_guard) = dead_addr();
 
         // Dead record first: the old sequential loop waited a full connect
         // timeout on it before trying the next one.
@@ -1668,8 +1677,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_racing_fails_when_every_address_is_dead() {
-        let a = dead_addr().await;
-        let b = dead_addr().await;
+        let (a, _guard_a) = dead_addr();
+        let (b, _guard_b) = dead_addr();
         let err = connect_racing(&[a, b], Duration::from_secs(2))
             .await
             .expect_err("all-dead must be an error");

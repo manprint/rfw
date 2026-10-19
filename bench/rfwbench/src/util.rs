@@ -60,7 +60,10 @@ pub fn raise_nofile() -> u64 {
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
             libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl);
         }
-        rl.rlim_cur as u64
+        #[allow(clippy::unnecessary_cast)] // rlim_t is u32 on 32-bit targets
+        {
+            rl.rlim_cur as u64
+        }
     }
 }
 
@@ -100,7 +103,11 @@ impl Prng {
 /// pid (run from a privileged --pid=host container to pin root-owned
 /// processes such as docker-proxy, which Docker itself starts unpinned).
 pub fn pin(a: &Args) {
-    let cpus: Vec<usize> = a.str("cpus", "0").split(',').filter_map(|c| c.trim().parse().ok()).collect();
+    let cpus: Vec<usize> = a
+        .str("cpus", "0")
+        .split(',')
+        .filter_map(|c| c.trim().parse().ok())
+        .collect();
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for c in &cpus {
         unsafe { libc::CPU_SET(*c, &mut set) };
@@ -113,7 +120,9 @@ pub fn pin(a: &Args) {
         };
         for t in rd.flatten() {
             let tid: i32 = t.file_name().to_string_lossy().parse().unwrap_or(0);
-            let r = unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+            let r = unsafe {
+                libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set)
+            };
             if r == 0 {
                 ok += 1;
             } else {

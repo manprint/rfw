@@ -12,13 +12,27 @@ fn sock(host: &str, port: u16, rcvbuf: i32) -> UdpSocket {
     let s = UdpSocket::bind("0.0.0.0:0").unwrap_or_else(|e| die(&format!("udp bind: {e}")));
     use std::os::unix::io::AsRawFd;
     set_i32(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, rcvbuf);
-    s.connect(resolve(host, port)).unwrap_or_else(|e| die(&format!("udp connect: {e}")));
+    s.connect(resolve(host, port))
+        .unwrap_or_else(|e| die(&format!("udp connect: {e}")));
     s
 }
 
 /// Minimal DNS query (A example.org, RD set) with the given id.
 fn dns_query(id: u16) -> Vec<u8> {
-    let mut q = vec![(id >> 8) as u8, id as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    let mut q = vec![
+        (id >> 8) as u8,
+        id as u8,
+        0x01,
+        0x00,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     for l in ["example", "org"] {
         q.push(l.len() as u8);
         q.extend_from_slice(l.as_bytes());
@@ -234,7 +248,9 @@ pub fn udphold(a: &Args) {
     let flows: usize = a.num("flows", 1000);
     let hold_s: f64 = a.num("hold", 10.0);
     let t0 = Instant::now();
-    let socks: Vec<UdpSocket> = (0..flows).map(|i| sock(&host, base + (i as u16 % ports), 1 << 20)).collect();
+    let socks: Vec<UdpSocket> = (0..flows)
+        .map(|i| sock(&host, base + (i as u16 % ports), 1 << 20))
+        .collect();
     let probe = |socks: &[UdpSocket], tag: u8| -> u64 {
         // Pace in batches so the forwarder's socket buffer is never the limit
         // being measured; retry stragglers once.
@@ -251,7 +267,9 @@ pub fn udphold(a: &Args) {
             let mut still = Vec::new();
             let mut buf = [0u8; 64];
             for &i in &pending {
-                socks[i].set_read_timeout(Some(Duration::from_millis(1))).ok();
+                socks[i]
+                    .set_read_timeout(Some(Duration::from_millis(1)))
+                    .ok();
                 let mut got = false;
                 while Instant::now() < deadline {
                     match socks[i].recv(&mut buf) {
@@ -286,5 +304,8 @@ pub fn udphold(a: &Args) {
     let _ = std::io::stdout().flush();
     std::thread::sleep(Duration::from_secs_f64(hold_s));
     let alive = probe(&socks, 2);
-    println!("{{\"phase\":\"done\",\"alive_after_hold\":{alive},\"established\":{ok},\"failed\":{}}}", flows as u64 - ok);
+    println!(
+        "{{\"phase\":\"done\",\"alive_after_hold\":{alive},\"established\":{ok},\"failed\":{}}}",
+        flows as u64 - ok
+    );
 }

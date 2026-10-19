@@ -35,7 +35,11 @@ pub fn rr(a: &Args) {
     let t0 = Instant::now();
     let measure_from = Duration::from_secs_f64(warm);
     let end = Duration::from_secs_f64(warm + dur);
-    let period = if rate > 0.0 { Duration::from_secs_f64(conns as f64 / rate) } else { Duration::ZERO };
+    let period = if rate > 0.0 {
+        Duration::from_secs_f64(conns as f64 / rate)
+    } else {
+        Duration::ZERO
+    };
 
     let hs: Vec<_> = (0..conns)
         .map(|i| {
@@ -54,8 +58,13 @@ pub fn rr(a: &Args) {
                 let mut req = vec![0u8; size];
                 let mut rsp = vec![0u8; size];
                 // Stagger open-loop connections across one period.
-                let mut due = t0 + measure_from.min(Duration::from_millis(0))
-                    + if rate > 0.0 { period.mul_f64(i as f64 / conns as f64) } else { Duration::ZERO };
+                let mut due = t0
+                    + measure_from.min(Duration::from_millis(0))
+                    + if rate > 0.0 {
+                        period.mul_f64(i as f64 / conns as f64)
+                    } else {
+                        Duration::ZERO
+                    };
                 let mut seq: u64 = 0;
                 loop {
                     let now = Instant::now();
@@ -74,7 +83,10 @@ pub fn rr(a: &Args) {
                     };
                     req[..8].copy_from_slice(&seq.to_le_bytes());
                     seq += 1;
-                    if s.write_all(&req).is_err() || s.read_exact(&mut rsp).is_err() || rsp[..8] != req[..8] {
+                    if s.write_all(&req).is_err()
+                        || s.read_exact(&mut rsp).is_err()
+                        || rsp[..8] != req[..8]
+                    {
                         errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -184,7 +196,9 @@ pub fn hold(a: &Args) {
     // The echo is ping-pong, so a slow-latency forwarder (Nagle + delayed ACK)
     // needs many connections in flight to finish in reasonable time.
     let burst: usize = a.num("burst", 0);
-    let threads: usize = a.num("threads", if burst > 0 { 128 } else { 8 }).min(conns.max(1));
+    let threads: usize = a
+        .num("threads", if burst > 0 { 128 } else { 8 })
+        .min(conns.max(1));
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads)
         .map(|t| {
