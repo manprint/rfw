@@ -8,7 +8,9 @@ name: Benchmark
 #    connections, a variant that does not start). Never absolute speed: shared
 #    runners are too noisy for that.
 #  * Performance: scores are ratios against the `direct` (no forwarder) run
-#    measured in the same job, compared with bench/baseline/*.json. A drop
+#    measured in the same job (against `socat` for the single-request latency
+#    tests rr1_64 and udp_rr: `direct` there tracks the runner's CPU, which
+#    differs between jobs), compared with bench/baseline/*.json. A drop
 #    beyond the tolerance is reported in the job summary and, on main, fails
 #    the job.
 #  * bench/baseline/quick-2c.json must be produced on a GitHub runner: run this

@@ -213,11 +213,23 @@ def cell(recs, ex, fmt):
     return s, m
 
 
+# Single-in-flight request/response tests measure the cost of one forwarding hop
+# (wake-ups, two extra syscalls). `direct` has no hop, so its number tracks the
+# runner's CPU and scheduler, not the forwarder: the same code scored 20k msg/s
+# on an EPYC 7763 runner and 41k on a Xeon 8573C one while every forwarder moved
+# only ~30 %. They are scored against `socat` (same hop, same job) instead.
+HOP_BOUND = {"rr1_64", "udp_rr"}
+
+
 def scores(data):
-    """{variant|test|column: ratio vs direct, oriented so higher = better}."""
+    """{variant|test|column: ratio vs the reference, higher = better}.
+
+    The reference is `direct`, or `socat` for the hop-bound tests (HOP_BOUND).
+    """
     out = {}
     for test, cols in M.items():
-        if test not in data or "direct" not in data[test]:
+        ref = "socat" if test in HOP_BOUND else "direct"
+        if test not in data or ref not in data[test]:
             continue
         # primary + latency-ish columns that exist
         for name, ex, fmt, hib in cols:
@@ -227,11 +239,11 @@ def scores(data):
             # runner a single scheduling hiccup moves p99/p99.9 by 2x between runs.
             if "p99" in name:
                 continue
-            d = med([ex(r) for r in data[test]["direct"]])
+            d = med([ex(r) for r in data[test][ref]])
             if not d:
                 continue
             for v, recs in data[test].items():
-                if v == "direct":
+                if v == ref:
                     continue
                 x = med([ex(r) for r in recs])
                 if x:
@@ -343,7 +355,7 @@ def main():
     ap.add_argument("--json", help="write summary.json here")
     ap.add_argument("--baseline")
     ap.add_argument("--check", action="store_true", help="exit 1 on correctness problems or ratio regressions")
-    ap.add_argument("--tolerance", type=float, default=0.30, help="allowed relative drop of a ratio-to-direct score vs baseline")
+    ap.add_argument("--tolerance", type=float, default=0.30, help="allowed relative drop of a ratio-to-reference score vs baseline")
     ap.add_argument("--update-baseline", help="write the scores of this run as a baseline file")
     a = ap.parse_args()
 
@@ -400,7 +412,7 @@ def main():
                 if was and now < was * (1 - a.tolerance):
                     regress.append(f"[{cores}c] {k}: {now:.2f} vs baseline {was:.2f} ({(now / was - 1) * 100:+.0f}%)")
         if regress:
-            print("\n### Possible regressions vs baseline (ratio to `direct`)\n", file=sys.stderr)
+            print("\n### Possible regressions vs baseline (ratio to `direct`; `socat` for rr1_64 and udp_rr)\n", file=sys.stderr)
             for r in regress:
                 print("- " + r, file=sys.stderr)
             if a.check:
