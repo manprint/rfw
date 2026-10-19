@@ -587,11 +587,9 @@ class RfwNative(Variant):
             args.append(f"0.0.0.0:{lp}:{ip}:{bp}/{proto}")
         env = dict(os.environ, RUST_LOG="warn", **self.env)
 
-        def lim():
-            import resource
-            resource.setrlimit(resource.RLIMIT_NOFILE, (1048576, 1048576))
-
-        self.proc = subprocess.Popen(["taskset", "-c", self.ctx.cpus_fwd, *args], env=env, preexec_fn=lim,
+        # No ulimit games: rfw raises its own RLIMIT_NOFILE (that is part of what is
+        # under test), exactly as it does when started by systemd or a shell.
+        self.proc = subprocess.Popen(["taskset", "-c", self.ctx.cpus_fwd, *args], env=env,
                                      stdout=subprocess.DEVNULL, stderr=open(os.path.join(self.ctx.out, f"{self.name}.log"), "w"))
 
     def stop(self):
