@@ -351,6 +351,17 @@ For maximum bandwidth:
       0.0.0.0:8080:fileserver.lan:80
   ```
 
+  Measured (see [`docs/benchmarks/BENCHMARK_REPORT.md`](docs/benchmarks/BENCHMARK_REPORT.md)):
+  on bulk transfers splice moves 1.2–1.7× the data at about half the CPU, and with
+  `--buffer-bytes 262144` (pipe size) it matches Docker's userland proxy at the same
+  CPU. It does not help tiny-message traffic (a database forwarder), where it costs
+  a few percent of saturated throughput, so leave it off there. Splice needs
+  kernel pipes: the per-user pipe budget (`fs.pipe-user-pages-soft`) is shared by
+  every process of the same uid. When rfw cannot get useful pipes it falls back to
+  the buffered path for that connection and logs one warning per minute; in a root
+  container add `--cap-add SYS_RESOURCE` (much narrower than `--privileged`) to lift
+  the limit.
+
 - **Connection count** — Each connection is one async task on tokio's
   multi-threaded runtime (one worker per CPU core); rfw handles thousands of
   concurrent connections without extra tuning.
@@ -848,8 +859,9 @@ docker run -d \
 - `--net=host` binds `0.0.0.0:5432` directly on the host, like `socat` did, and
   uses the host's `/etc/resolv.conf` for DNS.
 - `--ulimit nofile=65536:65536`: each proxied connection holds two sockets and
-  Docker's default soft limit is often 1024, i.e. ~500 connections before
-  `accept()` fails with `EMFILE`.
+  Docker's default soft limit is often 1024. rfw raises its own soft limit towards
+  the hard limit at startup (and warns if `--max-connections` cannot fit), so this
+  is no longer required, but it raises the ceiling that bounds that adjustment.
 - `--stop-timeout 15` covers the 10s in-flight drain on `docker stop`.
 - `--metrics-addr 127.0.0.1:9090`: on the host network `0.0.0.0` would expose
   the unauthenticated stats endpoint on every interface. Loopback keeps it

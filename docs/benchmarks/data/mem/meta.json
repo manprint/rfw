@@ -1,0 +1,30 @@
+{
+  "cpu_model": "Intel(R) Core(TM) 7 240H",
+  "nproc": 16,
+  "kernel": "7.0.0-38-generic",
+  "governor": "powersave",
+  "mem_total_kb": 48859748,
+  "docker": "Docker version 29.9.1, build dfc520d",
+  "pipe_user_pages_soft": "16384",
+  "pipe_max_size": "1048576",
+  "rmem_max": "16777216",
+  "wmem_max": "16777216",
+  "ip_local_port_range": "32768\t60999",
+  "git_rev": "7cb54ae",
+  "fwd_cpus": "0,2",
+  "tests": [
+    "ports",
+    "conns",
+    "udp",
+    "soak"
+  ],
+  "variants": [
+    "rfw",
+    "rfw-splice",
+    "rfw-d-host",
+    "rfw-d-compose",
+    "socat",
+    "docker-proxy"
+  ],
+  "rfw_version": "rfw 1.1.0"
+}
