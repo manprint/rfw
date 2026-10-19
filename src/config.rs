@@ -25,7 +25,8 @@ impl Protocol {
     }
 }
 
-/// Forwarder definition: local_host:local_port:remote_host:remote_port[/tcp|/udp]
+/// One forwarder: a single local port to a single remote port. Port ranges are
+/// expanded into one of these per port when the configuration is loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwarderConfig {
     pub local_host: String,
@@ -54,8 +55,266 @@ impl ForwarderConfig {
     }
 }
 
+/// Most ports one range entry may expand to. Every port becomes a listener
+/// with its own monitor and target probe, so an unbounded range (`1-65535`,
+/// usually a typo) would exhaust descriptors before it forwarded anything.
+pub const MAX_RANGE_PORTS: usize = 4096;
+
+/// An inclusive span of ports; a single port is `start == end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortSpan {
+    start: u16,
+    end: u16,
+}
+
+impl PortSpan {
+    fn single(port: u16) -> Self {
+        Self {
+            start: port,
+            end: port,
+        }
+    }
+
+    /// A validated range. Port 0 means "any free port" for a single listener,
+    /// which has no sensible reading for a span, so it is rejected here.
+    fn range(start: u16, end: u16) -> Result<Self, String> {
+        if start == 0 {
+            return Err("port 0 is not allowed in a range".to_string());
+        }
+        if start > end {
+            return Err(format!("start {start} is greater than end {end}"));
+        }
+        let span = Self { start, end };
+        if span.len() > MAX_RANGE_PORTS {
+            return Err(format!(
+                "{} ports exceed the limit of {MAX_RANGE_PORTS} per range",
+                span.len()
+            ));
+        }
+        Ok(span)
+    }
+
+    fn len(self) -> usize {
+        usize::from(self.end - self.start) + 1
+    }
+
+    /// Parse `80` or `30000-30050`. `what` is "local" or "remote", for errors.
+    fn parse(raw: &str, what: &str) -> Result<Self, String> {
+        let Some((first, last)) = raw.split_once('-') else {
+            return raw
+                .parse()
+                .map(Self::single)
+                .map_err(|e| format!("Invalid {what} port '{raw}': {e}"));
+        };
+        let bound = |s: &str| -> Result<u16, String> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "Invalid {what} port range '{raw}': '{s}' is not a port number"
+                ));
+            }
+            s.parse()
+                .map_err(|e| format!("Invalid {what} port range '{raw}': {e}"))
+        };
+        Self::range(bound(first)?, bound(last)?)
+            .map_err(|e| format!("Invalid {what} port range '{raw}': {e}"))
+    }
+}
+
+impl std::fmt::Display for PortSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
+/// One configured entry before range expansion. Both sides always have the
+/// same number of ports (checked in [`ForwarderSpec::new`]), so local port
+/// `local.start + k` maps to remote port `remote.start + k`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwarderSpec {
+    local_host: String,
+    local: PortSpan,
+    remote_host: String,
+    remote: PortSpan,
+    protocol: Protocol,
+}
+
+impl ForwarderSpec {
+    fn new(
+        local_host: String,
+        local: PortSpan,
+        remote_host: String,
+        remote: PortSpan,
+        protocol: Protocol,
+    ) -> Result<Self, String> {
+        let spec = Self {
+            local_host,
+            local,
+            remote_host,
+            remote,
+            protocol,
+        };
+        if local.len() != remote.len() {
+            return Err(format!(
+                "Port range length mismatch in '{}': local {local} has {} port(s) but remote {remote} has {}. A range maps port for port, so both sides need the same number of ports.",
+                spec.describe(),
+                local.len(),
+                remote.len()
+            ));
+        }
+        Ok(spec)
+    }
+
+    /// Same shape as [`ForwarderConfig::label`], with the ports as written.
+    fn describe(&self) -> String {
+        let base = format!(
+            "{}:{}->{}:{}",
+            self.local_host, self.local, self.remote_host, self.remote
+        );
+        match self.protocol {
+            Protocol::Tcp => base,
+            Protocol::Udp => format!("{base}/{}", self.protocol.as_str()),
+        }
+    }
+
+    fn expand(&self) -> Vec<ForwarderConfig> {
+        (0..self.local.len() as u16)
+            .map(|offset| ForwarderConfig {
+                local_host: self.local_host.clone(),
+                local_port: self.local.start + offset,
+                remote_host: self.remote_host.clone(),
+                remote_port: self.remote.start + offset,
+                protocol: self.protocol,
+            })
+            .collect()
+    }
+}
+
+/// Expand every entry into single-port forwarders, rejecting any local
+/// endpoint claimed twice. Done on the entries (not the flat list) so the
+/// error can name both entries that collide, e.g. a range and a single port
+/// inside it.
+fn expand_specs(specs: &[ForwarderSpec]) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
+    let total: usize = specs.iter().map(|s| s.local.len()).sum();
+    let mut owner: std::collections::HashMap<(Protocol, &str, u16), usize> =
+        std::collections::HashMap::with_capacity(total);
+    let mut out = Vec::with_capacity(total);
+    for (index, spec) in specs.iter().enumerate() {
+        for port in spec.local.start..=spec.local.end {
+            let key = (spec.protocol, spec.local_host.as_str(), port);
+            if let Some(&first) = owner.get(&key) {
+                let addr = match spec.protocol {
+                    Protocol::Tcp => format!("{}:{port}", spec.local_host),
+                    Protocol::Udp => format!("{}:{port}/udp", spec.local_host),
+                };
+                let (a, b) = (specs[first].describe(), spec.describe());
+                let who = if a == b {
+                    format!("'{a}' is listed twice")
+                } else {
+                    format!("defined by both '{a}' and '{b}'")
+                };
+                anyhow::bail!(
+                    "Duplicate local address '{addr}': {who}. Each forwarder needs a unique local endpoint."
+                );
+            }
+            owner.insert(key, index);
+        }
+        out.extend(spec.expand());
+    }
+    Ok(out)
+}
+
+/// A YAML forwarder entry. `local_port_end` turns it into a range: ports
+/// `local_port..=local_port_end` map to `remote_port..` at the same offsets.
+/// `remote_port_end` is optional; when present it must span as many ports.
+#[derive(Debug, Clone, Deserialize)]
+struct RawForwarder {
+    local_host: String,
+    local_port: u16,
+    #[serde(default)]
+    local_port_end: Option<u16>,
+    remote_host: String,
+    remote_port: u16,
+    #[serde(default)]
+    remote_port_end: Option<u16>,
+    #[serde(default)]
+    protocol: Protocol,
+}
+
+impl RawForwarder {
+    fn into_spec(self) -> Result<ForwarderSpec, String> {
+        let shown = format!("{}:{}", self.local_host, self.local_port);
+        let local = match self.local_port_end {
+            None => PortSpan::single(self.local_port),
+            Some(end) => PortSpan::range(self.local_port, end).map_err(|e| {
+                format!(
+                    "Invalid local port range {}-{end} for '{shown}': {e}",
+                    self.local_port
+                )
+            })?,
+        };
+        let remote = match (self.local_port_end, self.remote_port_end) {
+            (None, None) => PortSpan::single(self.remote_port),
+            (None, Some(end)) => {
+                return Err(format!(
+                    "Invalid forwarder '{shown}': remote_port_end {end} needs local_port_end (a range has to span the same ports on both sides)"
+                ));
+            }
+            (Some(_), explicit) => {
+                let end = match explicit {
+                    Some(end) => end,
+                    None => {
+                        let last = u32::from(self.remote_port) + local.len() as u32 - 1;
+                        u16::try_from(last).map_err(|_| {
+                            format!(
+                                "Invalid forwarder '{shown}': the {} local ports starting at remote_port {} would run past 65535",
+                                local.len(),
+                                self.remote_port
+                            )
+                        })?
+                    }
+                };
+                PortSpan::range(self.remote_port, end).map_err(|e| {
+                    format!(
+                        "Invalid remote port range {}-{end} for '{shown}': {e}",
+                        self.remote_port
+                    )
+                })?
+            }
+        };
+        ForwarderSpec::new(
+            self.local_host,
+            local,
+            self.remote_host,
+            remote,
+            self.protocol,
+        )
+    }
+}
+
+/// Deserialize the `forwarders:` list, expanding ranges, so everything past
+/// the config layer (manager, hot-reload diff, stats) only ever sees one
+/// forwarder per port.
+fn deserialize_forwarders<'de, D>(deserializer: D) -> Result<Vec<ForwarderConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw = Vec::<RawForwarder>::deserialize(deserializer)?;
+    let specs = raw
+        .into_iter()
+        .map(RawForwarder::into_spec)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(D::Error::custom)?;
+    expand_specs(&specs).map_err(D::Error::custom)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfigFile {
+    #[serde(deserialize_with = "deserialize_forwarders")]
     forwarders: Vec<ForwarderConfig>,
     #[serde(default)]
     settings: Settings,
@@ -673,7 +932,8 @@ pub struct CliArgs {
     #[arg(long = "health-check", value_name = "HOST:PORT")]
     pub health_check: Option<String>,
 
-    /// Forwarders in format local_host:local_port:remote_host:remote_port[/tcp|/udp]
+    /// Forwarders in format local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]
+    /// (a port range maps port for port)
     #[arg(trailing_var_arg = true)]
     pub forwarders: Vec<String>,
 }
@@ -708,8 +968,12 @@ impl Default for CliArgs {
     }
 }
 
-/// Parse a forwarder string "host:port:remote_host:remote_port[/tcp|/udp]"
-pub fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
+/// Parse one forwarder entry
+/// `local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]`.
+///
+/// A range on one side needs a range of the same length on the other; the
+/// check lives in [`ForwarderSpec::new`] so CLI, env and YAML agree.
+fn parse_forwarder_spec(s: &str) -> Result<ForwarderSpec, String> {
     let (body, protocol) = match s.rsplit_once('/') {
         None => (s, Protocol::Tcp),
         Some((body, suffix)) => {
@@ -728,26 +992,22 @@ pub fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
     let parts: Vec<&str> = body.split(':').collect();
     if parts.len() != 4 {
         return Err(format!(
-            "Invalid forwarder format '{s}': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+            "Invalid forwarder format '{s}': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
         ));
     }
-    let local_port: u16 = parts[1]
-        .parse()
-        .map_err(|e| format!("Invalid local port '{}': {}", parts[1], e))?;
-    let remote_port: u16 = parts[3]
-        .parse()
-        .map_err(|e| format!("Invalid remote port '{}': {}", parts[3], e))?;
-    Ok(ForwarderConfig {
-        local_host: parts[0].to_string(),
-        local_port,
-        remote_host: parts[2].to_string(),
-        remote_port,
+    ForwarderSpec::new(
+        parts[0].to_string(),
+        PortSpan::parse(parts[1], "local")?,
+        parts[2].to_string(),
+        PortSpan::parse(parts[3], "remote")?,
         protocol,
-    })
+    )
 }
 
-/// Load forwarders from RFW_FORWARDER_N env vars
-fn load_env_forwarders() -> Vec<ForwarderConfig> {
+/// Load forwarders from RFW_FORWARDER_N env vars. An entry that does not parse
+/// is skipped with a warning; entries that parse but claim the same local
+/// endpoint are an error.
+fn load_env_forwarders() -> Result<Vec<ForwarderConfig>, anyhow::Error> {
     let mut entries: Vec<_> = std::env::vars()
         .filter_map(|(key, value)| {
             key.strip_prefix("RFW_FORWARDER_")
@@ -758,17 +1018,17 @@ fn load_env_forwarders() -> Vec<ForwarderConfig> {
 
     entries.sort_by_key(|(index, _, _)| *index);
 
-    let mut forwarders = Vec::with_capacity(entries.len());
+    let mut specs = Vec::with_capacity(entries.len());
     for (_, key, value) in entries {
-        match parse_forwarder(&value) {
-            Ok(forwarder) => forwarders.push(forwarder),
+        match parse_forwarder_spec(&value) {
+            Ok(spec) => specs.push(spec),
             Err(error) => {
                 warn!(env_var = %key, error = %error, "Ignoring invalid env forwarder");
             }
         }
     }
 
-    forwarders
+    expand_specs(&specs)
 }
 
 /// Parsed YAML config: the forwarder list plus the `settings:` block.
@@ -833,12 +1093,12 @@ pub fn load_forwarders_with_source(
 ) -> Result<(Vec<ForwarderConfig>, ForwarderSource), anyhow::Error> {
     let (configured_forwarders, configured_source) = if !cli.forwarders.is_empty() {
         // CLI args: parse and use instead of YAML
-        let parsed = cli
+        let specs = cli
             .forwarders
             .iter()
-            .map(|s| parse_forwarder(s).map_err(|e| anyhow::anyhow!("{}", e)))
+            .map(|s| parse_forwarder_spec(s).map_err(|e| anyhow::anyhow!("{}", e)))
             .collect::<Result<Vec<_>, _>>()?;
-        (parsed, ForwarderSource::Cli)
+        (expand_specs(&specs)?, ForwarderSource::Cli)
     } else if let Some(path) = &cli.config_file {
         // YAML file
         (load_yaml_forwarders(path)?, ForwarderSource::File)
@@ -847,7 +1107,7 @@ pub fn load_forwarders_with_source(
     };
 
     // Env vars override everything
-    let env_forwarders = load_env_forwarders();
+    let env_forwarders = load_env_forwarders()?;
     let (forwarders, source) = if env_forwarders.is_empty() {
         (configured_forwarders, configured_source)
     } else {
@@ -1760,11 +2020,11 @@ mod tests {
         );
         assert_eq!(
             parse_forwarder("/udp").unwrap_err(),
-            "Invalid forwarder format '/udp': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+            "Invalid forwarder format '/udp': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
         );
         assert_eq!(
             parse_forwarder("a:b:2/udp").unwrap_err(),
-            "Invalid forwarder format 'a:b:2/udp': expected local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+            "Invalid forwarder format 'a:b:2/udp': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
         );
     }
 
@@ -1920,5 +2180,413 @@ mod tests {
         assert!(knobs.udp_gro_gso());
         knobs.update(&Settings::default());
         assert!(!knobs.udp_gro_gso());
+    }
+
+    // ---- Port ranges --------------------------------------------------------
+
+    /// Parse one entry and expand it, the way every load path does.
+    fn parse_forwarders(s: &str) -> Result<Vec<ForwarderConfig>, String> {
+        parse_forwarder_spec(s).map(|spec| spec.expand())
+    }
+
+    /// Single-port convenience: the entry must expand to exactly one forwarder.
+    fn parse_forwarder(s: &str) -> Result<ForwarderConfig, String> {
+        let mut all = parse_forwarders(s)?;
+        assert_eq!(all.len(), 1, "'{s}' is not a single-port entry");
+        Ok(all.remove(0))
+    }
+
+    fn ports(list: &[ForwarderConfig]) -> Vec<(u16, u16)> {
+        list.iter().map(|f| (f.local_port, f.remote_port)).collect()
+    }
+
+    fn expand_all(entries: &[&str]) -> Result<Vec<ForwarderConfig>, anyhow::Error> {
+        let specs = entries
+            .iter()
+            .map(|e| parse_forwarder_spec(e).expect("entry must parse"))
+            .collect::<Vec<_>>();
+        expand_specs(&specs)
+    }
+
+    #[test]
+    fn range_expands_one_forwarder_per_port_at_the_same_offset() {
+        let list = parse_forwarders("0.0.0.0:30000-30003:tunnel.example.com:40000-40003").unwrap();
+        assert_eq!(
+            ports(&list),
+            vec![
+                (30000, 40000),
+                (30001, 40001),
+                (30002, 40002),
+                (30003, 40003)
+            ]
+        );
+        for f in &list {
+            assert_eq!(f.local_host, "0.0.0.0");
+            assert_eq!(f.remote_host, "tunnel.example.com");
+            assert_eq!(f.protocol, Protocol::Tcp);
+        }
+    }
+
+    #[test]
+    fn range_with_the_same_ports_on_both_sides() {
+        let list = parse_forwarders("0.0.0.0:30000-30050:h:30000-30050").unwrap();
+        assert_eq!(list.len(), 51);
+        assert!(list.iter().all(|f| f.local_port == f.remote_port));
+        assert_eq!(list[0].local_port, 30000);
+        assert_eq!(list[50].local_port, 30050);
+    }
+
+    #[test]
+    fn udp_range_keeps_the_protocol_on_every_port() {
+        for suffix in ["/udp", "/UDP"] {
+            let list = parse_forwarders(&format!("0.0.0.0:5000-5002:h:6000-6002{suffix}")).unwrap();
+            assert_eq!(ports(&list), vec![(5000, 6000), (5001, 6001), (5002, 6002)]);
+            assert!(list.iter().all(|f| f.protocol == Protocol::Udp));
+            assert_eq!(list[1].label(), "0.0.0.0:5001->h:6001/udp");
+        }
+        let tcp = parse_forwarders("0.0.0.0:5000-5001:h:6000-6001/tcp").unwrap();
+        assert!(tcp.iter().all(|f| f.protocol == Protocol::Tcp));
+    }
+
+    #[test]
+    fn single_ports_and_one_port_ranges_are_equivalent() {
+        let single = parse_forwarders("a:7:b:9").unwrap();
+        let ranged = parse_forwarders("a:7-7:b:9-9").unwrap();
+        assert_eq!(ports(&single), ports(&ranged));
+        assert_eq!(ranged.len(), 1);
+    }
+
+    #[test]
+    fn range_may_end_at_the_top_of_the_port_space() {
+        let list = parse_forwarders("a:65530-65535:b:65530-65535").unwrap();
+        assert_eq!(list.len(), 6);
+        assert_eq!(list[5].local_port, 65535);
+        assert_eq!(list[5].remote_port, 65535);
+        // and the overlap scan must not wrap past 65535
+        assert_eq!(expand_all(&["a:65530-65535:b:1-6"]).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn hostnames_with_hyphens_are_not_mistaken_for_ranges() {
+        let list = parse_forwarders("my-host:1-3:db-prod.example.com:10-12").unwrap();
+        assert_eq!(list[0].local_host, "my-host");
+        assert_eq!(list[0].remote_host, "db-prod.example.com");
+        assert_eq!(ports(&list), vec![(1, 10), (2, 11), (3, 12)]);
+        let single = parse_forwarder("my-host:80:db-prod.example.com:80").unwrap();
+        assert_eq!(single.remote_host, "db-prod.example.com");
+    }
+
+    #[test]
+    fn range_size_limit_is_enforced_and_inclusive() {
+        let ok = format!("a:1-{MAX_RANGE_PORTS}:b:1-{MAX_RANGE_PORTS}");
+        assert_eq!(parse_forwarders(&ok).unwrap().len(), MAX_RANGE_PORTS);
+        let too_big = format!("a:1-{}:b:1-{}", MAX_RANGE_PORTS + 1, MAX_RANGE_PORTS + 1);
+        let err = parse_forwarders(&too_big).unwrap_err();
+        assert!(err.contains("exceed the limit"), "{err}");
+    }
+
+    #[test]
+    fn range_with_different_lengths_is_rejected_naming_both_sides() {
+        let err = parse_forwarders("a:30000-30050:b:30000-30010").unwrap_err();
+        assert!(err.contains("length mismatch"), "{err}");
+        assert!(err.contains("local 30000-30050 has 51 port(s)"), "{err}");
+        assert!(err.contains("remote 30000-30010 has 11"), "{err}");
+    }
+
+    #[test]
+    fn range_on_one_side_only_is_rejected() {
+        // many local ports onto one remote port, and the reverse
+        let err = parse_forwarders("a:30000-30050:b:80").unwrap_err();
+        assert!(err.contains("length mismatch"), "{err}");
+        let err = parse_forwarders("a:80:b:30000-30050").unwrap_err();
+        assert!(err.contains("length mismatch"), "{err}");
+    }
+
+    #[test]
+    fn malformed_ranges_are_rejected() {
+        for bad in [
+            "a:5-1:b:5-1", // reversed
+            "a:0-5:b:1-6", // port 0 in a local range
+            "a:1-6:b:0-5", // port 0 in a remote range
+            "a:30000-:b:30000-30001",
+            "a:-30050:b:1-2",
+            "a:1-2-3:b:1-3",
+            "a:1 -3:b:1-3",
+            "a:1- 3:b:1-3",
+            "a:+1-3:b:1-3",
+            "a:1-3:b:+1-3",
+            "a:1-70000:b:1-70000", // past 65535
+            "a:x-y:b:1-2",
+            "a:-:b:1-2",
+            "a:1-2:b:1-",
+        ] {
+            assert!(parse_forwarders(bad).is_err(), "'{bad}' must be rejected");
+        }
+        let err = parse_forwarders("a:5-1:b:5-1").unwrap_err();
+        assert!(err.contains("start 5 is greater than end 1"), "{err}");
+        let err = parse_forwarders("a:0-5:b:1-6").unwrap_err();
+        assert!(err.contains("port 0"), "{err}");
+        // a single port 0 keeps its historical meaning (kernel-chosen port)
+        assert_eq!(parse_forwarder("a:0:b:1").unwrap().local_port, 0);
+    }
+
+    // ---- Range overlaps and duplicates ----------------------------------------
+
+    #[test]
+    fn overlapping_ranges_are_rejected_naming_both_entries_and_the_port() {
+        let err = expand_all(&[
+            "0.0.0.0:30000-30050:h:30000-30050",
+            "0.0.0.0:30040-30060:h:1-21",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Duplicate local address '0.0.0.0:30040'"),
+            "{err}"
+        );
+        assert!(err.contains("0.0.0.0:30000-30050->h:30000-30050"), "{err}");
+        assert!(err.contains("0.0.0.0:30040-30060->h:1-21"), "{err}");
+    }
+
+    #[test]
+    fn a_single_port_inside_a_range_is_rejected_in_either_order() {
+        for entries in [
+            ["0.0.0.0:30000-30050:h:1-51", "0.0.0.0:30025:x:9"],
+            ["0.0.0.0:30025:x:9", "0.0.0.0:30000-30050:h:1-51"],
+        ] {
+            let err = expand_all(&entries).unwrap_err().to_string();
+            assert!(
+                err.contains("Duplicate local address '0.0.0.0:30025'"),
+                "{err}"
+            );
+            assert!(err.contains("defined by both"), "{err}");
+        }
+    }
+
+    #[test]
+    fn adjacent_and_disjoint_ranges_are_accepted() {
+        let list =
+            expand_all(&["a:100-109:h:100-109", "a:110-119:h:110-119", "a:200:h:200"]).unwrap();
+        assert_eq!(list.len(), 21);
+    }
+
+    #[test]
+    fn tcp_and_udp_ranges_may_share_the_same_ports() {
+        let list = expand_all(&["a:100-109:h:100-109", "a:100-109:h:100-109/udp"]).unwrap();
+        assert_eq!(list.len(), 20);
+        validate_no_duplicates(&list).expect("flat list must also be clean");
+    }
+
+    #[test]
+    fn two_udp_ranges_overlapping_are_rejected_with_the_udp_suffix() {
+        let err = expand_all(&["a:100-109:h:1-10/udp", "a:109-111:h:1-3/udp"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate local address 'a:109/udp'"), "{err}");
+    }
+
+    #[test]
+    fn different_local_hosts_may_reuse_ports() {
+        // The duplicate check is by literal local address, as before ranges.
+        let list = expand_all(&["127.0.0.1:100-102:h:1-3", "10.0.0.1:100-102:h:1-3"]).unwrap();
+        assert_eq!(list.len(), 6);
+    }
+
+    #[test]
+    fn the_same_entry_listed_twice_says_so() {
+        let err = expand_all(&["a:100-102:h:1-3", "a:100-102:h:1-3"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is listed twice"), "{err}");
+        let err = expand_all(&["a:8080:h:1", "a:8080:h:1"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate local address 'a:8080'"), "{err}");
+        assert!(err.contains("is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn expansion_preserves_entry_order() {
+        let list = expand_all(&["a:300-301:h:1-2", "a:100:h:9", "a:200-201:h:5-6"]).unwrap();
+        let locals: Vec<u16> = list.iter().map(|f| f.local_port).collect();
+        assert_eq!(locals, vec![300, 301, 100, 200, 201]);
+    }
+
+    // ---- Ranges in YAML -----------------------------------------------------
+
+    fn yaml_forwarders(entries: &str) -> Result<Vec<ForwarderConfig>, String> {
+        let yaml = format!("forwarders:\n{entries}");
+        serde_saphyr::from_str::<ConfigFile>(&yaml)
+            .map(|cf| cf.forwarders)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn yaml_local_port_end_expands_and_remote_follows_the_offset() {
+        let list = yaml_forwarders(
+            "  - {local_host: 0.0.0.0, local_port: 30000, local_port_end: 30002, remote_host: h, remote_port: 40000}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ports(&list),
+            vec![(30000, 40000), (30001, 40001), (30002, 40002)]
+        );
+    }
+
+    #[test]
+    fn yaml_block_style_range_with_udp_and_explicit_remote_end() {
+        let list = yaml_forwarders(
+            "  - local_host: \"0.0.0.0\"\n    local_port: 5000\n    local_port_end: 5002\n    remote_host: \"h\"\n    remote_port: 7000\n    remote_port_end: 7002\n    protocol: udp\n  - {local_host: 0.0.0.0, local_port: 80, remote_host: h, remote_port: 8080}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ports(&list),
+            vec![(5000, 7000), (5001, 7001), (5002, 7002), (80, 8080)]
+        );
+        assert!(list[..3].iter().all(|f| f.protocol == Protocol::Udp));
+        assert_eq!(list[3].protocol, Protocol::Tcp);
+    }
+
+    #[test]
+    fn yaml_one_port_range_is_allowed() {
+        let list = yaml_forwarders(
+            "  - {local_host: a, local_port: 7, local_port_end: 7, remote_host: b, remote_port: 9}\n",
+        )
+        .unwrap();
+        assert_eq!(ports(&list), vec![(7, 9)]);
+    }
+
+    #[test]
+    fn yaml_invalid_ranges_are_rejected() {
+        let entry = |extra: &str| {
+            format!("  - {{local_host: a, local_port: 100, remote_host: b, remote_port: 200, {extra}}}\n")
+        };
+        let cases = [
+            ("local_port_end: 99", "greater than end"),
+            (
+                "local_port_end: 150, remote_port_end: 210",
+                "length mismatch",
+            ),
+            ("remote_port_end: 210", "needs local_port_end"),
+        ];
+        for (extra, expect) in cases {
+            let err = yaml_forwarders(&entry(extra)).expect_err(extra);
+            assert!(err.contains(expect), "{extra}: {err}");
+        }
+        // the remote side would run past 65535
+        let err = yaml_forwarders(
+            "  - {local_host: a, local_port: 100, local_port_end: 150, remote_host: b, remote_port: 65500}\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("run past 65535"), "{err}");
+        // port 0 in a range, local or remote
+        for e in [
+            "  - {local_host: a, local_port: 0, local_port_end: 5, remote_host: b, remote_port: 1}\n",
+            "  - {local_host: a, local_port: 1, local_port_end: 5, remote_host: b, remote_port: 0}\n",
+        ] {
+            let err = yaml_forwarders(e).unwrap_err();
+            assert!(err.contains("port 0"), "{err}");
+        }
+        // too many ports
+        let err = yaml_forwarders(
+            "  - {local_host: a, local_port: 1, local_port_end: 5000, remote_host: b, remote_port: 1}\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("exceed the limit"), "{err}");
+    }
+
+    #[test]
+    fn yaml_overlapping_ranges_are_rejected_when_loaded() {
+        let path = write_temp(
+            "range-overlap",
+            "forwarders:\n  - {local_host: a, local_port: 100, local_port_end: 110, remote_host: b, remote_port: 1}\n  - {local_host: a, local_port: 105, remote_host: c, remote_port: 2}\n",
+        );
+        let res = load_yaml_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let err = res.expect_err("overlap must fail the load").to_string();
+        assert!(err.contains("Duplicate local address 'a:105'"), "{err}");
+    }
+
+    #[test]
+    fn yaml_range_keeps_settings_and_loads_through_load_yaml_config() {
+        let path = write_temp(
+            "range-ok",
+            "forwarders:\n  - {local_host: a, local_port: 100, local_port_end: 102, remote_host: b, remote_port: 1}\nsettings:\n  buffer_bytes: 4096\n",
+        );
+        let loaded = load_yaml_config(&path).expect("must parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.forwarders.len(), 3);
+        assert_eq!(loaded.settings.buffer_bytes, 4096);
+    }
+
+    #[test]
+    fn a_plain_yaml_entry_without_range_fields_is_unchanged() {
+        let list = yaml_forwarders(
+            "  - {local_host: a, local_port: 1, remote_host: b, remote_port: 2, protocol: udp}\n",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label(), "a:1->b:2/udp");
+    }
+
+    // ---- Ranges from env and CLI ----------------------------------------------
+
+    #[test]
+    fn env_ranges_expand_and_invalid_entries_are_skipped() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _env_guard = ForwarderEnvGuard::set(&[
+            ("RFW_FORWARDER_1", "0.0.0.0:9000-9002:h:9100-9102"),
+            ("RFW_FORWARDER_2", "0.0.0.0:9500-9505:h:9500-9501"), // length mismatch
+            ("RFW_FORWARDER_3", "0.0.0.0:9300:h:80/udp"),
+        ]);
+        let list = load_forwarders(&CliArgs::default()).expect("valid entries still load");
+        assert_eq!(
+            ports(&list),
+            vec![(9000, 9100), (9001, 9101), (9002, 9102), (9300, 80)]
+        );
+        assert_eq!(list[3].protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn env_overlapping_ranges_fail_the_load() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _env_guard = ForwarderEnvGuard::set(&[
+            ("RFW_FORWARDER_1", "0.0.0.0:9000-9010:h:1-11"),
+            ("RFW_FORWARDER_2", "0.0.0.0:9005:h:80"),
+        ]);
+        let err = load_forwarders(&CliArgs::default()).expect_err("overlap must fail");
+        assert!(
+            err.to_string()
+                .contains("Duplicate local address '0.0.0.0:9005'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cli_ranges_expand_and_errors_surface() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _env_guard = ForwarderEnvGuard::set(&[]);
+        let cli = CliArgs::try_parse_from([
+            "rfw",
+            "0.0.0.0:100-102:h:200-202",
+            "0.0.0.0:100-101:h:200-201/udp",
+            "0.0.0.0:500:h:600",
+        ])
+        .unwrap();
+        let list = load_forwarders(&cli).expect("must load");
+        assert_eq!(list.len(), 3 + 2 + 1);
+
+        let cli = CliArgs::try_parse_from(["rfw", "0.0.0.0:100-110:h:200-205"]).unwrap();
+        let err = load_forwarders(&cli).expect_err("mismatch must fail");
+        assert!(err.to_string().contains("length mismatch"), "{err}");
+
+        let cli =
+            CliArgs::try_parse_from(["rfw", "0.0.0.0:100-110:h:1-11", "0.0.0.0:110:h:5"]).unwrap();
+        let err = load_forwarders(&cli).expect_err("overlap must fail");
+        assert!(
+            err.to_string()
+                .contains("Duplicate local address '0.0.0.0:110'"),
+            "{err}"
+        );
     }
 }

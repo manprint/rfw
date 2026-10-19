@@ -100,6 +100,76 @@ fn reserve_port(is_free: impl Fn(u16) -> bool) -> u16 {
     panic!("could not reserve a free port in {RESERVED_PORTS:?}");
 }
 
+/// Reserve `len` consecutive ports, each free for TCP *and* UDP on 127.0.0.1,
+/// and return the first. For tests of port ranges, where the forwarder's local
+/// side (or the backends' remote side) must be a contiguous block. The ports
+/// are claimed like [`free_port`] ones, so no in-process backend takes them.
+pub fn free_block(len: u16) -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let window = u32::from(RESERVED_PORTS.end - RESERVED_PORTS.start) - u32::from(len) + 1;
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id().wrapping_mul(104_729) % window,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    let _no_fork = FORK_GATE.write().unwrap_or_else(|e| e.into_inner());
+    let mut claimed = claimed_ports().lock().unwrap();
+    for _ in 0..window {
+        let base = RESERVED_PORTS.start + (NEXT.fetch_add(1, Ordering::Relaxed) % window) as u16;
+        let block = base..base + len;
+        if block.clone().any(|p| claimed.contains(&p)) {
+            continue;
+        }
+        let free = block.clone().all(|p| {
+            StdListener::bind(("127.0.0.1", p)).is_ok()
+                && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+        });
+        if free {
+            claimed.extend(block);
+            return base;
+        }
+    }
+    panic!("could not reserve {len} consecutive free ports in {RESERVED_PORTS:?}");
+}
+
+/// What the port-tagged backends answer: lets a test tell *which remote port*
+/// a forwarded connection or datagram reached.
+pub fn port_tag(port: u16) -> String {
+    format!("PORT={port}")
+}
+
+/// TCP backend on a port reserved with [`free_block`]: answers every read with
+/// [`port_tag`] and keeps the connection open until the client closes it.
+pub async fn spawn_port_tag_on(port: u16) {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|e| panic!("bind tcp backend on {port}: {e}"));
+    let tag = port_tag(port);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let tag = tag.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 256];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if sock.write_all(tag.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// Bind an in-process listener on a port nothing else in this binary has
 /// claimed. Retries if the OS offers a port already reserved for an `rfw`
 /// instance.
@@ -742,4 +812,22 @@ pub fn spawn_udp_gso_echo() -> u16 {
         }
     });
     port
+}
+
+/// UDP backend on a port reserved with [`free_block`]: answers every datagram
+/// with [`port_tag`], whatever it carried.
+pub async fn spawn_udp_port_tag_on(port: u16) {
+    let sock = tokio::net::UdpSocket::bind(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|e| panic!("bind udp backend on {port}: {e}"));
+    let tag = port_tag(port);
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 65536];
+        loop {
+            let Ok((_, from)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = sock.send_to(tag.as_bytes(), from).await;
+        }
+    });
 }

@@ -14,7 +14,7 @@
 services:
   rfw:
     # Pin a release tag in production; `latest` moves on every release.
-    image: ghcr.io/manprint/rfw:v1.1.1
+    image: ghcr.io/manprint/rfw:v1.2.0
     container_name: rfw
     restart: unless-stopped
 
@@ -35,8 +35,11 @@ services:
 
     environment:
       # ── Forwarder configuration via env vars ──
-      # Format: local_host:local_port:remote_host:remote_port[/tcp|/udp]
-      # (no suffix = tcp). Env vars override CLI args and config file.
+      # Format: local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]
+      # (no suffix = tcp). A range maps port for port, e.g.
+      #   0.0.0.0:30000-30050:tunnel.example.com:30000-30050
+      # (publish the whole range under `ports:` too, or use network_mode: host).
+      # Env vars override CLI args and config file.
       - RFW_FORWARDER_1=0.0.0.0:8080:example.com:80
       - RFW_FORWARDER_2=0.0.0.0:8081:api.example.com:443
       # DNS over UDP to a public resolver (publish 1053/udp above)

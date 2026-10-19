@@ -8,6 +8,7 @@
 - **UDP sessions** — Idle timeout (`udp_session_timeout_secs`, default 60s, hot-reloadable), global cap `udp_max_sessions` (default 16384), drops counted, never blocking other clients
 - **UDP GRO/GSO (Linux, opt-in)** — `udp_gro_gso` / `--udp-gro-gso` receives coalesced UDP bursts and forwards them with segmented sends, cutting syscalls on high-packet-rate flows; datagram boundaries and order are unchanged (see [UDP GRO/GSO](#udp-grogso-linux-opt-in))
 - **Multiple forwarders** — Run many forwarders in a single process
+- **Port ranges** — `0.0.0.0:30000-30050:host:30000-30050` forwards a whole block, port for port, over TCP or UDP; one line on the CLI, in an env var or in YAML (`local_port_end`), validated for length, bounds and overlaps (see [Port ranges](#port-ranges))
 - **Configuration sources** — CLI args, YAML file, or environment variables
 - **Hot-reload** — Watch YAML config file for changes, apply without restart
 - **Auto-reconnect** — Each forwarder retries independently on failure
@@ -51,7 +52,7 @@ Download from the [releases page](https://github.com/manprint/rfw/releases).
 ### Docker
 
 ```bash
-docker pull ghcr.io/manprint/rfw:v1.1.1
+docker pull ghcr.io/manprint/rfw:v1.2.0
 docker compose up -d
 ```
 
@@ -60,7 +61,7 @@ Or run manually:
 ```bash
 docker run --rm -p 8080:8080 \
   -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
-  ghcr.io/manprint/rfw:v1.1.1 --log-dir ""
+  ghcr.io/manprint/rfw:v1.2.0 --log-dir ""
 ```
 
 For the "database behind a cloud DNS name on the host network" deployment, see
@@ -69,15 +70,15 @@ For the "database behind a cloud DNS name on the host network" deployment, see
 ## Forwarder syntax
 
 ```
-local_host:local_port:remote_host:remote_port[/tcp|/udp]
+local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]
 ```
 
 | Part | Description | Example |
 |---|---|---|
 | `local_host` | IP/hostname to bind locally | `127.0.0.1`, `0.0.0.0`, `localhost` |
-| `local_port` | Port to listen on locally | `8080`, `3306`, `443` |
+| `local_port` | Port to listen on locally, or a range `first-last` | `8080`, `3306`, `30000-30050` |
 | `remote_host` | Destination hostname/IP | `example.com`, `192.168.1.5` |
-| `remote_port` | Destination port | `80`, `443`, `5432` |
+| `remote_port` | Destination port, or a range of the same length | `80`, `5432`, `30000-30050` |
 | `/tcp`, `/udp` | Optional protocol suffix (case-insensitive); default `tcp` | `/udp` |
 
 A TCP and a UDP forwarder may share the same local port; two UDP (or two TCP) forwarders may not.
@@ -89,7 +90,52 @@ A TCP and a UDP forwarder may share the same local port; two UDP (or two TCP) fo
 0.0.0.0:3306:db-prod.example.com:3306   → database tunnel
 0.0.0.0:443:app.azure.com:443           → cloud service proxy
 0.0.0.0:1053:1.1.1.1:53/udp             → DNS over UDP
+0.0.0.0:30000-30050:tunnel.example.com:30000-30050   → 51 ports, one line
 ```
+
+### Port ranges
+
+A range on both sides forwards a block of ports, **port for port**: local port
+`first + k` goes to remote port `first' + k`. The two sides need not start at
+the same number.
+
+```
+0.0.0.0:30000-30050:tunnel.example.com:30000-30050      # 30000→30000 … 30050→30050
+0.0.0.0:8000-8009:backend.internal:9000-9009            # 8000→9000 … 8009→9009
+0.0.0.0:5000-5003:media.example.com:6000-6003/udp       # the same, over UDP
+```
+
+A range is expanded when the configuration is loaded, into one ordinary
+forwarder per port. Everything else (hot-reload, `/stats`, metrics, logs,
+`max_connections`) sees plain single-port forwarders, labelled
+`0.0.0.0:30001->host:30001`. In particular, shrinking or growing a range in a
+YAML file on a live reload stops or starts only the ports that left or
+joined; the others keep their listener and their open connections.
+
+Rules, all checked at load (on a hot-reload a violation keeps the running
+configuration and reports the error):
+
+- Both sides must have the **same number of ports**. A range on one side only
+  (`30000-30050:host:80`) is an error: list the ports you mean, or use two
+  ranges of equal length.
+- `first` must not exceed `last`; a range may not include port 0; `last` is at
+  most 65535. A one-port range (`80-80`) is allowed.
+- At most **4096 ports** per range (`MAX_RANGE_PORTS`): each port is a real
+  listener with its own monitor, and a typo such as `1-65535` would otherwise
+  exhaust file descriptors.
+- Local endpoints must not overlap, between ranges or between a range and a
+  single port, in either order. A TCP range and a UDP range may share ports,
+  as single forwarders may. The error names the port and both entries:
+  `Duplicate local address '0.0.0.0:30040': defined by both
+  '0.0.0.0:30000-30050->h:30000-30050' and '0.0.0.0:30040-30060->h:1-21'`.
+- Only the port fields take ranges: a hyphen in a hostname
+  (`db-prod.example.com`) is not affected.
+
+Each port of a range is monitored separately, as if you had written it by
+hand: every port probes its own target (`host:port`) and reports its own
+reachability, so a backend that is down for the whole block produces one
+"unreachable" alert per port, not one per range. A range of 50 ports against
+one host also means 50 probes per `probe_interval` while idle.
 
 ## Configuration
 
@@ -133,12 +179,39 @@ The `settings:` block also accepts `udp_gro_gso: true` (Linux only, default `fal
 
 The YAML file is **watched for changes** — edit it and rfw picks up new forwarders / removes stopped ones without restart. The `forwarders:` list and the data-plane knobs (`buffer_bytes`, `socket_buffer_bytes`, `use_splice`, timeouts, keepalive, probe cadence, alert threshold, `udp_session_timeout_secs`, `udp_gro_gso`) are hot-reloaded; interval, `max_connections`, `udp_max_sessions`, `metrics_addr`, `webhook_url` and `instance_name` changes need a restart.
 
+A range in YAML adds `local_port_end` to an entry. `remote_port` is the remote
+port that matches `local_port`, and the remote side follows at the same offsets:
+
+```yaml
+forwarders:
+  # 30000→30000 … 30050→30050 (51 forwarders)
+  - local_host: "0.0.0.0"
+    local_port: 30000
+    local_port_end: 30050
+    remote_host: "tunnel.example.com"
+    remote_port: 30000
+
+  # 5000→6000 … 5003→6003 over UDP; remote_port_end is optional and, when
+  # present, must span the same number of ports
+  - local_host: "0.0.0.0"
+    local_port: 5000
+    local_port_end: 5003
+    remote_host: "media.example.com"
+    remote_port: 6000
+    remote_port_end: 6003
+    protocol: udp
+```
+
+`remote_port_end` without `local_port_end` is an error. See
+[Port ranges](#port-ranges) for the rules.
+
 ### 3. Environment variables
 
 ```bash
 export RFW_FORWARDER_1=127.0.0.1:8080:172.16.0.5:80
 export RFW_FORWARDER_2=0.0.0.0:3306:db-prod.example.com:3306
 export RFW_FORWARDER_3=0.0.0.0:1053:1.1.1.1:53/udp
+export RFW_FORWARDER_4=0.0.0.0:30000-30050:tunnel.example.com:30000-30050   # a range
 rfw
 ```
 
@@ -150,7 +223,7 @@ rfw
 Usage: rfw [OPTIONS] [FORWARDERS]...
 
 Arguments:
-  [FORWARDERS]...  Forwarders in format local_host:local_port:remote_host:remote_port
+  [FORWARDERS]...  Forwarders in format local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp] (a port range maps port for port)
 
 Options:
   -f, --file <CONFIG_FILE>        Path to YAML configuration file
@@ -797,7 +870,7 @@ docker run --rm -p 8080:8080 \
 docker compose up -d
 ```
 
-In production pin a release tag (`ghcr.io/manprint/rfw:v1.1.1`) rather than
+In production pin a release tag (`ghcr.io/manprint/rfw:v1.2.0`) rather than
 `latest`, which moves on every release. Edit `docker-compose.yml` to configure
 your forwarders via env vars. For a UDP forwarder, publish its port with the
 `/udp` suffix (`"1053:1053/udp"`); a port served over both TCP and UDP needs
@@ -846,7 +919,7 @@ docker run -d \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RFW_INSTANCE_NAME=db-proxy-prod \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.1.1 \
+  ghcr.io/manprint/rfw:v1.2.0 \
     --log-dir "" \
     --max-connections 1000 \
     --metrics-addr 127.0.0.1:9090 \
@@ -882,7 +955,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.1.1
+    image: ghcr.io/manprint/rfw:v1.2.0
     container_name: rfw-db
     restart: always
     network_mode: host          # 0.0.0.0:5432 on the host, host DNS
@@ -969,7 +1042,7 @@ docker run -d \
   -v /opt/rfw:/etc/rfw:ro \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.1.1 \
+  ghcr.io/manprint/rfw:v1.2.0 \
     -f /etc/rfw/forwarders.yml \
     --log-dir ""
 ```
@@ -977,7 +1050,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.1.1
+    image: ghcr.io/manprint/rfw:v1.2.0
     container_name: rfw-db
     restart: always
     network_mode: host

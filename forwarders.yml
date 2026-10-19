@@ -52,6 +52,18 @@ forwarders:
     remote_port: 514
     protocol: udp
 
+  # ── Port ranges ──
+  # `local_port_end` turns an entry into a block of ports, mapped port for port:
+  # local 30000..30050 -> remote 30000..30050 (51 forwarders). The remote side
+  # follows at the same offsets; `remote_port_end` is optional and must span
+  # the same number of ports. Works with `protocol: udp` too; at most 4096
+  # ports per entry; ranges may not overlap other local ports.
+  # - local_host: "0.0.0.0"
+  #   local_port: 30000
+  #   local_port_end: 30050
+  #   remote_host: "tunnel.example.com"
+  #   remote_port: 30000
+
   # WireGuard / QUIC-style bulk UDP: consider `udp_gro_gso: true` below
   # (Linux only) and a larger socket_buffer_bytes.
   # - local_host: "0.0.0.0"

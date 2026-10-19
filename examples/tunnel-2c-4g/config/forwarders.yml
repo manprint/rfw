@@ -1,0 +1,33 @@
+# rfw forwarders for the tunnel-server port set (7835, 30000-30050, 80, 443).
+# Replace tunnel.example.com with the real remote host (name or IP):
+#   sed -i 's/tunnel\.example\.com/REAL.HOST/g' config/forwarders.yml
+# Hot-reloaded: forwarders and data-plane knobs apply on save. max_connections,
+# udp_max_sessions and metrics_addr need `docker compose restart`.
+# Needs rfw >= 1.2.0 (port ranges).
+
+forwarders:
+  # control port, TCP + UDP
+  - {local_host: "0.0.0.0", local_port: 7835, remote_host: "tunnel.example.com", remote_port: 7835, protocol: tcp}
+  - {local_host: "0.0.0.0", local_port: 7835, remote_host: "tunnel.example.com", remote_port: 7835, protocol: udp}
+  # alt STUN
+  - {local_host: "0.0.0.0", local_port: 7836, remote_host: "tunnel.example.com", remote_port: 7836, protocol: udp}
+  # control port over standard HTTPS: host 443 -> remote 7835
+  - {local_host: "0.0.0.0", local_port: 443, remote_host: "tunnel.example.com", remote_port: 7835, protocol: tcp}
+  # vhost TCP + QUIC (80/udp, 443/udp)
+  - {local_host: "0.0.0.0", local_port: 80, remote_host: "tunnel.example.com", remote_port: 80, protocol: tcp}
+  - {local_host: "0.0.0.0", local_port: 80, remote_host: "tunnel.example.com", remote_port: 80, protocol: udp}
+  - {local_host: "0.0.0.0", local_port: 443, remote_host: "tunnel.example.com", remote_port: 443, protocol: udp}
+  # tunnel port range 30000-30050 (TCP, 51 ports, port for port)
+  - {local_host: "0.0.0.0", local_port: 30000, local_port_end: 30050, remote_host: "tunnel.example.com", remote_port: 30000}
+
+settings:
+  # loopback only: host network would otherwise expose it on every interface
+  metrics_addr: "127.0.0.1:9090"
+  # 2 cores: splice halves forwarder CPU on bulk streams, -4% on saturated tiny messages
+  use_splice: true
+  # QUIC / STUN datagrams: +5-13% lossless rate on kernels with UDP GRO/GSO
+  udp_gro_gso: true
+  # ~60 KiB/conn in the image => 10k conns ~ 600 MiB; 6 fds/conn with splice
+  max_connections: 10000
+  connect_timeout_secs: 5
+  dns_timeout_secs: 3

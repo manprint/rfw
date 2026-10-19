@@ -1,0 +1,65 @@
+# rfw in front of a tunnel server, sized for a 2 vCPU / 4 GB VM.
+# Choices come from docs/benchmarks/BENCHMARK_REPORT.md (sections 4, 5, 9).
+#
+#   docker compose up -d
+#   curl -s 127.0.0.1:9090/stats        # on the VM
+#
+# Host ports 80, 443, 7835, 7836 and 30000-30050 (plus 127.0.0.1:9090) must be free.
+
+services:
+  rfw:
+    image: ghcr.io/manprint/rfw:v1.2.0
+    container_name: rfw-tunnel
+    restart: unless-stopped
+
+    # Host network: no docker-proxy (one process per published port and protocol,
+    # ~110 here), no NAT hop, no `ports:` list. The image runs as root, so
+    # 80/443 bind without extra capabilities.
+    network_mode: host
+
+    # All forwarders and settings live in the YAML (hot reload). Mount the
+    # directory, not the file: editors replace the inode.
+    volumes:
+      - ./config:/etc/rfw:ro
+    command: ["-f", "/etc/rfw/forwarders.yml", "--log-dir", ""]
+
+    environment:
+      - RUST_LOG=info
+      - RFW_INSTANCE_NAME=tunnel-edge
+      # - RFW_WEBHOOK_URL=${RFW_WEBHOOK_URL}   # Google Chat alerts, from .env
+
+    # --splice needs a pipe budget: SYS_RESOURCE lifts fs.pipe-user-pages-soft
+    # (report section 4.3). Narrow replacement for --privileged, which gains nothing.
+    cap_add:
+      - SYS_RESOURCE
+
+    # 10000 conns x 6 fds (splice) + 16384 UDP sessions + headroom.
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+
+    # 10000 x ~60 KiB ~ 600 MiB, plus pipe pages charged to the cgroup. Leaves
+    # ~1 GiB for the OS and Docker on a 4 GB VM. CPU is left unlimited on purpose:
+    # rfw scales with both cores.
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 128M
+
+    stop_grace_period: 15s
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rfw", "--health-check", "127.0.0.1:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
