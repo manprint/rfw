@@ -218,7 +218,11 @@ def cell(recs, ex, fmt):
 # runner's CPU and scheduler, not the forwarder: the same code scored 20k msg/s
 # on an EPYC 7763 runner and 41k on a Xeon 8573C one while every forwarder moved
 # only ~30 %. They are scored against `socat` (same hop, same job) instead.
-HOP_BOUND = {"rr1_64", "udp_rr"}
+#
+# The connection-rate test is bound the same way: `direct` is one loopback
+# connect, a forwarder is two. On a Xeon 6975P-C runner `direct` did 42k conn/s
+# against 26k on the baseline runner, while rfw held 4.1-4.2x socat on both.
+HOP_BOUND = {"rr1_64", "udp_rr", "cps"}
 
 
 def scores(data):
@@ -412,7 +416,7 @@ def main():
                 if was and now < was * (1 - a.tolerance):
                     regress.append(f"[{cores}c] {k}: {now:.2f} vs baseline {was:.2f} ({(now / was - 1) * 100:+.0f}%)")
         if regress:
-            print("\n### Possible regressions vs baseline (ratio to `direct`; `socat` for rr1_64 and udp_rr)\n", file=sys.stderr)
+            print("\n### Possible regressions vs baseline (ratio to `direct`; `socat` for rr1_64, udp_rr and cps)\n", file=sys.stderr)
             for r in regress:
                 print("- " + r, file=sys.stderr)
             if a.check:
