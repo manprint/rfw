@@ -170,7 +170,7 @@ pub async fn run_forwarder(
         }
     };
 
-    info!(forwarder = %label, "Listening on {} -> {}:{}", local_str, cfg.remote_host, cfg.remote_port);
+    info!(forwarder = %label, "Listening on {} -> {}", local_str, cfg.remote_addr());
     if bind_failures > 0 {
         notifier.notify(Event::BindRecovered {
             label: label.to_string(),
@@ -343,37 +343,63 @@ pub(crate) async fn connect_racing(
     addrs: &[std::net::SocketAddr],
     connect_timeout: Duration,
 ) -> Result<(TcpStream, std::net::SocketAddr), anyhow::Error> {
+    async fn attempt(
+        addr: std::net::SocketAddr,
+        connect_timeout: Duration,
+    ) -> (std::net::SocketAddr, Result<TcpStream, anyhow::Error>) {
+        let result = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => Ok(s),
+            Ok(Err(e)) => Err(anyhow::anyhow!("connect {addr}: {e}")),
+            Err(_) => Err(anyhow::anyhow!("connect timeout to {addr}")),
+        };
+        (addr, result)
+    }
+
+    // One address (IP literal, single A record) is the common case: connect
+    // inline, with no task spawn and no JoinSet on the connect path.
+    if let [addr] = addrs {
+        return attempt(*addr, connect_timeout).await.1.map(|s| (s, *addr));
+    }
+
     let mut attempts = tokio::task::JoinSet::new();
     let mut last_err: Option<anyhow::Error> = None;
+    let mut pending = addrs.iter().copied();
 
-    for (i, addr) in addrs.iter().copied().enumerate() {
-        let stagger = CONNECT_ATTEMPT_DELAY * i as u32;
-        attempts.spawn(async move {
-            if !stagger.is_zero() {
-                tokio::time::sleep(stagger).await;
+    loop {
+        if let Some(addr) = pending.next() {
+            attempts.spawn(attempt(addr, connect_timeout));
+        }
+        let more = pending.len() > 0;
+        // Wait for a winner. The next address starts after the stagger, or at
+        // once when an attempt fails (RFC 8305 section 5): a refused first
+        // record must not cost a full stagger.
+        loop {
+            tokio::select! {
+                joined = attempts.join_next() => match joined {
+                    // Dropping the set aborts the attempts still in flight.
+                    Some(Ok((addr, Ok(stream)))) => return Ok((stream, addr)),
+                    Some(Ok((_, Err(e)))) => {
+                        last_err = Some(e);
+                        if more {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        last_err = Some(anyhow::anyhow!("connect task failed: {e}"));
+                        if more {
+                            break;
+                        }
+                    }
+                    None if more => break,
+                    None => {
+                        return Err(last_err
+                            .unwrap_or_else(|| anyhow::anyhow!("no addresses to connect to")));
+                    }
+                },
+                _ = tokio::time::sleep(CONNECT_ATTEMPT_DELAY), if more => break,
             }
-            let result = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await
-            {
-                Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Err(anyhow::anyhow!("connect {addr}: {e}")),
-                Err(_) => Err(anyhow::anyhow!("connect timeout to {addr}")),
-            };
-            (addr, result)
-        });
-    }
-
-    while let Some(joined) = attempts.join_next().await {
-        match joined {
-            Ok((addr, Ok(stream))) => {
-                // Dropping the set aborts the attempts still in flight.
-                return Ok((stream, addr));
-            }
-            Ok((_, Err(e))) => last_err = Some(e),
-            Err(e) => last_err = Some(anyhow::anyhow!("connect task failed: {e}")),
         }
     }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no addresses to connect to")))
 }
 
 /// Proxy a single TCP connection to remote destination.

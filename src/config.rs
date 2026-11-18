@@ -38,11 +38,29 @@ pub struct ForwarderConfig {
     pub protocol: Protocol,
 }
 
+/// `host:port`, with an IPv6 literal in brackets (`[::1]:80`): the form
+/// socket-address parsers expect, and the only unambiguous one to read.
+pub fn host_port(host: &str, port: impl std::fmt::Display) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// A configured host without the brackets an IPv6 literal may be written in.
+fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 impl ForwarderConfig {
     pub fn label(&self) -> String {
         let base = format!(
-            "{}:{}->{}:{}",
-            self.local_host, self.local_port, self.remote_host, self.remote_port
+            "{}->{}",
+            host_port(&self.local_host, self.local_port),
+            host_port(&self.remote_host, self.remote_port)
         );
         match self.protocol {
             Protocol::Tcp => base,
@@ -51,7 +69,11 @@ impl ForwarderConfig {
     }
 
     pub fn local_addr(&self) -> String {
-        format!("{}:{}", self.local_host, self.local_port)
+        host_port(&self.local_host, self.local_port)
+    }
+
+    pub fn remote_addr(&self) -> String {
+        host_port(&self.remote_host, self.remote_port)
     }
 }
 
@@ -151,9 +173,9 @@ impl ForwarderSpec {
         protocol: Protocol,
     ) -> Result<Self, String> {
         let spec = Self {
-            local_host,
+            local_host: unbracket(&local_host).to_string(),
             local,
-            remote_host,
+            remote_host: unbracket(&remote_host).to_string(),
             remote,
             protocol,
         };
@@ -171,8 +193,9 @@ impl ForwarderSpec {
     /// Same shape as [`ForwarderConfig::label`], with the ports as written.
     fn describe(&self) -> String {
         let base = format!(
-            "{}:{}->{}:{}",
-            self.local_host, self.local, self.remote_host, self.remote
+            "{}->{}",
+            host_port(&self.local_host, self.local),
+            host_port(&self.remote_host, self.remote)
         );
         match self.protocol {
             Protocol::Tcp => base,
@@ -207,8 +230,8 @@ fn expand_specs(specs: &[ForwarderSpec]) -> Result<Vec<ForwarderConfig>, anyhow:
             let key = (spec.protocol, spec.local_host.as_str(), port);
             if let Some(&first) = owner.get(&key) {
                 let addr = match spec.protocol {
-                    Protocol::Tcp => format!("{}:{port}", spec.local_host),
-                    Protocol::Udp => format!("{}:{port}/udp", spec.local_host),
+                    Protocol::Tcp => host_port(&spec.local_host, port),
+                    Protocol::Udp => format!("{}/udp", host_port(&spec.local_host, port)),
                 };
                 let (a, b) = (specs[first].describe(), spec.describe());
                 let who = if a == b {
@@ -231,6 +254,7 @@ fn expand_specs(specs: &[ForwarderSpec]) -> Result<Vec<ForwarderConfig>, anyhow:
 /// `local_port..=local_port_end` map to `remote_port..` at the same offsets.
 /// `remote_port_end` is optional; when present it must span as many ports.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawForwarder {
     local_host: String,
     local_port: u16,
@@ -313,6 +337,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(deserialize_with = "deserialize_forwarders")]
     forwarders: Vec<ForwarderConfig>,
@@ -372,7 +397,11 @@ pub const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_UDP_SESSIONS: usize = 1_048_576;
 
 /// Process-global runtime settings (one HTTP endpoint, one sampler, one reporter).
+///
+/// Unknown keys are an error: a misspelled setting used to be dropped without
+/// a word, leaving the default in force.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     /// `host:port` for the HTTP stats endpoint. `None` disables it (default).
     #[serde(default)]
@@ -517,7 +546,7 @@ impl Settings {
             }
         }
         if let Some(addr) = &self.metrics_addr {
-            if addr.parse::<std::net::SocketAddr>().is_err() {
+            if !is_host_port(addr) {
                 anyhow::bail!("metrics_addr '{addr}' is not a valid host:port socket address");
             }
         }
@@ -926,6 +955,11 @@ pub struct CliArgs {
     #[arg(long = "log-dir", default_value = "logs")]
     pub log_dir: String,
 
+    /// Daily log files kept in --log-dir; older ones are deleted. 0 keeps
+    /// them all.
+    #[arg(long = "log-max-files", value_name = "N", default_value_t = 30)]
+    pub log_max_files: usize,
+
     /// Probe a running rfw's stats endpoint at HOST:PORT and exit 0 if healthy,
     /// 1 otherwise. Intended as a container healthcheck in images with no shell
     /// (the binary is its own probe). Starts no forwarders.
@@ -962,6 +996,7 @@ impl Default for CliArgs {
             udp_max_sessions: None,
             udp_gro_gso: false,
             log_dir: "logs".to_string(),
+            log_max_files: 30,
             health_check: None,
             forwarders: Vec::new(),
         }
@@ -989,19 +1024,51 @@ fn parse_forwarder_spec(s: &str) -> Result<ForwarderSpec, String> {
             (body, protocol)
         }
     };
-    let parts: Vec<&str> = body.split(':').collect();
-    if parts.len() != 4 {
-        return Err(format!(
-            "Invalid forwarder format '{s}': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
-        ));
+    let bad = || {
+        format!(
+            "Invalid forwarder format '{s}': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp] (an IPv6 host goes in brackets: [::1]:8080:[2001:db8::1]:80)"
+        )
+    };
+    let (local_host, rest) = split_host(body).ok_or_else(bad)?;
+    let (local_port, rest) = rest.split_once(':').ok_or_else(bad)?;
+    let (remote_host, remote_port) = split_host(rest).ok_or_else(bad)?;
+    if remote_port.contains(':') {
+        return Err(bad());
     }
     ForwarderSpec::new(
-        parts[0].to_string(),
-        PortSpan::parse(parts[1], "local")?,
-        parts[2].to_string(),
-        PortSpan::parse(parts[3], "remote")?,
+        local_host.to_string(),
+        PortSpan::parse(local_port, "local")?,
+        remote_host.to_string(),
+        PortSpan::parse(remote_port, "remote")?,
         protocol,
     )
+}
+
+/// Split `host:rest` at the colon ending the host. A bracketed host
+/// (`[::1]:rest`) may contain colons itself; the brackets are dropped.
+fn split_host(s: &str) -> Option<(&str, &str)> {
+    match s.strip_prefix('[') {
+        Some(inner) => {
+            let (host, rest) = inner.split_once(']')?;
+            Some((host, rest.strip_prefix(':')?))
+        }
+        None => s.split_once(':'),
+    }
+}
+
+/// `true` for a `host:port` an endpoint can bind or connect to: a socket
+/// address (`127.0.0.1:9090`, `[::1]:9090`) or a hostname with a port.
+pub fn is_host_port(addr: &str) -> bool {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    addr.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty()
+            && port.parse::<u16>().is_ok()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+    })
 }
 
 /// Load forwarders from RFW_FORWARDER_N env vars. An entry that does not parse
@@ -1188,14 +1255,16 @@ pub fn apply_cli_overrides(settings: &mut Settings, cli: &CliArgs) {
 }
 
 /// Load runtime settings: YAML `settings:` block (if a config file is given),
-/// with CLI flags overriding individual fields. Missing/unreadable file falls
-/// back to defaults (the forwarder load path already surfaces file errors).
+/// with CLI flags overriding individual fields. A file that cannot be read is
+/// an error even when the forwarders come from the CLI or the environment:
+/// falling back to defaults would run without the settings the operator wrote.
 pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     let mut settings = match &cli.config_file {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(content) => serde_saphyr::from_str::<ConfigFile>(&content)?.settings,
-            Err(_) => Settings::default(),
-        },
+        Some(path) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("cannot read config file {}: {e}", path.display()))?;
+            serde_saphyr::from_str::<ConfigFile>(&content)?.settings
+        }
         None => Settings::default(),
     };
 
@@ -1205,22 +1274,67 @@ pub fn load_settings(cli: &CliArgs) -> Result<Settings, anyhow::Error> {
     Ok(settings)
 }
 
-/// Check for duplicate local endpoints among forwarders. The key is the
-/// protocol plus the local address, so a TCP and a UDP forwarder may share a port.
+/// A local host as the kernel will see it, as far as that can be told
+/// without resolving anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalHost {
+    Ip(std::net::IpAddr),
+    /// A hostname, lowercased. What it resolves to is not known here.
+    Name(String),
+}
+
+impl LocalHost {
+    fn of(host: &str) -> Self {
+        match host.parse() {
+            Ok(ip) => Self::Ip(ip),
+            Err(_) => Self::Name(host.to_ascii_lowercase()),
+        }
+    }
+
+    /// `true` when binding both on one port is bound to fail: the same
+    /// address, or a wildcard and any address of its family.
+    fn clashes_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ip(a), Self::Ip(b)) => {
+                a == b || (a.is_ipv4() == b.is_ipv4() && (a.is_unspecified() || b.is_unspecified()))
+            }
+            (a, b) => a == b,
+        }
+    }
+}
+
+/// Check for local endpoints that cannot both be bound. Grouped by protocol
+/// and port, so a TCP and a UDP forwarder may share a port.
+///
+/// Comparing the text alone let `0.0.0.0:80` next to `127.0.0.1:80` (or
+/// `LOCALHOST:80` next to `localhost:80`) through: the second one then sat in
+/// its bind-retry loop forever.
 fn validate_no_duplicates(fwd: &[ForwarderConfig]) -> Result<(), anyhow::Error> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<(Protocol, u16), Vec<(LocalHost, &ForwarderConfig)>> =
+        std::collections::HashMap::new();
     for f in fwd {
-        let addr = f.local_addr();
-        if !seen.insert((f.protocol, addr.clone())) {
-            let shown = match f.protocol {
-                Protocol::Tcp => addr,
-                Protocol::Udp => format!("{addr}/udp"),
+        // Port 0 asks for any free port: two of those never collide.
+        if f.local_port == 0 {
+            continue;
+        }
+        let host = LocalHost::of(&f.local_host);
+        let group = seen.entry((f.protocol, f.local_port)).or_default();
+        if let Some((_, first)) = group.iter().find(|(h, _)| h.clashes_with(&host)) {
+            let suffix = match f.protocol {
+                Protocol::Tcp => "",
+                Protocol::Udp => "/udp",
             };
+            let (a, b) = (first.local_addr(), f.local_addr());
+            if a == b {
+                anyhow::bail!(
+                    "Duplicate local address '{a}{suffix}'. Each forwarder needs a unique local endpoint."
+                );
+            }
             anyhow::bail!(
-                "Duplicate local address '{}'. Each forwarder needs a unique local endpoint.",
-                shown
+                "Duplicate local address '{b}{suffix}': it overlaps '{a}{suffix}', so only one of them could bind. Each forwarder needs a unique local endpoint."
             );
         }
+        group.push((host, f));
     }
     Ok(())
 }
@@ -2018,14 +2132,12 @@ mod tests {
             parse_forwarder("a:1:b:53/").unwrap_err(),
             "Unknown protocol suffix '/' in 'a:1:b:53/': expected /tcp or /udp"
         );
-        assert_eq!(
-            parse_forwarder("/udp").unwrap_err(),
+        assert!(parse_forwarder("/udp").unwrap_err().starts_with(
             "Invalid forwarder format '/udp': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
-        );
-        assert_eq!(
-            parse_forwarder("a:b:2/udp").unwrap_err(),
+        ));
+        assert!(parse_forwarder("a:b:2/udp").unwrap_err().starts_with(
             "Invalid forwarder format 'a:b:2/udp': expected local_host:local_port[-end]:remote_host:remote_port[-end][/tcp|/udp]"
-        );
+        ));
     }
 
     #[test]
@@ -2588,5 +2700,109 @@ mod tests {
                 .contains("Duplicate local address '0.0.0.0:110'"),
             "{err}"
         );
+    }
+
+    // ---- IPv6 hosts, strict keys, overlapping listeners ---------------------
+
+    #[test]
+    fn parse_forwarder_accepts_bracketed_ipv6_hosts() {
+        let f = parse_forwarder("[::1]:8080:[2001:db8::1]:80/udp").unwrap();
+        assert_eq!(f.local_host, "::1");
+        assert_eq!(f.remote_host, "2001:db8::1");
+        assert_eq!((f.local_port, f.remote_port), (8080, 80));
+        assert_eq!(f.protocol, Protocol::Udp);
+        // The bind address must parse as a socket address again.
+        assert_eq!(f.local_addr(), "[::1]:8080");
+        assert!(f.local_addr().parse::<std::net::SocketAddr>().is_ok());
+        assert!(f.label().starts_with("[::1]:8080->[2001:db8::1]:80"));
+
+        let mixed = parse_forwarder("0.0.0.0:53:[fe80::1]:53").unwrap();
+        assert_eq!(mixed.remote_host, "fe80::1");
+    }
+
+    #[test]
+    fn parse_forwarder_rejects_unbracketed_ipv6_and_stray_colons() {
+        for bad in [
+            "::1:8080:db:80",
+            "[::1:8080:db:80",
+            "a:1:b:2:3",
+            "[::1]8080:b:2",
+        ] {
+            assert!(parse_forwarder(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn host_port_brackets_only_ipv6() {
+        assert_eq!(host_port("db.example.com", 80), "db.example.com:80");
+        assert_eq!(host_port("10.0.0.1", 80), "10.0.0.1:80");
+        assert_eq!(host_port("::", 80), "[::]:80");
+    }
+
+    #[test]
+    fn is_host_port_accepts_addresses_and_hostnames() {
+        for ok in [
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "localhost:9090",
+            "rfw-1.svc:80",
+        ] {
+            assert!(is_host_port(ok), "{ok}");
+        }
+        for bad in [
+            "9090",
+            ":9090",
+            "localhost",
+            "localhost:http",
+            "host:70000",
+            "a b:80",
+        ] {
+            assert!(!is_host_port(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unknown_yaml_keys_are_rejected() {
+        let err = serde_saphyr::from_str::<ConfigFile>("settings:\n  max_conections: 5\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_conections"), "{err}");
+        assert!(serde_saphyr::from_str::<ConfigFile>("forwardrs: []\n").is_err());
+    }
+
+    #[test]
+    fn overlapping_local_addresses_are_duplicates() {
+        let on = |host: &str| ForwarderConfig {
+            local_host: host.into(),
+            ..fwd(Protocol::Tcp, 80)
+        };
+        let clash = |a: &str, b: &str| validate_no_duplicates(&[on(a), on(b)]).is_err();
+        assert!(clash("0.0.0.0", "127.0.0.1"));
+        assert!(clash("127.0.0.1", "0.0.0.0"));
+        assert!(clash("::", "::1"));
+        assert!(clash("LOCALHOST", "localhost"));
+        assert!(clash("::1", "0:0:0:0:0:0:0:1"));
+        // Different families, different addresses, unresolved names: fine.
+        assert!(!clash("0.0.0.0", "::1"));
+        assert!(!clash("127.0.0.1", "127.0.0.2"));
+        assert!(!clash("localhost", "127.0.0.1"));
+
+        let err = validate_no_duplicates(&[on("0.0.0.0"), on("127.0.0.1")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'127.0.0.1:80': it overlaps '0.0.0.0:80'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_settings_fails_on_an_unreadable_config_file() {
+        let cli = CliArgs {
+            config_file: Some("/nonexistent/rfw-settings.yml".into()),
+            ..CliArgs::default()
+        };
+        let err = load_settings(&cli).unwrap_err().to_string();
+        assert!(err.contains("cannot read config file"), "{err}");
     }
 }

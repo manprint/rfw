@@ -16,7 +16,7 @@
 //!    `token` query parameters; they are redacted in every log line and never
 //!    echoed back in an error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,18 @@ use crate::config::Protocol;
 /// Google Chat rejects `text` messages beyond 4096 characters; stay under it.
 pub const MAX_TEXT_CHARS: usize = 4000;
 /// Events waiting for delivery. Producers drop (and count) beyond this.
-const QUEUE_CAPACITY: usize = 256;
+///
+/// Sized for a port range losing its target: every port has its own monitor,
+/// so up to `MAX_RANGE_PORTS` events arrive in one burst, to be folded into a
+/// single message by the worker (see [`Event::group_key`]).
+const QUEUE_CAPACITY: usize = 8192;
+/// How long the worker keeps collecting events of the same group before it
+/// sends the one message that stands for all of them.
+const GROUP_WINDOW: Duration = Duration::from_secs(2);
+/// Events of other groups held back while one group is being collected.
+const MAX_HELD_EVENTS: usize = 2 * QUEUE_CAPACITY;
+/// Forwarder labels spelled out in a grouped message; the rest is a count.
+const GROUP_LABELS_SHOWN: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delivery attempts per message (transport errors, `429` and `5xx` retry).
@@ -197,13 +208,53 @@ impl Event {
         }
     }
 
+    /// Events sharing a key describe one incident seen by several forwarders
+    /// (a port range is one forwarder per port, all on the same target host)
+    /// and are delivered as a single message.
+    fn group_key(&self) -> Option<String> {
+        match self {
+            Event::TargetUnreachable { target, .. } => {
+                Some(format!("down:{}", target_host(target)))
+            }
+            Event::TargetRecovered { target, .. } => Some(format!("up:{}", target_host(target))),
+            Event::DnsChanged { host, new, .. } => Some(format!("dns:{host}:{}", join_ips(new))),
+            _ => None,
+        }
+    }
+
+    /// The forwarder an event is about, when it is about one.
+    fn label(&self) -> Option<&str> {
+        match self {
+            Event::DnsChanged { label, .. }
+            | Event::TargetUnreachable { label, .. }
+            | Event::TargetRecovered { label, .. }
+            | Event::BindFailed { label, .. }
+            | Event::BindRecovered { label, .. }
+            | Event::ConnectionLimitReached { label, .. }
+            | Event::UdpSessionLimitReached { label, .. } => Some(label),
+            _ => None,
+        }
+    }
+
     /// Render the Google Chat message text.
     ///
     /// Uses the basic text formatting Google Chat understands (`*bold*`,
     /// `_italic_`, `` `mono` ``). Every operator-supplied string (labels,
     /// hostnames, error text) goes through [`mono`] or [`plain`] so it can
     /// neither break the formatting nor run to arbitrary length.
+    #[cfg(test)]
     pub fn render(&self, instance: &InstanceInfo, suppressed: u64) -> String {
+        self.render_grouped(instance, suppressed, &[])
+    }
+
+    /// [`Event::render`] for an event standing for `others` as well: the
+    /// labels of the other forwarders that reported the same incident.
+    pub fn render_grouped(
+        &self,
+        instance: &InstanceInfo,
+        suppressed: u64,
+        others: &[String],
+    ) -> String {
         let icon = match self.severity() {
             Severity::Info => "🟢",
             Severity::Warning => "🟠",
@@ -386,6 +437,21 @@ impl Event {
             }
         }
 
+        if !others.is_empty() {
+            let shown: Vec<String> = others
+                .iter()
+                .take(GROUP_LABELS_SHOWN)
+                .map(|l| mono(l))
+                .collect();
+            text.push_str(&format!(
+                "\nSame for {} other forwarder(s): {}",
+                others.len(),
+                shown.join(", ")
+            ));
+            if others.len() > shown.len() {
+                text.push_str(&format!(" and {} more", others.len() - shown.len()));
+            }
+        }
         if suppressed > 0 {
             text.push_str(&format!(
                 "\n_(+{suppressed} similar event(s) suppressed since the previous message)_"
@@ -491,6 +557,11 @@ fn truncate_chars(s: String, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// The host of a `host:port` target (the whole string if it has no port).
+fn target_host(target: &str) -> &str {
+    target.rsplit_once(':').map_or(target, |(host, _)| host)
 }
 
 fn join_ips(ips: &[IpAddr]) -> String {
@@ -821,6 +892,7 @@ pub fn start(config: WebhookConfig) -> anyhow::Result<(Notifier, NotifierHandle)
         counters: counters.clone(),
         throttle: Throttle::default(),
         last_send: None,
+        held: VecDeque::new(),
     };
     let task = tokio::spawn(worker.run(rx, cancel.clone()));
 
@@ -864,16 +936,26 @@ struct Worker {
     counters: Arc<NotifierCounters>,
     throttle: Throttle,
     last_send: Option<Instant>,
+    /// Events taken off the queue while collecting a group, in arrival order.
+    held: VecDeque<Event>,
 }
 
 impl Worker {
     async fn run(mut self, mut rx: mpsc::Receiver<Event>, cancel: CancellationToken) {
         loop {
+            if let Some(ev) = self.held.pop_front() {
+                if cancel.is_cancelled() {
+                    self.held.push_front(ev);
+                    break;
+                }
+                self.process(ev, &mut rx, Some(&cancel)).await;
+                continue;
+            }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
                 ev = rx.recv() => match ev {
-                    Some(ev) => self.process(ev).await,
+                    Some(ev) => self.process(ev, &mut rx, Some(&cancel)).await,
                     None => return,
                 },
             }
@@ -882,24 +964,102 @@ impl Worker {
         // the "stopping" message). The caller bounds this with a timeout.
         rx.close();
         while let Ok(ev) = rx.try_recv() {
-            self.process(ev).await;
+            self.hold(ev);
+        }
+        // The lifecycle message first: the flush window may not cover the rest.
+        if let Some(i) = self
+            .held
+            .iter()
+            .position(|e| matches!(e, Event::Stopping { .. }))
+        {
+            if let Some(ev) = self.held.remove(i) {
+                self.held.push_front(ev);
+            }
+        }
+        while let Some(ev) = self.held.pop_front() {
+            self.process(ev, &mut rx, None).await;
         }
     }
 
-    async fn process(&mut self, event: Event) {
-        let now = Instant::now();
-        let suppressed = match event.throttle() {
+    /// Keep an event for later, dropping (and counting) beyond the bound.
+    fn hold(&mut self, ev: Event) {
+        if self.held.len() >= MAX_HELD_EVENTS {
+            self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            warn!(event = ev.kind(), "Webhook backlog full; event dropped");
+            return;
+        }
+        self.held.push_back(ev);
+    }
+
+    /// Throttle check. `None` means the event is suppressed.
+    fn admit(&mut self, event: &Event, now: Instant) -> Option<u64> {
+        match event.throttle() {
             Some((key, window)) => match self.throttle.admit(&key, window, now) {
-                Admit::Send { suppressed } => suppressed,
+                Admit::Send { suppressed } => Some(suppressed),
                 Admit::Suppress => {
                     self.counters.suppressed.fetch_add(1, Ordering::Relaxed);
                     debug!(event = event.kind(), key = %key, "Webhook event suppressed by throttle");
-                    return;
+                    None
                 }
             },
-            None => 0,
+            None => Some(0),
+        }
+    }
+
+    /// Collect the events that belong to `key`: those already held, plus
+    /// whatever arrives within [`GROUP_WINDOW`]. `live` is `None` during the
+    /// shutdown flush, where nothing new can arrive and waiting only costs
+    /// the flush budget. Returns the labels of the forwarders collected.
+    async fn collect_group(
+        &mut self,
+        key: &str,
+        rx: &mut mpsc::Receiver<Event>,
+        live: Option<&CancellationToken>,
+    ) -> Vec<String> {
+        if let Some(cancel) = live {
+            let deadline = tokio::time::Instant::now() + GROUP_WINDOW;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    ev = rx.recv() => match ev {
+                        Some(ev) => self.hold(ev),
+                        None => break,
+                    },
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut others = Vec::new();
+        for ev in std::mem::take(&mut self.held) {
+            if ev.group_key().as_deref() != Some(key) {
+                self.held.push_back(ev);
+            } else if self.admit(&ev, now).is_some() {
+                if let Some(label) = ev.label() {
+                    others.push(label.to_string());
+                }
+            }
+        }
+        others
+    }
+
+    async fn process(
+        &mut self,
+        event: Event,
+        rx: &mut mpsc::Receiver<Event>,
+        live: Option<&CancellationToken>,
+    ) {
+        let now = Instant::now();
+        let Some(suppressed) = self.admit(&event, now) else {
+            return;
         };
         self.throttle.prune(now, Duration::from_secs(3600));
+
+        let others = match event.group_key() {
+            Some(key) => self.collect_group(&key, rx, live).await,
+            None => Vec::new(),
+        };
 
         if let Some(last) = self.last_send {
             let wait = MIN_SEND_SPACING.saturating_sub(last.elapsed());
@@ -908,12 +1068,16 @@ impl Worker {
             }
         }
 
-        let text = event.render(&self.instance, suppressed);
+        let text = event.render_grouped(&self.instance, suppressed, &others);
         self.last_send = Some(Instant::now());
         match self.deliver(&text).await {
             Ok(()) => {
                 self.counters.sent.fetch_add(1, Ordering::Relaxed);
-                debug!(event = event.kind(), "Webhook message delivered");
+                debug!(
+                    event = event.kind(),
+                    grouped = others.len(),
+                    "Webhook message delivered"
+                );
             }
             Err(e) => {
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);

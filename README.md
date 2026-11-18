@@ -52,7 +52,7 @@ Download from the [releases page](https://github.com/manprint/rfw/releases).
 ### Docker
 
 ```bash
-docker pull ghcr.io/manprint/rfw:v1.2.0
+docker pull ghcr.io/manprint/rfw:v1.3.0
 docker compose up -d
 ```
 
@@ -61,7 +61,7 @@ Or run manually:
 ```bash
 docker run --rm -p 8080:8080 \
   -e RFW_FORWARDER_1=0.0.0.0:8080:example.com:80 \
-  ghcr.io/manprint/rfw:v1.2.0 --log-dir ""
+  ghcr.io/manprint/rfw:v1.3.0 --log-dir ""
 ```
 
 For the "database behind a cloud DNS name on the host network" deployment, see
@@ -91,7 +91,16 @@ A TCP and a UDP forwarder may share the same local port; two UDP (or two TCP) fo
 0.0.0.0:443:app.azure.com:443           → cloud service proxy
 0.0.0.0:1053:1.1.1.1:53/udp             → DNS over UDP
 0.0.0.0:30000-30050:tunnel.example.com:30000-30050   → 51 ports, one line
+[::]:8080:[2001:db8::10]:80             → IPv6: hosts in brackets
 ```
+
+An IPv6 address must be written in brackets, on the command line and in
+`RFW_FORWARDER_N`; in YAML `local_host: "::1"` and `local_host: "[::1]"` are
+the same host.
+
+Two forwarders whose local addresses cannot both bind are rejected at startup
+and on reload: the same address, or a wildcard (`0.0.0.0`, `::`) next to any
+address of its family on the same port and protocol.
 
 ### Port ranges
 
@@ -258,6 +267,8 @@ Options:
                                   forwarders (default off; hot-reloadable)
       --log-dir <DIR>             Rolling JSON log directory; "" disables file
                                   logging (default "logs")
+      --log-max-files <N>         Daily log files kept in --log-dir; older ones
+                                  are deleted (default 30; 0 keeps them all)
       --health-check <HOST:PORT>  Probe a running instance's stats endpoint and
                                   exit 0 (healthy) or 1; starts no forwarders
   -h, --help                      Print help
@@ -282,6 +293,11 @@ process must not abort over an edit), and each correction is logged.
 
 These runtime options can also be set in the YAML config under a `settings:`
 block (CLI flags take precedence, at startup and on hot-reload). See `forwarders.yml`.
+
+Unknown keys in the YAML file (top level, `settings:`, a forwarder entry) are
+an error, at startup and on reload: a misspelled setting is reported instead
+of silently leaving the default in force. A `-f` file that cannot be read is
+an error too, even when the forwarders come from the CLI or the environment.
 
 ## Configuration override behavior
 
@@ -558,13 +574,16 @@ kind, and carry a `suppressed` count. Opening and closing a session is logged at
 duration and the byte counts); per-datagram events are never logged above
 debug. To see them, run with `RUST_LOG=debug`.
 
-> **Operational note:** rotated log files are never deleted. For a long-lived
-> deployment either point `--log-dir` at a volume managed by logrotate, or run
-> with `--log-dir ""` and let the container runtime collect stdout:
+> **Operational note:** the log file rotates daily and only the newest
+> `--log-max-files` (default 30) are kept; `--log-max-files 0` keeps them all.
+> In a container, run with `--log-dir ""` and let the runtime collect stdout:
 >
 > ```bash
 > rfw --log-dir "" 0.0.0.0:8080:example.com:80
 > ```
+
+Console output is coloured only when stdout is a terminal (and `NO_COLOR` is
+unset), so `docker logs` and journald get plain text.
 
 ## Signals & shutdown
 
@@ -578,6 +597,9 @@ trigger the same graceful shutdown:
 UDP forwarders have no in-flight connections to drain: their sessions are
 closed at once (each forwarder releases its port within 2 seconds), and the
 in-flight count in the shutdown alert covers TCP connections only.
+
+A second `SIGTERM`/`SIGINT` during the drain exits immediately (status 130)
+without waiting for the remaining connections.
 
 Give the container at least that long to stop:
 
@@ -746,6 +768,11 @@ settings:
 Every message ends with `<instance> · pid <pid> · rfw <version> · <UTC time>`,
 because several rfw instances usually post into one space.
 
+One incident seen by several forwarders is one message: when the forwarders of
+a port range (or any forwarders sharing a target host) report the same outage,
+recovery or DNS change within 2 seconds, the first is sent and the others are
+listed under it (`Same for N other forwarder(s): …`).
+
 ### How the target is probed
 
 Every `probe_interval_secs` the monitor resolves the target name and opens one
@@ -870,7 +897,7 @@ docker run --rm -p 8080:8080 \
 docker compose up -d
 ```
 
-In production pin a release tag (`ghcr.io/manprint/rfw:v1.2.0`) rather than
+In production pin a release tag (`ghcr.io/manprint/rfw:v1.3.0`) rather than
 `latest`, which moves on every release. Edit `docker-compose.yml` to configure
 your forwarders via env vars. For a UDP forwarder, publish its port with the
 `/udp` suffix (`"1053:1053/udp"`); a port served over both TCP and UDP needs
@@ -919,7 +946,7 @@ docker run -d \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RFW_INSTANCE_NAME=db-proxy-prod \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.2.0 \
+  ghcr.io/manprint/rfw:v1.3.0 \
     --log-dir "" \
     --max-connections 1000 \
     --metrics-addr 127.0.0.1:9090 \
@@ -941,8 +968,7 @@ docker run -d \
   local; the healthcheck reaches it from inside the same network namespace.
 - `--max-connections` should stay below the database's own connection limit;
   with keepalive on, dead clients no longer eat into it.
-- `--log-dir ""` leaves logging to the Docker log driver (rfw never prunes its
-  own rotated files).
+- `--log-dir ""` leaves logging to the Docker log driver.
 - `RFW_WEBHOOK_URL` (exported in the shell that runs the command, or injected by
   your secrets manager) turns on the Google Chat alerts; leave it unset to run
   silent. `RFW_INSTANCE_NAME` is what the messages call this host.
@@ -955,7 +981,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.2.0
+    image: ghcr.io/manprint/rfw:v1.3.0
     container_name: rfw-db
     restart: always
     network_mode: host          # 0.0.0.0:5432 on the host, host DNS
@@ -1042,7 +1068,7 @@ docker run -d \
   -v /opt/rfw:/etc/rfw:ro \
   -e RFW_WEBHOOK_URL="$RFW_WEBHOOK_URL" \
   -e RUST_LOG=info \
-  ghcr.io/manprint/rfw:v1.2.0 \
+  ghcr.io/manprint/rfw:v1.3.0 \
     -f /etc/rfw/forwarders.yml \
     --log-dir ""
 ```
@@ -1050,7 +1076,7 @@ docker run -d \
 ```yaml
 services:
   rfw-db:
-    image: ghcr.io/manprint/rfw:v1.2.0
+    image: ghcr.io/manprint/rfw:v1.3.0
     container_name: rfw-db
     restart: always
     network_mode: host

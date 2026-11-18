@@ -40,6 +40,9 @@ const DOWN_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// burst of failing clients cannot turn into a burst of probes.
 const KICK_MIN_SPACING: Duration = Duration::from_secs(1);
 
+/// Startup probes in flight at once (see [`probe_all`]).
+const STARTUP_PROBE_CONCURRENCY: usize = 256;
+
 /// One resolve-and-connect attempt.
 #[derive(Debug)]
 pub struct ProbeOutcome {
@@ -111,10 +114,15 @@ pub async fn probe_all(
 ) -> Vec<ProbeReport> {
     let dns_timeout = knobs.dns_timeout();
     let connect_timeout = knobs.connect_timeout();
+    // Bounded: a port range would otherwise open thousands of connections to
+    // one target in the same instant.
+    let gate = Arc::new(tokio::sync::Semaphore::new(STARTUP_PROBE_CONCURRENCY));
     let mut set = tokio::task::JoinSet::new();
     for (i, cfg) in configs.iter().cloned().enumerate() {
         let resolver = resolver.clone();
+        let gate = gate.clone();
         set.spawn(async move {
+            let _slot = gate.acquire_owned().await;
             let outcome = match cfg.protocol {
                 Protocol::Tcp => probe_target(&cfg, &resolver, dns_timeout, connect_timeout).await,
                 Protocol::Udp => probe_udp_target(&cfg, &resolver, dns_timeout).await,
@@ -123,7 +131,7 @@ pub async fn probe_all(
                 i,
                 ProbeReport {
                     label: cfg.label(),
-                    target: format!("{}:{}", cfg.remote_host, cfg.remote_port),
+                    target: cfg.remote_addr(),
                     protocol: cfg.protocol,
                     outcome: outcome.result,
                 },
@@ -203,7 +211,7 @@ pub async fn run_monitor(
         return run_udp_monitor(cfg, cancel, stats, resolver, knobs, notifier).await;
     }
     let label = cfg.label();
-    let target = format!("{}:{}", cfg.remote_host, cfg.remote_port);
+    let target = cfg.remote_addr();
     let mut down: Option<Downtime> = None;
     let mut last_probe: Option<Instant> = None;
 
@@ -455,7 +463,7 @@ async fn run_udp_monitor(
     notifier: Notifier,
 ) {
     let label = cfg.label();
-    let target = format!("{}:{}", cfg.remote_host, cfg.remote_port);
+    let target = cfg.remote_addr();
     let mut down: Option<Downtime> = None;
     let mut last_probe: Option<Instant> = None;
     let mut prev: Option<UdpSample> = None;

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -19,13 +20,17 @@ fn env_filter() -> EnvFilter {
 ///
 /// Returns a guard that must be kept alive for the app lifetime (it flushes the
 /// non-blocking writer on drop); `None` when file logging is disabled.
-pub fn setup(log_dir: &str) -> Result<Option<WorkerGuard>, anyhow::Error> {
-    // Console subscriber (human-friendly, color)
+pub fn setup(log_dir: &str, max_files: usize) -> Result<Option<WorkerGuard>, anyhow::Error> {
+    // Colour only for a terminal: escape codes in `docker logs`, journald or a
+    // redirected file are noise. `NO_COLOR` (no-color.org) turns it off too.
+    let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+
+    // Console subscriber (human-friendly)
     let console_layer = fmt::layer()
         .with_target(true)
         .with_line_number(true)
         .with_thread_ids(false)
-        .with_ansi(true)
+        .with_ansi(ansi)
         .with_span_events(FmtSpan::NONE)
         .pretty()
         .with_filter(env_filter());
@@ -43,12 +48,20 @@ pub fn setup(log_dir: &str) -> Result<Option<WorkerGuard>, anyhow::Error> {
         )
     })?;
 
-    // File appender (rolling daily).
-    //
-    // NOTE: rotated files are never deleted. On a long-lived staging/production
-    // host, pair this with logrotate or an ephemeral volume, or run with
-    // `--log-dir ""` and let the container runtime collect stdout.
-    let file_appender = tracing_appender::rolling::daily(log_dir, "rfw.log");
+    // File appender (rolling daily). Only the newest `max_files` are kept, so
+    // a long-lived host does not fill its disk; 0 keeps everything.
+    let mut builder = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("rfw.log");
+    if max_files > 0 {
+        builder = builder.max_log_files(max_files);
+    }
+    let file_appender = builder.build(log_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot open a log file in {}: {e} (use --log-dir \"\" to log to the console only)",
+            log_dir.display()
+        )
+    })?;
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
     // File subscriber (JSON, no color)

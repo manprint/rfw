@@ -3,11 +3,10 @@
 # ============================================================
 
 # ── Stage 1: Build ──────────────────────────────────────────
-# Pinned to the Debian 12 (bookworm) variant on purpose: the runtime stage is
-# distroless *cc-debian12*, so the builder's glibc must not be newer than the
-# runtime's. `rust:latest` moved to Debian 13 (glibc 2.41) and only kept
-# working because the binary happened not to pull in any post-2.36 symbols.
-FROM rust:1-bookworm AS builder
+# Pinned to the Debian 13 (trixie) variant on purpose: the runtime stage is
+# distroless *cc-debian13*, so the builder's glibc must not be newer than the
+# runtime's. Move both stages together, never `rust:latest` alone.
+FROM rust:1-trixie AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -17,7 +16,7 @@ RUN cargo build --release && \
     strip target/release/rfw
 
 # ── Stage 2: Minimal runtime image ──────────────────────────
-FROM gcr.io/distroless/cc-debian12:latest
+FROM gcr.io/distroless/cc-debian13:latest
 
 LABEL org.opencontainers.image.title="rfw"
 LABEL org.opencontainers.image.description="Rust Forwarder — TCP/UDP port forwarder"

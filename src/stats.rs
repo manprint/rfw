@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -54,6 +55,23 @@ pub struct UdpSample {
     pub sent: u64,
 }
 
+/// Gives a hot counter a cache line of its own.
+///
+/// `bytes_sent` and `bytes_received` are written on every read/write of every
+/// connection of a forwarder, from every worker thread. Sharing a line with
+/// each other and with the read-mostly fields next to them makes each update
+/// invalidate that line on all the other cores.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 /// Per-forwarder traffic counters.
 ///
 /// `bytes_sent` / `bytes_received` are **lifetime-monotonic**: they accumulate
@@ -68,9 +86,9 @@ pub struct ForwarderStats {
     /// Transport of this forwarder; fixed at registration.
     protocol: Protocol,
     /// Lifetime bytes client -> remote.
-    pub bytes_sent: AtomicU64,
+    pub bytes_sent: CachePadded<AtomicU64>,
     /// Lifetime bytes remote -> client.
-    pub bytes_received: AtomicU64,
+    pub bytes_received: CachePadded<AtomicU64>,
     /// UDP datagrams forwarded client -> remote (lifetime).
     pub datagrams_sent: AtomicU64,
     /// UDP datagrams forwarded remote -> client (lifetime).
@@ -128,8 +146,8 @@ impl ForwarderStats {
         Self {
             label,
             protocol,
-            bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
+            bytes_sent: CachePadded(AtomicU64::new(0)),
+            bytes_received: CachePadded(AtomicU64::new(0)),
             datagrams_sent: AtomicU64::new(0),
             datagrams_received: AtomicU64::new(0),
             datagrams_dropped: AtomicU64::new(0),
@@ -153,10 +171,6 @@ impl ForwarderStats {
     #[cfg(test)]
     pub fn new(label: String) -> Self {
         Self::with_protocol(label, Protocol::Tcp)
-    }
-
-    pub fn label(&self) -> &str {
-        &self.label
     }
 
     pub fn set_listening(&self, listening: bool) {
@@ -398,13 +412,23 @@ pub struct StatsSnapshot {
 
 /// Global registry of all forwarder stats.
 pub struct StatsRegistry {
-    stats: RwLock<Vec<Arc<ForwarderStats>>>,
+    stats: RwLock<RegistryInner>,
+}
+
+/// Entries in registration order (`by_seq`), with a label index so that
+/// registering or removing one forwarder does not scan all the others: a port
+/// range registers thousands of them.
+#[derive(Default)]
+struct RegistryInner {
+    next_seq: u64,
+    by_seq: BTreeMap<u64, Arc<ForwarderStats>>,
+    by_label: HashMap<String, u64>,
 }
 
 impl StatsRegistry {
     pub fn new() -> Self {
         Self {
-            stats: RwLock::new(Vec::new()),
+            stats: RwLock::new(RegistryInner::default()),
         }
     }
 
@@ -418,12 +442,19 @@ impl StatsRegistry {
         label: &str,
         protocol: Protocol,
     ) -> Arc<ForwarderStats> {
-        let mut stats = self.stats.write().await;
-        if let Some(existing) = stats.iter().find(|s| s.label() == label) {
+        let mut inner = self.stats.write().await;
+        if let Some(existing) = inner
+            .by_label
+            .get(label)
+            .and_then(|seq| inner.by_seq.get(seq))
+        {
             return existing.clone();
         }
         let s = Arc::new(ForwarderStats::with_protocol(label.to_string(), protocol));
-        stats.push(s.clone());
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.by_seq.insert(seq, s.clone());
+        inner.by_label.insert(label.to_string(), seq);
         s
     }
 
@@ -434,21 +465,23 @@ impl StatsRegistry {
 
     /// Collect non-resetting snapshots of all forwarders for reporting/exposure.
     pub async fn collect(&self) -> Vec<StatsSnapshot> {
-        let stats = self.stats.read().await;
-        stats.iter().map(|s| s.snapshot()).collect()
+        let inner = self.stats.read().await;
+        inner.by_seq.values().map(|s| s.snapshot()).collect()
     }
 
     /// Re-derive throughput rates for all forwarders given the elapsed time.
     pub async fn sample_rates(&self, dt_secs: f64) {
-        let stats = self.stats.read().await;
-        for s in stats.iter() {
+        let inner = self.stats.read().await;
+        for s in inner.by_seq.values() {
             s.update_rate(dt_secs);
         }
     }
 
     pub async fn remove(&self, label: &str) {
-        let mut stats = self.stats.write().await;
-        stats.retain(|s| s.label() != label);
+        let mut inner = self.stats.write().await;
+        if let Some(seq) = inner.by_label.remove(label) {
+            inner.by_seq.remove(&seq);
+        }
     }
 }
 

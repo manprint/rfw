@@ -28,6 +28,8 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 /// Backoff after an accept error that is not per-connection (EMFILE/ENFILE).
 /// Without it the loop spins at 100% CPU for as long as fds stay exhausted.
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+/// Wait between attempts to bind the endpoint's address.
+const BIND_RETRY: Duration = Duration::from_secs(5);
 
 /// Serve a read-only HTTP endpoint exposing live traffic stats.
 ///
@@ -41,17 +43,26 @@ pub async fn serve(
     cancel: CancellationToken,
     notifier: Notifier,
 ) {
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, "Metrics server failed to bind {addr}");
-            notifier.notify(Event::Internal {
-                component: "metrics",
-                message: format!(
-                    "stats endpoint failed to bind {addr}: {e}. /metrics, /stats and the healthcheck are unavailable"
-                ),
-            });
-            return;
+    // Retried like a forwarder's listener: a port that is briefly taken at
+    // startup must not cost the endpoint (and the container healthcheck that
+    // probes it) for the rest of the process lifetime.
+    let listener = loop {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => break l,
+            Err(e) => {
+                error!(error = %e, "Metrics server failed to bind {addr}, retry in {}s", BIND_RETRY.as_secs());
+                // The notifier folds repeats into one message per window.
+                notifier.notify(Event::Internal {
+                    component: "metrics",
+                    message: format!(
+                        "stats endpoint failed to bind {addr}: {e}. /metrics, /stats and the healthcheck are unavailable until it binds (retrying)"
+                    ),
+                });
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(BIND_RETRY) => {}
+                }
+            }
         }
     };
     let counters = notifier.counters();
@@ -120,12 +131,12 @@ pub async fn serve(
 pub async fn health_check(addr: &str) -> Result<(), anyhow::Error> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let socket_addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| anyhow::anyhow!("--health-check '{addr}' is not a host:port address: {e}"))?;
+    if !crate::config::is_host_port(addr) {
+        anyhow::bail!("--health-check '{addr}' is not a host:port address");
+    }
 
     let response = timeout(PROBE_TIMEOUT, async {
-        let mut stream = TcpStream::connect(socket_addr).await?;
+        let mut stream = TcpStream::connect(addr).await?;
         stream
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await?;

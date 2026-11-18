@@ -34,17 +34,40 @@ fn plan(soft: u64, hard: u64) -> Plan {
     }
 }
 
-/// Descriptors `max_connections` simultaneous connections can need.
-fn fds_for(max_connections: u64, splice: bool) -> u64 {
-    max_connections
-        .saturating_mul(if splice { 6 } else { 2 })
-        .saturating_add(BASE_FDS)
+/// What the configuration can ask of the descriptor table, all at once.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Budget {
+    /// `max_connections`, when capped.
+    pub max_connections: Option<usize>,
+    pub splice: bool,
+    /// `udp_max_sessions` when a UDP forwarder is configured: one upstream
+    /// socket per session.
+    pub udp_sessions: Option<usize>,
+    /// Listening sockets (one per forwarder; a port range has thousands).
+    pub listeners: usize,
 }
 
-/// Raise the soft open-file limit to the hard limit and warn when a configured
-/// `max_connections` still cannot fit. Failures are logged, never fatal.
+impl Budget {
+    /// Descriptors needed when every cap is reached together. TCP
+    /// connections, UDP sessions and listeners share one table, so the
+    /// parts add up: sizing each against the limit on its own let a
+    /// configuration through that could not fit as a whole.
+    fn fds(&self) -> u64 {
+        let tcp = (self.max_connections.unwrap_or(0) as u64).saturating_mul(if self.splice {
+            6
+        } else {
+            2
+        });
+        tcp.saturating_add(self.udp_sessions.unwrap_or(0) as u64)
+            .saturating_add(self.listeners as u64)
+            .saturating_add(BASE_FDS)
+    }
+}
+
+/// Raise the soft open-file limit to the hard limit and warn when the
+/// configured caps still cannot fit. Failures are logged, never fatal.
 #[cfg(unix)]
-pub fn raise_soft_limit(max_connections: Option<usize>, splice: bool) {
+pub fn raise_soft_limit(budget: Budget) {
     let mut rl = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -70,18 +93,25 @@ pub fn raise_soft_limit(max_connections: Option<usize>, splice: bool) {
             warn!(error = %std::io::Error::last_os_error(), "Could not raise the open-file soft limit from {soft}");
         }
     }
-    if let Some(max) = max_connections {
-        let needed = fds_for(max as u64, splice);
-        if current < needed {
-            warn!(
-                "Open-file limit {current} is below what max_connections = {max} can need ({needed}); connections will be refused with EMFILE before the cap is reached (raise ulimit -n / --ulimit nofile / LimitNOFILE, or lower max_connections)"
-            );
-        }
+    let needed = budget.fds();
+    if current < needed {
+        let tcp = match budget.max_connections {
+            Some(max) => format!("max_connections = {max}"),
+            None => "unlimited max_connections".to_string(),
+        };
+        let udp = budget
+            .udp_sessions
+            .map(|n| format!(", udp_max_sessions = {n}"))
+            .unwrap_or_default();
+        warn!(
+            "Open-file limit {current} is below what {tcp}{udp} and {} listener(s) can need together ({needed}); connections and UDP sessions will fail with EMFILE before the caps are reached (raise ulimit -n / --ulimit nofile / LimitNOFILE, or lower the caps)",
+            budget.listeners
+        );
     }
 }
 
 #[cfg(not(unix))]
-pub fn raise_soft_limit(_max_connections: Option<usize>, _splice: bool) {}
+pub fn raise_soft_limit(_budget: Budget) {}
 
 #[cfg(test)]
 mod tests {
@@ -107,8 +137,25 @@ mod tests {
 
     #[test]
     fn splice_needs_more_descriptors_per_connection() {
-        assert_eq!(fds_for(1000, false), 2128);
-        assert_eq!(fds_for(1000, true), 6128);
-        assert_eq!(fds_for(u64::MAX, true), u64::MAX);
+        let tcp = |max, splice| Budget {
+            max_connections: Some(max),
+            splice,
+            ..Budget::default()
+        };
+        assert_eq!(tcp(1000, false).fds(), 2128);
+        assert_eq!(tcp(1000, true).fds(), 6128);
+        assert_eq!(tcp(usize::MAX, true).fds(), u64::MAX);
+    }
+
+    #[test]
+    fn tcp_udp_and_listeners_add_up() {
+        let b = Budget {
+            max_connections: Some(1000),
+            splice: false,
+            udp_sessions: Some(16384),
+            listeners: 4096,
+        };
+        assert_eq!(b.fds(), 2000 + 16384 + 4096 + BASE_FDS);
+        assert_eq!(Budget::default().fds(), BASE_FDS);
     }
 }

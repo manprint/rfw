@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Setup logging (keep guard alive for app lifetime)
-    let _guard = logging::setup(&cli.log_dir)?;
+    let _guard = logging::setup(&cli.log_dir, cli.log_max_files)?;
 
     // Load forwarder configurations (YAML + CLI + env, merged with precedence)
     let (forwarders, source) = config::load_forwarders_with_source(&cli)?;
@@ -86,17 +86,17 @@ async fn main() -> anyhow::Result<()> {
                rfw -f forwarders.yml\n\
                rfw localhost:8080:example.com:80 localhost:8081:other.com:443\n\n\
              Environment: RFW_FORWARDER_1, RFW_FORWARDER_2, ... override everything.\n\n\
-             Forwarder format: local_host:local_port:remote_host:remote_port[/tcp|/udp]"
+             Forwarder format: local_host:local_port:remote_host:remote_port[/tcp|/udp]\n\
+             An IPv6 host goes in brackets: [::1]:8080:[2001:db8::1]:80"
         );
     }
 
     info!("Starting rfw with {} forwarder(s):", forwarders.len());
     for fwd in &forwarders {
         info!(
-            "  {} -> {}:{}{}",
+            "  {} -> {}{}",
             fwd.local_addr(),
-            fwd.remote_host,
-            fwd.remote_port,
+            fwd.remote_addr(),
             if fwd.protocol == Protocol::Udp {
                 " (udp)"
             } else {
@@ -120,8 +120,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Proxied connections cost descriptors; Docker's default soft limit (1024)
-    // would otherwise cap a TCP-only forwarder at ~500 connections.
-    fdlimit::raise_soft_limit(settings.max_connections, settings.use_splice);
+    // would otherwise cap a TCP-only forwarder at ~500 connections. Every UDP
+    // session holds one upstream socket on top of that.
+    fdlimit::raise_soft_limit(fdlimit::Budget {
+        max_connections: settings.max_connections,
+        splice: settings.use_splice,
+        udp_sessions: forwarders
+            .iter()
+            .any(|f| f.protocol == Protocol::Udp)
+            .then_some(settings.udp_max_sessions),
+        listeners: forwarders.len(),
+    });
 
     // Webhook alerting (opt-in). Built before the manager so every forwarder,
     // monitor and the reload path share one delivery queue.
@@ -139,10 +148,6 @@ async fn main() -> anyhow::Result<()> {
         None => (Notifier::disabled(), None),
     };
 
-    // Every UDP session holds one upstream socket: make room for them.
-    if forwarders.iter().any(|f| f.protocol == Protocol::Udp) {
-        udp::ensure_fd_budget(settings.udp_max_sessions);
-    }
     #[cfg(not(target_os = "linux"))]
     if settings.udp_gro_gso {
         warn!("udp_gro_gso is only supported on Linux; ignored");
@@ -245,6 +250,15 @@ async fn main() -> anyhow::Result<()> {
     notifier.notify(Event::Stopping {
         signal: signal.to_string(),
         active_connections: active,
+    });
+
+    // A second signal means "now": without it an operator facing a drain
+    // that hangs had nothing left but SIGKILL.
+    tokio::spawn(async move {
+        if let Ok(signal) = shutdown_signal().await {
+            warn!("{signal} received again. Exiting without waiting for connections to drain.");
+            std::process::exit(130);
+        }
     });
 
     // Graceful shutdown

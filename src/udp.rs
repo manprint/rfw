@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use hickory_resolver::TokioResolver;
@@ -46,6 +46,8 @@ const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_STOP_GRACE: Duration = Duration::from_secs(2);
 /// At most one warning per this window for each kind of datagram drop.
 const DROP_LOG_SPACING: Duration = Duration::from_secs(10);
+/// How long a target address that just failed a session is tried last.
+const TARGET_PENALTY: Duration = Duration::from_secs(30);
 /// At most one DNS-failure warning per this window.
 const DNS_FAIL_LOG_SPACING: Duration = Duration::from_secs(30);
 /// Pause after a non-transient listener receive error, so it cannot spin.
@@ -296,7 +298,7 @@ pub async fn run_udp_forwarder(
     };
 
     tune_listener(&socket, knobs.socket_buffer_bytes(), &label);
-    info!(forwarder = %label, "Listening (udp) on {} -> {}:{}", local_str, cfg.remote_host, cfg.remote_port);
+    info!(forwarder = %label, "Listening (udp) on {} -> {}", local_str, cfg.remote_addr());
     if bind_failures > 0 {
         notifier.notify(Event::BindRecovered {
             label: label.to_string(),
@@ -340,7 +342,8 @@ pub async fn run_udp_forwarder(
         tasks: tasks.clone(),
         targets,
         dns_watch,
-        sessions: HashMap::new(),
+        sessions: HashMap::default(),
+        penalized: Vec::new(),
         gates: Gates::default(),
         last_limit_alert: None,
         #[cfg(target_os = "linux")]
@@ -401,7 +404,11 @@ struct Engine {
     tasks: TaskTracker,
     targets: watch::Receiver<Arc<[SocketAddr]>>,
     dns_watch: bool,
-    sessions: HashMap<SocketAddr, SessionEntry>,
+    /// Keyed by client address, which a sender can forge: the hasher is
+    /// seeded per process, and cheaper than SipHash on the per-datagram path.
+    sessions: HashMap<SocketAddr, SessionEntry, foldhash::quality::RandomState>,
+    /// Target addresses whose session died of an upstream error, and when.
+    penalized: Vec<(SocketAddr, Instant)>,
     gates: Gates,
     last_limit_alert: Option<Instant>,
     #[cfg(target_os = "linux")]
@@ -539,15 +546,15 @@ impl Engine {
         datagrams: u64,
     ) -> Option<SessionEntry> {
         // Separate statement: the watch read guard drops here, not after the else block.
-        let first = self.targets.borrow().first().copied();
-        let Some(remote) = first else {
+        let targets: Arc<[SocketAddr]> = self.targets.borrow().clone();
+        if targets.is_empty() {
             batch.dropped += datagrams;
             self.stats.mark_connect_failed();
             if let Some(s) = self.gates.no_target.check(DROP_LOG_SPACING) {
                 warn!(forwarder = %self.label, suppressed = s, "UDP target not resolved yet; datagram dropped");
             }
             return None;
-        };
+        }
         let permit = match self.udp_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -568,9 +575,16 @@ impl Engine {
                 return None;
             }
         };
-        let upstream = match connect_upstream(remote, self.knobs.socket_buffer_bytes()) {
-            Ok(s) => s,
-            Err(e) => {
+        // Every address is a candidate, not only the first: one that cannot
+        // be reached at all (no route for its family) or that just refused a
+        // session must not black-hole the forwarder while another answers.
+        self.penalized
+            .retain(|(_, at)| at.elapsed() < TARGET_PENALTY);
+        let buffer = self.knobs.socket_buffer_bytes();
+        let opened = open_first(&targets, &self.penalized, |a| connect_upstream(a, buffer));
+        let (remote, upstream) = match opened {
+            Ok(o) => o,
+            Err((remote, e)) => {
                 batch.dropped += datagrams;
                 self.stats.mark_connect_failed();
                 if let Some(s) = self.gates.open_failed.check(DROP_LOG_SPACING) {
@@ -638,6 +652,7 @@ impl Engine {
             u64::try_from(self.knobs.udp_session_timeout().as_millis()).unwrap_or(u64::MAX);
         let now_ms = self.stats.now_ms();
         let label = &self.label;
+        let mut dead: Vec<SocketAddr> = Vec::new();
         self.sessions.retain(|_, e| {
             let reason = if e.shared.dead.load(Ordering::Relaxed) {
                 Some("upstream error")
@@ -650,12 +665,22 @@ impl Engine {
             };
             match reason {
                 Some(r) => {
+                    if r == "upstream error" {
+                        dead.push(e.shared.remote);
+                    }
                     close_entry(label, e, r);
                     false
                 }
                 None => true,
             }
         });
+        let now = Instant::now();
+        for remote in dead {
+            match self.penalized.iter_mut().find(|(a, _)| *a == remote) {
+                Some(p) => p.1 = now,
+                None => self.penalized.push((remote, now)),
+            }
+        }
     }
 
     fn on_targets_changed(&mut self) {
@@ -1283,6 +1308,76 @@ fn reply_coalesced(
     None
 }
 
+/// Open an upstream socket to the first target that takes one: addresses not
+/// in `penalized` first, then the penalized ones (better than nothing). On
+/// failure, the last address tried and its error.
+fn open_first<S>(
+    targets: &[SocketAddr],
+    penalized: &[(SocketAddr, Instant)],
+    mut open: impl FnMut(SocketAddr) -> io::Result<S>,
+) -> Result<(SocketAddr, S), (SocketAddr, io::Error)> {
+    let is_penalized = |a: &SocketAddr| penalized.iter().any(|(p, _)| p == a);
+    let mut last = None;
+    for pass in [false, true] {
+        for &addr in targets.iter().filter(|a| is_penalized(a) == pass) {
+            match open(addr) {
+                Ok(s) => return Ok((addr, s)),
+                Err(e) => last = Some((addr, e)),
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        (
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            io::Error::new(io::ErrorKind::NotFound, "no target address"),
+        )
+    }))
+}
+
+/// One host's latest answer, shared by every forwarder that targets it.
+#[derive(Default)]
+struct SharedAnswer {
+    last: Option<(Instant, SharedLookup)>,
+}
+
+type SharedLookup = Result<Arc<[IpAddr]>, String>;
+
+/// Answers by hostname. A port range is thousands of forwarders to one host,
+/// each refreshing on its own: they share one lookup per interval instead of
+/// each asking the resolver.
+static SHARED_DNS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<SharedAnswer>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Resolve `host`, reusing an answer another forwarder got within the last
+/// `DNS_REFRESH_INTERVAL`. Concurrent callers wait for the one lookup in
+/// flight rather than starting their own.
+async fn resolve_shared(
+    host: &str,
+    resolver: &TokioResolver,
+    dns_timeout: Duration,
+) -> SharedLookup {
+    let slot = {
+        let mut map = SHARED_DNS.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(host) {
+            // Hosts dropped by a reload: nobody holds their slot any more.
+            map.retain(|_, s| Arc::strong_count(s) > 1);
+        }
+        map.entry(host.to_string()).or_default().clone()
+    };
+    let mut answer = slot.lock().await;
+    if let Some((at, result)) = &answer.last {
+        if at.elapsed() < DNS_REFRESH_INTERVAL {
+            return result.clone();
+        }
+    }
+    let result = resolve_targets(host, 0, None, resolver, dns_timeout)
+        .await
+        .map(|addrs| addrs.iter().map(|a| a.ip()).collect::<Arc<[IpAddr]>>())
+        .map_err(|e| e.to_string());
+    answer.last = Some((Instant::now(), result.clone()));
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_dns_refresher(
     cfg: Arc<ForwarderConfig>,
@@ -1299,13 +1394,16 @@ async fn run_dns_refresher(
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            r = resolve_targets(&cfg.remote_host, cfg.remote_port, None, &resolver, knobs.dns_timeout()) => r,
+            r = resolve_shared(&cfg.remote_host, &resolver, knobs.dns_timeout()) => r,
         };
         match result {
-            Ok(addrs) => {
-                let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+            Ok(ips) => {
+                let addrs: Vec<SocketAddr> = ips
+                    .iter()
+                    .map(|ip| SocketAddr::new(*ip, cfg.remote_port))
+                    .collect();
                 if let Some(old) = stats.observe_addrs(&ips) {
-                    let mut new = ips.clone();
+                    let mut new = ips.to_vec();
                     new.sort_unstable();
                     new.dedup();
                     info!(forwarder = %label, host = %cfg.remote_host, old = ?old, new = ?new, "Target DNS answer changed");
@@ -1337,80 +1435,6 @@ async fn run_dns_refresher(
         }
     }
 }
-
-/// Headroom for listeners, TCP connections, the log file, DNS and the metrics endpoint.
-#[cfg(unix)]
-const FD_HEADROOM: u64 = 256;
-
-#[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
-enum FdPlan {
-    Enough,
-    Raise { to: u64, sufficient: bool },
-    Short,
-}
-
-#[cfg(unix)]
-fn fd_plan(soft: u64, hard: u64, needed: u64) -> FdPlan {
-    if soft >= needed {
-        FdPlan::Enough
-    } else if hard > soft {
-        let to = hard.min(needed);
-        FdPlan::Raise {
-            to,
-            sufficient: to >= needed,
-        }
-    } else {
-        FdPlan::Short
-    }
-}
-
-/// Make room for `udp_max_sessions` upstream sockets: raise the soft
-/// RLIMIT_NOFILE when the hard limit allows, warn when it cannot suffice.
-// `rlim_t` is not u64 on every unix target (32-bit, some BSDs): keep the casts.
-#[cfg(unix)]
-#[allow(clippy::unnecessary_cast)]
-pub(crate) fn ensure_fd_budget(udp_max_sessions: usize) {
-    let needed = udp_max_sessions as u64 + FD_HEADROOM;
-    let mut rl = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `rl` is a valid, writable `rlimit` for the duration of the call.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
-        warn!(error = %io::Error::last_os_error(), "Could not read the open-file limit; not adjusting it");
-        return;
-    }
-    let (soft, hard) = (rl.rlim_cur as u64, rl.rlim_max as u64);
-    let mut current = soft;
-    let sufficient = match fd_plan(soft, hard, needed) {
-        FdPlan::Enough => return,
-        FdPlan::Short => false,
-        FdPlan::Raise { to, sufficient } => {
-            let raised = libc::rlimit {
-                rlim_cur: to as libc::rlim_t,
-                rlim_max: rl.rlim_max,
-            };
-            // SAFETY: `raised` is a valid `rlimit`; the call only reads it.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-                info!("Raised the open-file soft limit from {soft} to {to} for udp_max_sessions");
-                current = to;
-                sufficient
-            } else {
-                warn!(error = %io::Error::last_os_error(), "Could not raise the open-file soft limit");
-                false
-            }
-        }
-    };
-    if !sufficient {
-        warn!(
-            "Open-file limit {current} is below udp_max_sessions + {FD_HEADROOM} = {needed}; UDP sessions beyond it will fail to open (raise ulimit -n / LimitNOFILE, or lower udp_max_sessions)"
-        );
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn ensure_fd_budget(_udp_max_sessions: usize) {}
 
 /// Linux UDP segmentation offload: GRO on receive, GSO on send.
 #[cfg(target_os = "linux")]
@@ -2152,34 +2176,6 @@ mod tests {
         assert!(same_addr_set(&[a, a], &[a]));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn fd_budget_math() {
-        assert_eq!(fd_plan(20000, 20000, 16640), FdPlan::Enough);
-        assert_eq!(
-            fd_plan(1024, 1048576, 16640),
-            FdPlan::Raise {
-                to: 16640,
-                sufficient: true
-            }
-        );
-        assert_eq!(
-            fd_plan(1024, 4096, 16640),
-            FdPlan::Raise {
-                to: 4096,
-                sufficient: false
-            }
-        );
-        assert_eq!(fd_plan(1024, 1024, 16640), FdPlan::Short);
-        assert_eq!(
-            fd_plan(1024, u64::MAX, 16640),
-            FdPlan::Raise {
-                to: 16640,
-                sufficient: true
-            }
-        );
-    }
-
     // ---- Linux GRO/GSO offload (3.1) ---------------------------------------
 
     /// Non-blocking socket on 127.0.0.1 with UDP_GRO on; `None` on a kernel without it.
@@ -2724,5 +2720,37 @@ mod tests {
             expect_echoes(&c, &burst, Duration::from_secs(2), &format!("client {i}")).await;
         }
         assert_eq!(load(&f.stats.datagrams_dropped), 0);
+    }
+
+    // ---- target failover ----------------------------------------------------
+
+    #[test]
+    fn open_first_skips_addresses_that_cannot_be_opened() {
+        let a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let refuse_a = |addr: SocketAddr| {
+            if addr == a {
+                Err(io::Error::from(io::ErrorKind::NetworkUnreachable))
+            } else {
+                Ok(addr)
+            }
+        };
+        assert_eq!(open_first(&[a, b], &[], refuse_a).unwrap(), (b, b));
+
+        let (addr, err) = open_first(&[a], &[], refuse_a).unwrap_err();
+        assert_eq!(addr, a);
+        assert_eq!(err.kind(), io::ErrorKind::NetworkUnreachable);
+        assert!(open_first(&[], &[], refuse_a).is_err());
+    }
+
+    #[test]
+    fn open_first_tries_penalized_addresses_last() {
+        let a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let ok = |addr: SocketAddr| io::Result::Ok(addr);
+        let penalized = [(a, Instant::now())];
+        assert_eq!(open_first(&[a, b], &penalized, ok).unwrap().0, b);
+        // Still used when it is the only one left.
+        assert_eq!(open_first(&[a], &penalized, ok).unwrap().0, a);
     }
 }

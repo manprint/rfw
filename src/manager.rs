@@ -31,6 +31,79 @@ const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// multi-second outage on a port that never needed to go down.
 const STOP_LISTENER_GRACE: Duration = Duration::from_secs(5);
 
+/// First and longest wait before a panicked accept loop is started again.
+const PANIC_RESTART_MIN: Duration = Duration::from_secs(1);
+const PANIC_RESTART_MAX: Duration = Duration::from_secs(30);
+
+/// From this many running forwarders on, each new monitor starts at its own
+/// phase (see [`monitor_phase`]) instead of probing at once.
+const MONITOR_STAGGER_MIN: usize = 16;
+/// Longest a monitor's first probe is delayed by the stagger.
+const MONITOR_STAGGER_MAX: Duration = Duration::from_secs(10);
+
+/// A stable per-forwarder offset in `[0, window)`.
+fn monitor_phase(label: &str, window: Duration) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    label.hash(&mut hasher);
+    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+    Duration::from_millis(hasher.finish() % window_ms)
+}
+
+/// Settings read once at startup. A reload that changes one of them cannot
+/// apply it; saying so beats an edit that silently does nothing.
+#[derive(Debug, Clone, PartialEq)]
+struct StartupOnly {
+    metrics_addr: Option<String>,
+    report_interval_secs: u64,
+    sample_interval_secs: u64,
+    max_connections: Option<usize>,
+    udp_max_sessions: usize,
+    webhook_url: Option<String>,
+    instance_name: Option<String>,
+}
+
+impl StartupOnly {
+    fn of(s: &Settings) -> Self {
+        Self {
+            metrics_addr: s.metrics_addr.clone(),
+            report_interval_secs: s.report_interval_secs,
+            sample_interval_secs: s.sample_interval_secs,
+            max_connections: s.max_connections,
+            udp_max_sessions: s.udp_max_sessions,
+            webhook_url: s.webhook_url.clone(),
+            instance_name: s.instance_name.clone(),
+        }
+    }
+
+    /// Names of the settings that differ from `other`.
+    fn changed(&self, other: &Self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.metrics_addr != other.metrics_addr {
+            out.push("metrics_addr");
+        }
+        if self.report_interval_secs != other.report_interval_secs {
+            out.push("report_interval_secs");
+        }
+        if self.sample_interval_secs != other.sample_interval_secs {
+            out.push("sample_interval_secs");
+        }
+        if self.max_connections != other.max_connections {
+            out.push("max_connections");
+        }
+        if self.udp_max_sessions != other.udp_max_sessions {
+            out.push("udp_max_sessions");
+        }
+        if self.webhook_url != other.webhook_url {
+            out.push("webhook_url");
+        }
+        if self.instance_name != other.instance_name {
+            out.push("instance_name");
+        }
+        out
+    }
+}
+
 /// Apply rfw's resolver policy on top of whatever the system config provides.
 ///
 /// Shared with the DNS tests so they exercise the production strategy rather
@@ -64,6 +137,8 @@ pub struct ForwarderManager {
     udp_limit: Arc<Semaphore>,
     /// Alert sink shared by every forwarder, monitor and the reload path.
     notifier: Notifier,
+    /// The startup-only settings this process is running with.
+    startup_only: StartupOnly,
 }
 
 struct ForwarderHandle {
@@ -99,6 +174,7 @@ impl ForwarderManager {
                 settings.udp_max_sessions.clamp(1, MAX_UDP_SESSIONS),
             )),
             notifier,
+            startup_only: StartupOnly::of(settings),
         })
     }
 
@@ -118,6 +194,13 @@ impl ForwarderManager {
     /// Apply reloaded data-plane knobs (buffer/socket-buffer/splice) live.
     /// New connections pick them up; interval/metrics settings still need a restart.
     pub fn update_knobs(&self, settings: &Settings) {
+        let ignored = self.startup_only.changed(&StartupOnly::of(settings));
+        if !ignored.is_empty() {
+            warn!(
+                settings = ?ignored,
+                "These settings are read at startup only; the reloaded values are ignored until rfw restarts"
+            );
+        }
         self.knobs.update(settings);
     }
 
@@ -153,57 +236,85 @@ impl ForwarderManager {
         let notifier = self.notifier.clone();
 
         // Supervisor: the accept loop runs in its own task so a panic inside
-        // it is observed here (and alerted) the moment it happens, instead of
-        // surfacing only when the forwarder is eventually stopped.
+        // it is observed here (and alerted) the moment it happens, and the
+        // loop is started again: without that the port stays dead until the
+        // process restarts, and a reload cannot revive it because the label
+        // is still registered as running.
+        let monitor_stats = stats.clone();
         let task = {
             let label = label.clone();
             let notifier = notifier.clone();
             tokio::spawn(async move {
-                let inner = match cfg_clone.protocol {
-                    Protocol::Tcp => tokio::spawn(run_forwarder(
-                        cfg_clone,
-                        token_clone,
-                        stats,
-                        resolver,
-                        knobs,
-                        conn_tracker,
-                        conn_limit,
-                        notifier.clone(),
-                    )),
-                    Protocol::Udp => tokio::spawn(run_udp_forwarder(
-                        cfg_clone,
-                        token_clone,
-                        stats,
-                        resolver,
-                        knobs,
-                        udp_limit,
-                        notifier.clone(),
-                    )),
-                };
-                if let Err(e) = inner.await {
-                    if e.is_panic() {
-                        error!(forwarder = %label, error = %e, "Forwarder task panicked; its port is no longer served");
-                        notifier.notify(Alert::Internal {
-                            component: "forwarder",
-                            message: format!(
-                                "accept loop of {label} panicked: {e}. The port is no longer served until the process restarts"
-                            ),
-                        });
+                let mut backoff = PANIC_RESTART_MIN;
+                loop {
+                    let started = Instant::now();
+                    let inner = match cfg_clone.protocol {
+                        Protocol::Tcp => tokio::spawn(run_forwarder(
+                            cfg_clone.clone(),
+                            token_clone.clone(),
+                            stats.clone(),
+                            resolver.clone(),
+                            knobs.clone(),
+                            conn_tracker.clone(),
+                            conn_limit.clone(),
+                            notifier.clone(),
+                        )),
+                        Protocol::Udp => tokio::spawn(run_udp_forwarder(
+                            cfg_clone.clone(),
+                            token_clone.clone(),
+                            stats.clone(),
+                            resolver.clone(),
+                            knobs.clone(),
+                            udp_limit.clone(),
+                            notifier.clone(),
+                        )),
+                    };
+                    match inner.await {
+                        Err(e) if e.is_panic() => {
+                            // A loop that ran for a while earns a fresh backoff.
+                            if started.elapsed() >= PANIC_RESTART_MAX {
+                                backoff = PANIC_RESTART_MIN;
+                            }
+                            error!(forwarder = %label, error = %e, "Forwarder task panicked; restarting it in {}s", backoff.as_secs());
+                            notifier.notify(Alert::Internal {
+                                component: "forwarder",
+                                message: format!(
+                                    "accept loop of {label} panicked: {e}. Restarting it in {}s",
+                                    backoff.as_secs()
+                                ),
+                            });
+                            if cancelled_during(&token_clone, backoff).await {
+                                return;
+                            }
+                            backoff = (backoff * 2).min(PANIC_RESTART_MAX);
+                        }
+                        _ => return,
                     }
                 }
             })
         };
 
-        let monitor = tokio::spawn(run_monitor(
-            Arc::new(cfg.clone()),
-            token.clone(),
-            self.stats_registry
-                .register_with_protocol(&label, cfg.protocol)
-                .await,
-            self.resolver.clone(),
-            self.knobs.clone(),
-            notifier,
-        ));
+        // With many forwarders (a port range is one per port) the monitors
+        // must not all probe in the same instant, at startup and then on
+        // every tick: spread their phase over the probe interval.
+        let monitor_delay = if fwds.len() >= MONITOR_STAGGER_MIN {
+            monitor_phase(&label, self.knobs.probe_interval().min(MONITOR_STAGGER_MAX))
+        } else {
+            Duration::ZERO
+        };
+        let monitor_token = token.clone();
+        let monitor = {
+            let cfg = Arc::new(cfg.clone());
+            let resolver = self.resolver.clone();
+            let knobs = self.knobs.clone();
+            tokio::spawn(async move {
+                if !monitor_delay.is_zero() && cancelled_during(&monitor_token, monitor_delay).await
+                {
+                    return;
+                }
+                run_monitor(cfg, monitor_token, monitor_stats, resolver, knobs, notifier).await;
+            })
+        };
 
         fwds.insert(
             label.clone(),
@@ -348,6 +459,28 @@ fn watched_path_matches_event_path(watched_path: &Path, event_path: &Path) -> bo
             .unwrap_or(false)
 }
 
+/// Identity of the file a config path currently resolves to. Differs after
+/// the file is rewritten, replaced, or a symlink on the way to it is repointed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFingerprint {
+    resolved: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ConfigFingerprint {
+    /// `None` while the path does not resolve (mid-rename, deleted).
+    fn of(path: &Path) -> Option<Self> {
+        let resolved = path.canonicalize().ok()?;
+        let meta = std::fs::metadata(&resolved).ok()?;
+        Some(Self {
+            resolved,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
 fn should_debounce_reload(
     last_reload: Option<Instant>,
     now: Instant,
@@ -381,7 +514,11 @@ pub async fn watch_config_file(
     policy: ReloadPolicy,
 ) {
     let notifier = manager.notifier();
-    let path = match config_path.canonicalize() {
+    // The path as given, made absolute but *not* resolved: when the config is
+    // a symlink (a Kubernetes ConfigMap swaps `..data`, never the file), the
+    // change happens in the directory holding the link, and that is the one
+    // to watch.
+    let path = match std::path::absolute(&config_path) {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot resolve config path: {e}");
@@ -405,17 +542,24 @@ pub async fn watch_config_file(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
     let watched = path.clone();
+    let mut fingerprint = ConfigFingerprint::of(&path);
     let mut watcher = match RecommendedWatcher::new(
         move |event: Result<Event, notify::Error>| {
             let Ok(event) = event else { return };
             if !is_relevant_config_event(&event.kind) {
                 return;
             }
-            let matches = event
+            // An event naming the file is enough. Otherwise something else in
+            // the directory changed: reload only if that changed what the
+            // path resolves to (a symlink in its chain was repointed).
+            let named = event
                 .paths
                 .iter()
                 .any(|event_path| watched_path_matches_event_path(&watched, event_path));
-            if matches {
+            let current = ConfigFingerprint::of(&watched);
+            let retargeted = current.is_some() && current != fingerprint;
+            fingerprint = current;
+            if named || retargeted {
                 // Full channel means a reload is already queued: nothing to do.
                 let _ = tx.try_send(());
             }
@@ -450,6 +594,23 @@ pub async fn watch_config_file(
             ),
         });
         return;
+    }
+
+    // A plain symlink to a file edited in place changes nothing in the link's
+    // directory: watch the target's directory too. Best effort; the link's
+    // own directory already covers a repointed link.
+    if let Some(target_dir) = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .filter(|d| *d != watch_dir)
+    {
+        if let Err(e) = watcher.watch(&target_dir, RecursiveMode::NonRecursive) {
+            warn!(
+                "Cannot watch {} (where the config symlink points): {e}",
+                target_dir.display()
+            );
+        }
     }
 
     info!(
